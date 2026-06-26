@@ -1,0 +1,10 @@
+# cargo generated files
+target
+examples/c_integration/demo
+
+# external tool files          
+*.swp          
+*.swo                                              
+tags                                 
+/cscope.*                        
+

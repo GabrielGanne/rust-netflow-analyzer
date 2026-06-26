@@ -1,0 +1,14 @@
+[package]
+name = "netflow_analyzer_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nom = "7.1"
+dashmap = "6.0"
+
+# The reference OS-socket listener lives at the workspace root per the project
+# layout; expose it as a runnable example of the core crate.
+[[example]]
+name = "udp_listener"
+path = "../examples/udp_listener.rs"
