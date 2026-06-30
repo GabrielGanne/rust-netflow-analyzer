@@ -18,11 +18,11 @@ fn decodes_v9_data_record_into_cache() {
     assert_eq!(ctx.flows.len(), 1, "one flow cached");
 
     let stats = ctx.stats();
-    assert_eq!(stats.packets_processed, 1);
+    assert_eq!(stats.pkts_parsed, 1);
     assert_eq!(stats.templates_received, 1);
     assert_eq!(stats.data_records_processed, 1);
     assert_eq!(stats.active_flows, 1);
-    assert_eq!(stats.malformed_packets, 0);
+    assert_eq!(stats.pkts_parse_error, 0);
 }
 
 #[test]
@@ -50,6 +50,8 @@ fn flush_emits_decoded_fields() {
 
     // The cache is emptied by flush.
     assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.stats().flows_output, 1);
+    assert_eq!(ctx.stats().flows_dropped, 0);
 }
 
 #[test]

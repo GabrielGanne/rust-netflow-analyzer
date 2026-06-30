@@ -146,7 +146,7 @@ impl FlowCache {
             // Idle timeout: no activity for too long -> emit and evict.
             if now.duration_since(record.last_observed) >= cfg.idle_timeout {
                 on_emit(record);
-                counters.flows_evicted.fetch_add(1, Ordering::Relaxed);
+                counters.flows_output.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
 
@@ -154,7 +154,7 @@ impl FlowCache {
             // reset counters without destroying the cache entry.
             if now.duration_since(record.first_observed) >= cfg.active_timeout {
                 on_emit(record);
-                counters.flows_evicted.fetch_add(1, Ordering::Relaxed);
+                counters.flows_output.fetch_add(1, Ordering::Relaxed);
                 record.bytes = 0;
                 record.packets = 0;
                 record.first_observed = now;
@@ -172,7 +172,7 @@ impl FlowCache {
     {
         self.map.retain(|_key, record| {
             on_emit(record);
-            counters.flows_evicted.fetch_add(1, Ordering::Relaxed);
+            counters.flows_output.fetch_add(1, Ordering::Relaxed);
             false
         });
     }
@@ -396,7 +396,7 @@ mod tests {
 
         assert_eq!(cache.len(), 0);
         assert_eq!(emitted.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.flows_evicted.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.flows_output.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -418,7 +418,7 @@ mod tests {
         // Entry survives a rollover but its counters are reset.
         assert_eq!(cache.len(), 1);
         assert_eq!(emitted.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.flows_evicted.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.flows_output.load(Ordering::Relaxed), 1);
     }
 
     #[test]

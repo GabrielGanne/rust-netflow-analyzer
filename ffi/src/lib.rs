@@ -130,13 +130,13 @@ fn emit_record(callback: FlowCallback, user_data: SendUserData, record: &FlowRec
 pub unsafe extern "C" fn netflow_analyzer_get_stats(ctx: *const AnalyzerContext) -> LibraryStatsFFI {
     if ctx.is_null() {
         return LibraryStatsFFI {
-            packets_processed: 0,
-            malformed_packets: 0,
+            pkts_parsed: 0,
+            pkts_parse_error: 0,
             clock_dropped_packets: 0,
             clock_fallback_packets: 0,
             templates_received: 0,
             data_records_processed: 0,
-            flows_evicted: 0,
+            flows_output: 0,
             flows_dropped: 0,
             active_flows: 0,
         };
@@ -343,6 +343,8 @@ mod tests {
         assert_eq!(n, 1);
 
         let stats = unsafe { netflow_analyzer_get_stats(ctx) };
+        assert_eq!(stats.pkts_parsed, 1);
+        assert_eq!(stats.pkts_parse_error, 0);
         assert_eq!(stats.data_records_processed, 1);
         assert_eq!(stats.templates_received, 1);
         assert_eq!(stats.active_flows, 1);
@@ -351,6 +353,9 @@ mod tests {
         unsafe { netflow_analyzer_flush(ctx) };
         assert_eq!(state.count.load(Ordering::Relaxed), 1);
         assert_eq!(state.last_proto.load(Ordering::Relaxed), 17);
+        let stats = unsafe { netflow_analyzer_get_stats(ctx) };
+        assert_eq!(stats.flows_output, 1);
+        assert_eq!(stats.flows_dropped, 0);
 
         unsafe { netflow_analyzer_destroy(ctx) };
     }
@@ -367,6 +372,9 @@ mod tests {
         let bogus = [0xFFu8, 0xFF, 0x00, 0x00];
         let rc = unsafe { netflow_analyzer_process_packet(ctx, bogus.as_ptr(), bogus.len() as u32) };
         assert_eq!(rc, -2);
+        let stats = unsafe { netflow_analyzer_get_stats(ctx) };
+        assert_eq!(stats.pkts_parsed, 0);
+        assert_eq!(stats.pkts_parse_error, 1);
 
         unsafe { netflow_analyzer_destroy(ctx) };
     }
@@ -409,7 +417,7 @@ mod tests {
     fn null_arguments_are_handled() {
         // Stats on null context returns a zeroed snapshot.
         let stats = unsafe { netflow_analyzer_get_stats(ptr::null()) };
-        assert_eq!(stats.packets_processed, 0);
+        assert_eq!(stats.pkts_parsed, 0);
         assert_eq!(stats.active_flows, 0);
 
         // Processing with a null context returns the invalid-arguments code.

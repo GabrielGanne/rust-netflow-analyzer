@@ -22,7 +22,7 @@ fn decodes_v5_packet_with_multiple_records() {
 
     let stats = ctx.stats();
     assert_eq!(stats.data_records_processed, 2);
-    assert_eq!(stats.malformed_packets, 0);
+    assert_eq!(stats.pkts_parse_error, 0);
 
     let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = collected.clone();

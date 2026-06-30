@@ -19,14 +19,16 @@ fn rejects_unknown_version() {
     bogus.extend_from_slice(&[0u8; 20]);
 
     assert!(ctx.process_packet(&bogus).is_err());
-    assert_eq!(ctx.stats().malformed_packets, 1);
+    assert_eq!(ctx.stats().pkts_parse_error, 1);
+    assert_eq!(ctx.stats().pkts_parsed, 0);
 }
 
 #[test]
 fn empty_input_is_malformed() {
     let ctx = FlowContext::new();
     assert!(ctx.process_packet(&[]).is_err());
-    assert_eq!(ctx.stats().malformed_packets, 1);
+    assert_eq!(ctx.stats().pkts_parse_error, 1);
+    assert_eq!(ctx.stats().pkts_parsed, 0);
 }
 
 #[test]
@@ -96,7 +98,7 @@ fn background_aging_evicts_and_emits() {
 
     assert_eq!(ctx.flows.len(), 0, "idle flow evicted");
     assert!(!emitted.lock().unwrap().is_empty(), "eviction emitted a record");
-    assert!(ctx.stats().flows_evicted >= 1);
+    assert!(ctx.stats().flows_output >= 1);
 }
 
 #[test]

@@ -101,14 +101,14 @@ impl FlowContext {
             Ok(parsed) => parsed,
             Err(_) => {
                 self.counters
-                    .malformed_packets
+                    .pkts_parse_error
                     .fetch_add(1, Ordering::Relaxed);
                 return Err("Failed to parse NetFlow header packet structure");
             }
         };
 
         self.counters
-            .packets_processed
+            .pkts_parsed
             .fetch_add(1, Ordering::Relaxed);
 
         let domain = header.domain_id();

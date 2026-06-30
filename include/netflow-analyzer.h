@@ -76,8 +76,14 @@ typedef void (*FlowCallback)(const FlowRecordFFI *record, void *user_data);
  * C-compatible, point-in-time snapshot of the engine telemetry.
  */
 typedef struct {
-    uint64_t packets_processed;
-    uint64_t malformed_packets;
+    /**
+     * Datagrams whose NetFlow/IPFIX header was parsed successfully.
+     */
+    uint64_t pkts_parsed;
+    /**
+     * Datagrams rejected because their NetFlow/IPFIX header was malformed.
+     */
+    uint64_t pkts_parse_error;
     /**
      * Packets rejected because exporter clock skew exceeded the configured limit.
      */
@@ -88,7 +94,13 @@ typedef struct {
     uint64_t clock_fallback_packets;
     uint64_t templates_received;
     uint64_t data_records_processed;
-    uint64_t flows_evicted;
+    /**
+     * Flow records delivered to the configured output callback.
+     */
+    uint64_t flows_output;
+    /**
+     * Decoded flow records rejected because the flow cache was full.
+     */
     uint64_t flows_dropped;
     /**
      * Number of flows currently resident in the state cache.

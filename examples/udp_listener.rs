@@ -73,13 +73,13 @@ fn main() -> std::io::Result<()> {
         if last_report.elapsed() >= Duration::from_secs(5) {
             let s = ctx.stats();
             println!(
-                "[stats] packets={} malformed={} templates={} records={} active={} evicted={} dropped={}",
-                s.packets_processed,
-                s.malformed_packets,
+                "[stats] parsed={} parse_errors={} templates={} records={} active={} output={} dropped={}",
+                s.pkts_parsed,
+                s.pkts_parse_error,
                 s.templates_received,
                 s.data_records_processed,
                 s.active_flows,
-                s.flows_evicted,
+                s.flows_output,
                 s.flows_dropped,
             );
             last_report = Instant::now();

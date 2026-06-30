@@ -96,12 +96,12 @@ int main(void) {
     netflow_analyzer_flush(ctx);
 
     LibraryStatsFFI stats = netflow_analyzer_get_stats(ctx);
-    printf("[stats] packets=%llu malformed=%llu templates=%llu records=%llu evicted=%llu dropped=%llu active=%llu\n",
-           (unsigned long long)stats.packets_processed,
-           (unsigned long long)stats.malformed_packets,
+    printf("[stats] parsed=%llu parse_errors=%llu templates=%llu records=%llu output=%llu dropped=%llu active=%llu\n",
+           (unsigned long long)stats.pkts_parsed,
+           (unsigned long long)stats.pkts_parse_error,
            (unsigned long long)stats.templates_received,
            (unsigned long long)stats.data_records_processed,
-           (unsigned long long)stats.flows_evicted,
+           (unsigned long long)stats.flows_output,
            (unsigned long long)stats.flows_dropped,
            (unsigned long long)stats.active_flows);
 
