@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use netflow_analyzer_core::cache::AgingConfig;
+use netflow_analyzer_core::clock::ClockConfig;
 use netflow_analyzer_core::records::{FlowRecord, FlowRecordFFI};
 use netflow_analyzer_core::stats::LibraryStatsFFI;
-use netflow_analyzer_core::{EngineConfig, FlowContext};
+use netflow_analyzer_core::{EngineConfig, FlowContext, CLOCK_SKEW_ERROR};
 
 /// C-compatible callback invoked whenever a flow is emitted (idle eviction,
 /// active-timeout rollover, or explicit flush). The `record` pointer is only
@@ -21,6 +22,12 @@ pub struct AnalyzerConfig {
     pub idle_timeout_secs: u64,
     pub active_timeout_secs: u64,
     pub scan_interval_secs: u64,
+    /// Enable export-time versus receipt-time skew validation.
+    pub clock_sync_check_enabled: bool,
+    /// Correct skewed timestamps from receipt time instead of dropping packets.
+    pub clock_fallback_to_receipt_time: bool,
+    /// Maximum accepted clock skew, in nanoseconds. Zero selects the default.
+    pub max_clock_skew_ns: u64,
 }
 
 /// Wrapper that lets us move the host's opaque `user_data` pointer onto the
@@ -62,6 +69,15 @@ fn engine_config_from(cfg: &AnalyzerConfig) -> EngineConfig {
             idle_timeout: secs(cfg.idle_timeout_secs, defaults.aging.idle_timeout),
             active_timeout: secs(cfg.active_timeout_secs, defaults.aging.active_timeout),
             scan_interval: secs(cfg.scan_interval_secs, defaults.aging.scan_interval),
+        },
+        clock: ClockConfig {
+            sync_check_enabled: cfg.clock_sync_check_enabled,
+            max_skew: if cfg.max_clock_skew_ns == 0 {
+                defaults.clock.max_skew
+            } else {
+                Duration::from_nanos(cfg.max_clock_skew_ns)
+            },
+            fallback_to_receipt_time: cfg.clock_fallback_to_receipt_time,
         },
     }
 }
@@ -116,6 +132,8 @@ pub unsafe extern "C" fn netflow_analyzer_get_stats(ctx: *const AnalyzerContext)
         return LibraryStatsFFI {
             packets_processed: 0,
             malformed_packets: 0,
+            clock_dropped_packets: 0,
+            clock_fallback_packets: 0,
             templates_received: 0,
             data_records_processed: 0,
             flows_evicted: 0,
@@ -128,7 +146,7 @@ pub unsafe extern "C" fn netflow_analyzer_get_stats(ctx: *const AnalyzerContext)
 
 /// Core processing entry point called by C worker threads when a datagram
 /// arrives. Returns the number of data records decoded, or a negative error
-/// code (`-1` invalid arguments, `-2` malformed packet).
+/// code (`-1` invalid arguments, `-2` malformed packet, `-3` clock rejection).
 ///
 /// # Safety
 /// `ctx` must be a valid context pointer and `packet_bytes` must point to at
@@ -146,6 +164,30 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet(
     let data = std::slice::from_raw_parts(packet_bytes, length as usize);
     match (*ctx).internal.process_packet(data) {
         Ok(records) => records as i32,
+        Err(CLOCK_SKEW_ERROR) => -3,
+        Err(_) => -2,
+    }
+}
+
+/// Processing entry point with an explicit Unix-nanosecond receipt timestamp.
+/// This is the preferred entry point for offline packet-capture readers.
+///
+/// # Safety
+/// The pointer requirements are identical to [`netflow_analyzer_process_packet`].
+#[no_mangle]
+pub unsafe extern "C" fn netflow_analyzer_process_packet_at(
+    ctx: *const AnalyzerContext,
+    packet_bytes: *const u8,
+    length: u32,
+    receipt_time_ns: u64,
+) -> i32 {
+    if ctx.is_null() || packet_bytes.is_null() {
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+    match (*ctx).internal.process_packet_at(data, receipt_time_ns) {
+        Ok(records) => records as i32,
+        Err(CLOCK_SKEW_ERROR) => -3,
         Err(_) => -2,
     }
 }
@@ -248,6 +290,9 @@ mod tests {
             idle_timeout_secs: 0,
             active_timeout_secs: 0,
             scan_interval_secs: 0,
+            clock_sync_check_enabled: false,
+            clock_fallback_to_receipt_time: false,
+            max_clock_skew_ns: 0,
         };
         let defaults = EngineConfig::default();
         let cfg = engine_config_from(&zero);
@@ -256,6 +301,7 @@ mod tests {
         assert_eq!(cfg.aging.idle_timeout, defaults.aging.idle_timeout);
         assert_eq!(cfg.aging.active_timeout, defaults.aging.active_timeout);
         assert_eq!(cfg.aging.scan_interval, defaults.aging.scan_interval);
+        assert_eq!(cfg.clock, defaults.clock);
     }
 
     #[test]
@@ -266,6 +312,9 @@ mod tests {
             idle_timeout_secs: 7,
             active_timeout_secs: 11,
             scan_interval_secs: 1,
+            clock_sync_check_enabled: true,
+            clock_fallback_to_receipt_time: true,
+            max_clock_skew_ns: 123,
         };
         let cfg = engine_config_from(&custom);
         assert_eq!(cfg.max_flows, 10);
@@ -273,6 +322,9 @@ mod tests {
         assert_eq!(cfg.aging.idle_timeout, Duration::from_secs(7));
         assert_eq!(cfg.aging.active_timeout, Duration::from_secs(11));
         assert_eq!(cfg.aging.scan_interval, Duration::from_secs(1));
+        assert!(cfg.clock.sync_check_enabled);
+        assert!(cfg.clock.fallback_to_receipt_time);
+        assert_eq!(cfg.clock.max_skew, Duration::from_nanos(123));
     }
 
     #[test]
@@ -320,6 +372,40 @@ mod tests {
     }
 
     #[test]
+    fn clock_rejection_has_dedicated_error_and_counter() {
+        let config = AnalyzerConfig {
+            max_flows: 0,
+            max_templates: 0,
+            idle_timeout_secs: 0,
+            active_timeout_secs: 0,
+            scan_interval_secs: 0,
+            clock_sync_check_enabled: true,
+            clock_fallback_to_receipt_time: false,
+            max_clock_skew_ns: 10,
+        };
+        let state = TestState {
+            count: AtomicU32::new(0),
+            last_proto: AtomicU32::new(0),
+        };
+        let ud = &state as *const TestState as *mut c_void;
+        let ctx = unsafe { netflow_analyzer_create(&config, count_cb, ud) };
+        let packet = v9_packet();
+        let export_ns = 1_700_000_000_000_000_000;
+
+        let rc = unsafe {
+            netflow_analyzer_process_packet_at(
+                ctx,
+                packet.as_ptr(),
+                packet.len() as u32,
+                export_ns + 11,
+            )
+        };
+        assert_eq!(rc, -3);
+        assert_eq!(unsafe { netflow_analyzer_get_stats(ctx) }.clock_dropped_packets, 1);
+        unsafe { netflow_analyzer_destroy(ctx) };
+    }
+
+    #[test]
     fn null_arguments_are_handled() {
         // Stats on null context returns a zeroed snapshot.
         let stats = unsafe { netflow_analyzer_get_stats(ptr::null()) };
@@ -346,6 +432,9 @@ mod tests {
             idle_timeout_secs: 30,
             active_timeout_secs: 120,
             scan_interval_secs: 5,
+            clock_sync_check_enabled: false,
+            clock_fallback_to_receipt_time: false,
+            max_clock_skew_ns: 0,
         };
         let state = TestState {
             count: AtomicU32::new(0),

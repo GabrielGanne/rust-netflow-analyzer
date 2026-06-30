@@ -101,6 +101,15 @@ impl FlowCache {
                 existing.start_time_ns = fields.start_time_ns;
             }
             existing.end_time_ns = existing.end_time_ns.max(fields.end_time_ns);
+            if fields.original_start_time_ns != 0
+                && (existing.original_start_time_ns == 0
+                    || fields.original_start_time_ns < existing.original_start_time_ns)
+            {
+                existing.original_start_time_ns = fields.original_start_time_ns;
+            }
+            existing.original_end_time_ns = existing
+                .original_end_time_ns
+                .max(fields.original_end_time_ns);
             existing.last_observed = Instant::now();
             return;
         }
@@ -284,6 +293,8 @@ mod tests {
             packets: 1,
             start_time_ns: 0,
             end_time_ns: 0,
+            original_start_time_ns: 0,
+            original_end_time_ns: 0,
         }
     }
 
@@ -318,10 +329,14 @@ mod tests {
         let mut first = fields(6);
         first.start_time_ns = 20;
         first.end_time_ns = 30;
+        first.original_start_time_ns = 25;
+        first.original_end_time_ns = 35;
         cache.upsert(&first, &counters);
         let mut second = fields(6);
         second.start_time_ns = 10;
         second.end_time_ns = 40;
+        second.original_start_time_ns = 15;
+        second.original_end_time_ns = 45;
         cache.upsert(&second, &counters); // same key
 
         assert_eq!(cache.len(), 1);
@@ -331,6 +346,8 @@ mod tests {
         assert_eq!(record.packets, 2);
         assert_eq!(record.start_time_ns, 10);
         assert_eq!(record.end_time_ns, 40);
+        assert_eq!(record.original_start_time_ns, 15);
+        assert_eq!(record.original_end_time_ns, 45);
     }
 
     #[test]

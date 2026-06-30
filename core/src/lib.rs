@@ -1,14 +1,17 @@
 pub mod cache;
+pub mod clock;
 pub mod parser;
 pub mod records;
 pub mod stats;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cache::{
     AgingConfig, AgingHandle, FlowCache, TemplateCache, DEFAULT_MAX_FLOWS, DEFAULT_MAX_TEMPLATES,
 };
+use clock::{ClockConfig, ClockDecision, ClockTracker};
 use parser::{
     ParsedHeader, FIRST_DATA_SET_ID, FLOWSET_ID_V9_OPTIONS, FLOWSET_ID_V9_TEMPLATE,
     SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
@@ -16,12 +19,16 @@ use parser::{
 use records::{FlowFields, FlowRecord, RecordTimeContext};
 use stats::{InternalCounters, LibraryStatsFFI};
 
+/// Error returned when clock validation rejects an otherwise parseable packet.
+pub const CLOCK_SKEW_ERROR: &str = "Packet dropped because exporter clock skew exceeds limit";
+
 /// Top-level engine configuration combining cache caps and aging timings.
 #[derive(Debug, Clone, Copy)]
 pub struct EngineConfig {
     pub max_flows: usize,
     pub max_templates: usize,
     pub aging: AgingConfig,
+    pub clock: ClockConfig,
 }
 
 impl Default for EngineConfig {
@@ -30,6 +37,7 @@ impl Default for EngineConfig {
             max_flows: DEFAULT_MAX_FLOWS,
             max_templates: DEFAULT_MAX_TEMPLATES,
             aging: AgingConfig::default(),
+            clock: ClockConfig::default(),
         }
     }
 }
@@ -43,7 +51,9 @@ pub struct FlowContext {
     pub counters: Arc<InternalCounters>,
     pub templates: Arc<TemplateCache>,
     pub flows: Arc<FlowCache>,
+    pub clocks: Arc<ClockTracker>,
     aging_cfg: AgingConfig,
+    clock_cfg: ClockConfig,
     aging: Mutex<Option<AgingHandle>>,
 }
 
@@ -59,7 +69,9 @@ impl FlowContext {
             counters: Arc::new(InternalCounters::default()),
             templates: Arc::new(TemplateCache::new(cfg.max_templates)),
             flows: Arc::new(FlowCache::new(cfg.max_flows)),
+            clocks: Arc::new(ClockTracker::new(cfg.max_templates)),
             aging_cfg: cfg.aging,
+            clock_cfg: cfg.clock,
             aging: Mutex::new(None),
         }
     }
@@ -70,6 +82,21 @@ impl FlowContext {
     /// The input is borrowed and never copied: parsing operates directly on the
     /// caller's buffer.
     pub fn process_packet(&self, raw_bytes: &[u8]) -> Result<usize, &'static str> {
+        let receipt_time_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        self.process_packet_at(raw_bytes, receipt_time_ns)
+    }
+
+    /// Like [`Self::process_packet`], with an explicit Unix-nanosecond receipt
+    /// timestamp. Capture readers should pass the packet's capture timestamp.
+    pub fn process_packet_at(
+        &self,
+        raw_bytes: &[u8],
+        receipt_time_ns: u64,
+    ) -> Result<usize, &'static str> {
         let (mut payload, header) = match parser::parse_packet_header(raw_bytes) {
             Ok(parsed) => parsed,
             Err(_) => {
@@ -84,21 +111,44 @@ impl FlowContext {
             .packets_processed
             .fetch_add(1, Ordering::Relaxed);
 
+        let domain = header.domain_id();
+        let original_export_time_ns = header.export_time_ns();
+        let effective_export_time_ns = match self.clocks.observe(
+            domain,
+            original_export_time_ns,
+            receipt_time_ns,
+            self.clock_cfg,
+        ) {
+            ClockDecision::Accept {
+                effective_export_time_ns,
+            } => effective_export_time_ns,
+            ClockDecision::Fallback {
+                effective_export_time_ns,
+            } => {
+                self.counters
+                    .clock_fallback_packets
+                    .fetch_add(1, Ordering::Relaxed);
+                effective_export_time_ns
+            }
+            ClockDecision::Drop => {
+                self.counters
+                    .clock_dropped_packets
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(CLOCK_SKEW_ERROR);
+            }
+        };
+        let time_context = RecordTimeContext {
+            original_export_time_ns,
+            effective_export_time_ns,
+            system_uptime_ms: header.system_uptime_ms(),
+        };
+
         // NetFlow v5 is template-less: the payload is simply `count` fixed-size
         // records, so it takes a dedicated decode path instead of a set walk.
         if let ParsedHeader::V5(ref h) = header {
-            let time_context = RecordTimeContext {
-                export_time_ns: header.export_time_ns(),
-                system_uptime_ms: header.system_uptime_ms(),
-            };
             return Ok(self.process_v5_records(payload, h.count as usize, time_context));
         }
 
-        let domain = header.domain_id();
-        let time_context = RecordTimeContext {
-            export_time_ns: header.export_time_ns(),
-            system_uptime_ms: header.system_uptime_ms(),
-        };
         let mut data_records = 0usize;
 
         // Walk each FlowSet/Set in the payload. Any structural inconsistency

@@ -25,6 +25,18 @@ typedef struct {
     uint64_t idle_timeout_secs;
     uint64_t active_timeout_secs;
     uint64_t scan_interval_secs;
+    /**
+     * Enable export-time versus receipt-time skew validation.
+     */
+    bool clock_sync_check_enabled;
+    /**
+     * Correct skewed timestamps from receipt time instead of dropping packets.
+     */
+    bool clock_fallback_to_receipt_time;
+    /**
+     * Maximum accepted clock skew, in nanoseconds. Zero selects the default.
+     */
+    uint64_t max_clock_skew_ns;
 } AnalyzerConfig;
 
 typedef struct {
@@ -36,13 +48,21 @@ typedef struct {
     uint64_t bytes;
     uint64_t packets;
     /**
-     * Flow start time as Unix epoch nanoseconds.
+     * Effective flow start time as Unix epoch nanoseconds.
      */
     uint64_t start_time_ns;
     /**
-     * Flow end time as Unix epoch nanoseconds.
+     * Effective flow end time as Unix epoch nanoseconds.
      */
     uint64_t end_time_ns;
+    /**
+     * Unmodified exporter-derived flow start time.
+     */
+    uint64_t original_start_time_ns;
+    /**
+     * Unmodified exporter-derived flow end time.
+     */
+    uint64_t original_end_time_ns;
 } FlowRecordFFI;
 
 /**
@@ -58,6 +78,14 @@ typedef void (*FlowCallback)(const FlowRecordFFI *record, void *user_data);
 typedef struct {
     uint64_t packets_processed;
     uint64_t malformed_packets;
+    /**
+     * Packets rejected because exporter clock skew exceeded the configured limit.
+     */
+    uint64_t clock_dropped_packets;
+    /**
+     * Skewed packets accepted after rebasing timestamps onto receipt time.
+     */
+    uint64_t clock_fallback_packets;
     uint64_t templates_received;
     uint64_t data_records_processed;
     uint64_t flows_evicted;
@@ -95,7 +123,7 @@ LibraryStatsFFI netflow_analyzer_get_stats(const AnalyzerContext *ctx);
 /**
  * Core processing entry point called by C worker threads when a datagram
  * arrives. Returns the number of data records decoded, or a negative error
- * code (`-1` invalid arguments, `-2` malformed packet).
+ * code (`-1` invalid arguments, `-2` malformed packet, `-3` clock rejection).
  *
  * # Safety
  * `ctx` must be a valid context pointer and `packet_bytes` must point to at
@@ -104,6 +132,18 @@ LibraryStatsFFI netflow_analyzer_get_stats(const AnalyzerContext *ctx);
 int32_t netflow_analyzer_process_packet(const AnalyzerContext *ctx,
                                         const uint8_t *packet_bytes,
                                         uint32_t length);
+
+/**
+ * Processing entry point with an explicit Unix-nanosecond receipt timestamp.
+ * This is the preferred entry point for offline packet-capture readers.
+ *
+ * # Safety
+ * The pointer requirements are identical to [`netflow_analyzer_process_packet`].
+ */
+int32_t netflow_analyzer_process_packet_at(const AnalyzerContext *ctx,
+                                           const uint8_t *packet_bytes,
+                                           uint32_t length,
+                                           uint64_t receipt_time_ns);
 
 /**
  * Forces every cached flow to be emitted through the callback immediately.

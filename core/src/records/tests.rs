@@ -260,6 +260,8 @@ fn flow_record_round_trips_to_ffi() {
         packets: 3,
         start_time_ns: 1_700_000_000_123_456_789,
         end_time_ns: 1_700_000_001_987_654_321,
+        original_start_time_ns: 1_700_000_000_123_456_789,
+        original_end_time_ns: 1_700_000_001_987_654_321,
     };
     let record = FlowRecord::from_fields(&fields, Instant::now());
     assert_eq!(record.fields, fields);
@@ -272,6 +274,8 @@ fn flow_record_round_trips_to_ffi() {
     assert_eq!(ffi.packets, 3);
     assert_eq!(ffi.start_time_ns, 1_700_000_000_123_456_789);
     assert_eq!(ffi.end_time_ns, 1_700_000_001_987_654_321);
+    assert_eq!(ffi.original_start_time_ns, 1_700_000_000_123_456_789);
+    assert_eq!(ffi.original_end_time_ns, 1_700_000_001_987_654_321);
 }
 
 #[test]
@@ -287,7 +291,8 @@ fn resolves_uptime_timestamps_to_unix_nanoseconds() {
     rec.extend_from_slice(&9_000_u32.to_be_bytes());
     rec.extend_from_slice(&9_750_u32.to_be_bytes());
     let context = RecordTimeContext {
-        export_time_ns: 1_700_000_000_123_456_789,
+        original_export_time_ns: 1_700_000_000_123_456_789,
+        effective_export_time_ns: 1_700_000_000_123_456_789,
         system_uptime_ms: Some(10_000),
     };
 
@@ -319,7 +324,8 @@ fn normalizes_all_ipfix_absolute_time_units() {
     rec.extend_from_slice(&ntp.to_be_bytes());
     rec.extend_from_slice(&ntp.to_be_bytes());
     let context = RecordTimeContext {
-        export_time_ns: seconds * NS_PER_SECOND,
+        original_export_time_ns: seconds * NS_PER_SECOND,
+        effective_export_time_ns: seconds * NS_PER_SECOND,
         system_uptime_ms: None,
     };
 
@@ -335,7 +341,8 @@ fn v5_timestamps_preserve_header_nanoseconds() {
     rec[24..28].copy_from_slice(&4_000_u32.to_be_bytes());
     rec[28..32].copy_from_slice(&4_999_u32.to_be_bytes());
     let context = RecordTimeContext {
-        export_time_ns: 1_700_000_000_987_654_321,
+        original_export_time_ns: 1_700_000_000_987_654_321,
+        effective_export_time_ns: 1_700_000_000_987_654_321,
         system_uptime_ms: Some(5_000),
     };
 

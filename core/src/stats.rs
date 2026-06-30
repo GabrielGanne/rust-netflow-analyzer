@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct InternalCounters {
     pub packets_processed: AtomicU64,
     pub malformed_packets: AtomicU64,
+    pub clock_dropped_packets: AtomicU64,
+    pub clock_fallback_packets: AtomicU64,
     pub templates_received: AtomicU64,
     pub data_records_processed: AtomicU64,
     pub flows_evicted: AtomicU64,
@@ -19,6 +21,10 @@ pub struct InternalCounters {
 pub struct LibraryStatsFFI {
     pub packets_processed: u64,
     pub malformed_packets: u64,
+    /// Packets rejected because exporter clock skew exceeded the configured limit.
+    pub clock_dropped_packets: u64,
+    /// Skewed packets accepted after rebasing timestamps onto receipt time.
+    pub clock_fallback_packets: u64,
     pub templates_received: u64,
     pub data_records_processed: u64,
     pub flows_evicted: u64,
@@ -34,6 +40,8 @@ impl InternalCounters {
         LibraryStatsFFI {
             packets_processed: self.packets_processed.load(Ordering::Relaxed),
             malformed_packets: self.malformed_packets.load(Ordering::Relaxed),
+            clock_dropped_packets: self.clock_dropped_packets.load(Ordering::Relaxed),
+            clock_fallback_packets: self.clock_fallback_packets.load(Ordering::Relaxed),
             templates_received: self.templates_received.load(Ordering::Relaxed),
             data_records_processed: self.data_records_processed.load(Ordering::Relaxed),
             flows_evicted: self.flows_evicted.load(Ordering::Relaxed),

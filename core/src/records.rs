@@ -36,8 +36,25 @@ const NTP_ERA_SECONDS: u64 = 1_u64 << 32;
 /// Packet-level clock values used to resolve relative exporter timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordTimeContext {
-    pub export_time_ns: u64,
+    /// Unmodified timestamp supplied by the exporter.
+    pub original_export_time_ns: u64,
+    /// Export timestamp after optional receipt-time fallback.
+    pub effective_export_time_ns: u64,
     pub system_uptime_ms: Option<u32>,
+}
+
+impl RecordTimeContext {
+    fn adjust_to_effective_clock(self, timestamp_ns: u64) -> u64 {
+        if self.effective_export_time_ns >= self.original_export_time_ns {
+            timestamp_ns.saturating_add(
+                self.effective_export_time_ns - self.original_export_time_ns,
+            )
+        } else {
+            timestamp_ns.saturating_sub(
+                self.original_export_time_ns - self.effective_export_time_ns,
+            )
+        }
+    }
 }
 
 /// Identity used to key the flow state cache.
@@ -75,10 +92,14 @@ pub struct FlowFields {
     pub proto: u8,
     pub bytes: u64,
     pub packets: u64,
-    /// Flow start time, in nanoseconds since the Unix epoch.
+    /// Effective flow start time in Unix nanoseconds, corrected when fallback is used.
     pub start_time_ns: u64,
-    /// Flow end time, in nanoseconds since the Unix epoch.
+    /// Effective flow end time in Unix nanoseconds, corrected when fallback is used.
     pub end_time_ns: u64,
+    /// Unmodified exporter-derived flow start time.
+    pub original_start_time_ns: u64,
+    /// Unmodified exporter-derived flow end time.
+    pub original_end_time_ns: u64,
 }
 
 impl FlowFields {
@@ -164,9 +185,17 @@ impl FlowFields {
             offset = end;
         }
 
-        let fallback = time_context.map(|ctx| ctx.export_time_ns).unwrap_or(0);
-        fields.start_time_ns = timestamps.resolve_start(time_context).unwrap_or(fallback);
-        fields.end_time_ns = timestamps.resolve_end(time_context).unwrap_or(fallback);
+        let fallback = time_context
+            .map(|ctx| ctx.original_export_time_ns)
+            .unwrap_or(0);
+        fields.original_start_time_ns = timestamps.resolve_start(time_context).unwrap_or(fallback);
+        fields.original_end_time_ns = timestamps.resolve_end(time_context).unwrap_or(fallback);
+        fields.start_time_ns = time_context
+            .map(|ctx| ctx.adjust_to_effective_clock(fields.original_start_time_ns))
+            .unwrap_or(fields.original_start_time_ns);
+        fields.end_time_ns = time_context
+            .map(|ctx| ctx.adjust_to_effective_clock(fields.original_end_time_ns))
+            .unwrap_or(fields.original_end_time_ns);
 
         Some((fields, offset))
     }
@@ -198,8 +227,10 @@ impl FlowFields {
         fields.dst_port = read_be_u16(&record[34..36]); // dstport
         fields.proto = record[38]; // prot
         if let Some(ctx) = time_context {
-            fields.start_time_ns = uptime_timestamp_ns(ctx, first_ms);
-            fields.end_time_ns = uptime_timestamp_ns(ctx, last_ms);
+            fields.original_start_time_ns = uptime_timestamp_ns(ctx, first_ms);
+            fields.original_end_time_ns = uptime_timestamp_ns(ctx, last_ms);
+            fields.start_time_ns = ctx.adjust_to_effective_clock(fields.original_start_time_ns);
+            fields.end_time_ns = ctx.adjust_to_effective_clock(fields.original_end_time_ns);
         }
         Some(fields)
     }
@@ -266,10 +297,14 @@ pub struct FlowRecordFFI {
     pub proto: u8,
     pub bytes: u64,
     pub packets: u64,
-    /// Flow start time as Unix epoch nanoseconds.
+    /// Effective flow start time as Unix epoch nanoseconds.
     pub start_time_ns: u64,
-    /// Flow end time as Unix epoch nanoseconds.
+    /// Effective flow end time as Unix epoch nanoseconds.
     pub end_time_ns: u64,
+    /// Unmodified exporter-derived flow start time.
+    pub original_start_time_ns: u64,
+    /// Unmodified exporter-derived flow end time.
+    pub original_end_time_ns: u64,
 }
 
 impl FlowRecord {
@@ -284,6 +319,8 @@ impl FlowRecord {
             packets: self.packets,
             start_time_ns: self.start_time_ns,
             end_time_ns: self.end_time_ns,
+            original_start_time_ns: self.original_start_time_ns,
+            original_end_time_ns: self.original_end_time_ns,
         }
     }
 }
@@ -362,11 +399,11 @@ impl DecodedTimestamps {
 
 fn uptime_timestamp_ns(context: RecordTimeContext, switched_ms: u32) -> u64 {
     let Some(uptime_ms) = context.system_uptime_ms else {
-        return context.export_time_ns;
+        return context.original_export_time_ns;
     };
     let elapsed_ms = uptime_ms.wrapping_sub(switched_ms) as u64;
     context
-        .export_time_ns
+        .original_export_time_ns
         .saturating_sub(elapsed_ms.saturating_mul(NS_PER_MILLISECOND))
 }
 
@@ -376,7 +413,7 @@ fn uptime_timestamp_ns(context: RecordTimeContext, switched_ms: u32) -> u64 {
 fn ntp_to_unix_ns(value: u64, context: Option<RecordTimeContext>) -> u64 {
     let seconds_low = value >> 32;
     let fraction = value as u32 as u64;
-    let reference_unix_seconds = context.map(|ctx| ctx.export_time_ns / NS_PER_SECOND);
+    let reference_unix_seconds = context.map(|ctx| ctx.original_export_time_ns / NS_PER_SECOND);
     let era = reference_unix_seconds
         .map(|reference| {
             let reference_ntp = reference.saturating_add(NTP_UNIX_EPOCH_OFFSET);

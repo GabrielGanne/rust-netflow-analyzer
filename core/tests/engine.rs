@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use common::{sample_v9_packet, Builder};
 use netflow_analyzer_core::cache::AgingConfig;
+use netflow_analyzer_core::clock::ClockConfig;
 use netflow_analyzer_core::records::FlowRecord;
 use netflow_analyzer_core::{EngineConfig, FlowContext};
 
@@ -96,4 +97,83 @@ fn background_aging_evicts_and_emits() {
     assert_eq!(ctx.flows.len(), 0, "idle flow evicted");
     assert!(!emitted.lock().unwrap().is_empty(), "eviction emitted a record");
     assert!(ctx.stats().flows_evicted >= 1);
+}
+
+#[test]
+fn clock_check_drops_skewed_packet_and_tracks_domain() {
+    let cfg = EngineConfig {
+        clock: ClockConfig {
+            sync_check_enabled: true,
+            max_skew: Duration::from_nanos(10),
+            fallback_to_receipt_time: false,
+        },
+        ..EngineConfig::default()
+    };
+    let ctx = FlowContext::with_config(cfg);
+    let export_ns = 1_700_000_000_000_000_000;
+
+    let result = ctx.process_packet_at(&sample_v9_packet(), export_ns + 11);
+    assert!(result.is_err());
+    assert_eq!(ctx.stats().clock_dropped_packets, 1);
+    assert_eq!(ctx.stats().clock_fallback_packets, 0);
+    assert_eq!(ctx.templates.len(), 0, "the entire packet is rejected");
+
+    let state = ctx.clocks.get(42).expect("domain clock state");
+    assert_eq!(state.last_skew_ns, 11);
+    assert_eq!(state.clock_issues, 1);
+    assert!(!state.last_was_usable);
+}
+
+#[test]
+fn clock_fallback_preserves_original_and_rebases_effective_times() {
+    let cfg = EngineConfig {
+        clock: ClockConfig {
+            sync_check_enabled: true,
+            max_skew: Duration::from_nanos(10),
+            fallback_to_receipt_time: true,
+        },
+        ..EngineConfig::default()
+    };
+    let ctx = FlowContext::with_config(cfg);
+    let export_ns = 1_700_000_000_000_000_000;
+    let receipt_ns = export_ns + 1_000_000_000;
+
+    assert_eq!(
+        ctx.process_packet_at(&sample_v9_packet(), receipt_ns),
+        Ok(1)
+    );
+    assert_eq!(ctx.stats().clock_dropped_packets, 0);
+    assert_eq!(ctx.stats().clock_fallback_packets, 1);
+
+    let emitted: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = emitted.clone();
+    ctx.flush(move |record| sink.lock().unwrap().push(record.clone()));
+    let records = emitted.lock().unwrap();
+    assert_eq!(records[0].original_start_time_ns, export_ns);
+    assert_eq!(records[0].original_end_time_ns, export_ns);
+    assert_eq!(records[0].start_time_ns, receipt_ns);
+    assert_eq!(records[0].end_time_ns, receipt_ns);
+}
+
+#[test]
+fn clock_state_is_independent_per_domain() {
+    let ctx = FlowContext::new();
+    let first = sample_v9_packet();
+    let mut second = sample_v9_packet();
+    second[16..20].copy_from_slice(&43_u32.to_be_bytes());
+
+    ctx.process_packet_at(&first, 1_700_000_001_000_000_000)
+        .unwrap();
+    ctx.process_packet_at(&second, 1_700_000_002_000_000_000)
+        .unwrap();
+
+    assert_eq!(ctx.clocks.len(), 2);
+    assert_eq!(
+        ctx.clocks.get(42).unwrap().last_receipt_time_ns,
+        1_700_000_001_000_000_000
+    );
+    assert_eq!(
+        ctx.clocks.get(43).unwrap().last_receipt_time_ns,
+        1_700_000_002_000_000_000
+    );
 }
