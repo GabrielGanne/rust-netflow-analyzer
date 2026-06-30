@@ -31,6 +31,12 @@ fn decodes_v5_packet_with_multiple_records() {
     assert_eq!(flows.len(), 2);
     let total_bytes: u64 = flows.iter().map(|f| f.bytes).sum();
     assert_eq!(total_bytes, 1400);
+    assert!(flows
+        .iter()
+        .all(|f| f.start_time_ns == 1_699_999_999_000_000_000));
+    assert!(flows
+        .iter()
+        .all(|f| f.end_time_ns == 1_699_999_999_000_000_000));
 }
 
 #[test]

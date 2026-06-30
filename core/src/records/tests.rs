@@ -258,6 +258,8 @@ fn flow_record_round_trips_to_ffi() {
         proto: 17,
         bytes: 9,
         packets: 3,
+        start_time_ns: 1_700_000_000_123_456_789,
+        end_time_ns: 1_700_000_001_987_654_321,
     };
     let record = FlowRecord::from_fields(&fields, Instant::now());
     assert_eq!(record.fields, fields);
@@ -268,4 +270,76 @@ fn flow_record_round_trips_to_ffi() {
     assert_eq!(ffi.proto, 17);
     assert_eq!(ffi.bytes, 9);
     assert_eq!(ffi.packets, 3);
+    assert_eq!(ffi.start_time_ns, 1_700_000_000_123_456_789);
+    assert_eq!(ffi.end_time_ns, 1_700_000_001_987_654_321);
+}
+
+#[test]
+fn resolves_uptime_timestamps_to_unix_nanoseconds() {
+    let tmpl = TemplateRecord::from_fields(
+        600,
+        vec![
+            field(IE_FLOW_START_SYS_UP_TIME, 4),
+            field(IE_FLOW_END_SYS_UP_TIME, 4),
+        ],
+    );
+    let mut rec = Vec::new();
+    rec.extend_from_slice(&9_000_u32.to_be_bytes());
+    rec.extend_from_slice(&9_750_u32.to_be_bytes());
+    let context = RecordTimeContext {
+        export_time_ns: 1_700_000_000_123_456_789,
+        system_uptime_ms: Some(10_000),
+    };
+
+    let (fields, _) = FlowFields::from_record_sized_at(&tmpl, &rec, Some(context)).unwrap();
+    assert_eq!(fields.start_time_ns, 1_699_999_999_123_456_789);
+    assert_eq!(fields.end_time_ns, 1_699_999_999_873_456_789);
+}
+
+#[test]
+fn normalizes_all_ipfix_absolute_time_units() {
+    let seconds = 1_700_000_000_u64;
+    let unix_ns = seconds * NS_PER_SECOND + 123_456_788;
+    let ntp_seconds = seconds + NTP_UNIX_EPOCH_OFFSET;
+    let fraction = ((123_456_789_u128 << 32) / NS_PER_SECOND as u128) as u64;
+    let ntp = (ntp_seconds << 32) | fraction;
+
+    let tmpl = TemplateRecord::from_fields(
+        601,
+        vec![
+            field(IE_FLOW_START_SECONDS, 4),
+            field(IE_FLOW_END_MILLISECONDS, 8),
+            field(IE_FLOW_START_NANOSECONDS, 8),
+            field(IE_FLOW_END_MICROSECONDS, 8),
+        ],
+    );
+    let mut rec = Vec::new();
+    rec.extend_from_slice(&(seconds as u32).to_be_bytes());
+    rec.extend_from_slice(&(seconds * 1_000 + 987).to_be_bytes());
+    rec.extend_from_slice(&ntp.to_be_bytes());
+    rec.extend_from_slice(&ntp.to_be_bytes());
+    let context = RecordTimeContext {
+        export_time_ns: seconds * NS_PER_SECOND,
+        system_uptime_ms: None,
+    };
+
+    let (fields, _) = FlowFields::from_record_sized_at(&tmpl, &rec, Some(context)).unwrap();
+    // The later elements win; binary NTP fractions are rounded down to ns.
+    assert_eq!(fields.start_time_ns, unix_ns);
+    assert_eq!(fields.end_time_ns, unix_ns);
+}
+
+#[test]
+fn v5_timestamps_preserve_header_nanoseconds() {
+    let mut rec = v5_record([1, 2, 3, 4], [5, 6, 7, 8], 1, 2, 3, 4, 6);
+    rec[24..28].copy_from_slice(&4_000_u32.to_be_bytes());
+    rec[28..32].copy_from_slice(&4_999_u32.to_be_bytes());
+    let context = RecordTimeContext {
+        export_time_ns: 1_700_000_000_987_654_321,
+        system_uptime_ms: Some(5_000),
+    };
+
+    let fields = FlowFields::from_v5_record_at(&rec, Some(context)).unwrap();
+    assert_eq!(fields.start_time_ns, 1_699_999_999_987_654_321);
+    assert_eq!(fields.end_time_ns, 1_700_000_000_986_654_321);
 }

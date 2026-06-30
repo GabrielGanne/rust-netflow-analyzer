@@ -45,6 +45,7 @@ fn parses_v5_header_and_routes() {
             assert_eq!(h.engine_type, 1);
             assert_eq!(h.engine_id, 2);
             assert_eq!(h.sampling_interval, 64);
+            assert_eq!(header.export_time_ns(), 0x6500_0000_u64 * 1_000_000_000 + 1);
         }
         other => panic!("expected v5, got {other:?}"),
     }

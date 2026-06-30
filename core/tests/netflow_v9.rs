@@ -45,6 +45,8 @@ fn flush_emits_decoded_fields() {
     assert_eq!(f.proto, 6);
     assert_eq!(f.bytes, 1500);
     assert_eq!(f.packets, 10);
+    assert_eq!(f.start_time_ns, 1_700_000_000_000_000_000);
+    assert_eq!(f.end_time_ns, 1_700_000_000_000_000_000);
 
     // The cache is emptied by flush.
     assert_eq!(ctx.flows.len(), 0);

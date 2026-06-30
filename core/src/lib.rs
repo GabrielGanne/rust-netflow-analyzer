@@ -13,7 +13,7 @@ use parser::{
     ParsedHeader, FIRST_DATA_SET_ID, FLOWSET_ID_V9_OPTIONS, FLOWSET_ID_V9_TEMPLATE,
     SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
 };
-use records::{FlowFields, FlowRecord};
+use records::{FlowFields, FlowRecord, RecordTimeContext};
 use stats::{InternalCounters, LibraryStatsFFI};
 
 /// Top-level engine configuration combining cache caps and aging timings.
@@ -87,10 +87,18 @@ impl FlowContext {
         // NetFlow v5 is template-less: the payload is simply `count` fixed-size
         // records, so it takes a dedicated decode path instead of a set walk.
         if let ParsedHeader::V5(ref h) = header {
-            return Ok(self.process_v5_records(payload, h.count as usize));
+            let time_context = RecordTimeContext {
+                export_time_ns: header.export_time_ns(),
+                system_uptime_ms: header.system_uptime_ms(),
+            };
+            return Ok(self.process_v5_records(payload, h.count as usize, time_context));
         }
 
         let domain = header.domain_id();
+        let time_context = RecordTimeContext {
+            export_time_ns: header.export_time_ns(),
+            system_uptime_ms: header.system_uptime_ms(),
+        };
         let mut data_records = 0usize;
 
         // Walk each FlowSet/Set in the payload. Any structural inconsistency
@@ -125,7 +133,7 @@ impl FlowContext {
                 // Options templates carry metadata, not flow records; skip them.
                 id if id == FLOWSET_ID_V9_OPTIONS || id == SET_ID_IPFIX_OPTIONS => {}
                 id if id >= FIRST_DATA_SET_ID => {
-                    data_records += self.process_data_set(domain, id, body);
+                    data_records += self.process_data_set(domain, id, body, time_context);
                 }
                 // Reserved/unknown set ids (e.g. 4..=255) are ignored.
                 _ => {}
@@ -140,7 +148,12 @@ impl FlowContext {
     }
 
     /// Decodes up to `count` fixed-format NetFlow v5 records from the payload.
-    fn process_v5_records(&self, payload: &[u8], count: usize) -> usize {
+    fn process_v5_records(
+        &self,
+        payload: &[u8],
+        count: usize,
+        time_context: RecordTimeContext,
+    ) -> usize {
         let mut decoded = 0usize;
         // Trust the header count but never read past the buffer.
         let available = payload.len() / V5_RECORD_LEN;
@@ -148,7 +161,7 @@ impl FlowContext {
             .into_iter()
             .take(count.min(available))
         {
-            if let Some(fields) = FlowFields::from_v5_record(record) {
+            if let Some(fields) = FlowFields::from_v5_record_at(record, Some(time_context)) {
                 self.flows.upsert(&fields, &self.counters);
                 decoded += 1;
             }
@@ -160,7 +173,13 @@ impl FlowContext {
     }
 
     /// Decodes every data record in a data FlowSet body against its template.
-    fn process_data_set(&self, domain: u32, template_id: u16, body: &[u8]) -> usize {
+    fn process_data_set(
+        &self,
+        domain: u32,
+        template_id: u16,
+        body: &[u8],
+        time_context: RecordTimeContext,
+    ) -> usize {
         // Without the template we cannot interpret the records yet; the exporter
         // will resend it periodically, so we simply skip until then.
         let Some(template) = self.templates.get(domain, template_id) else {
@@ -172,7 +191,9 @@ impl FlowContext {
         match template.fixed_length {
             Some(record_len) if record_len > 0 => {
                 for record in parser::split_fixed_records(body, record_len) {
-                    if let Some(fields) = FlowFields::from_record(&template, record) {
+                    if let Some((fields, _)) =
+                        FlowFields::from_record_sized_at(&template, record, Some(time_context))
+                    {
                         self.flows.upsert_in_domain(domain, &fields, &self.counters);
                         count += 1;
                     }
@@ -182,7 +203,7 @@ impl FlowContext {
             None => {
                 let mut cursor = body;
                 while !cursor.is_empty() {
-                    match FlowFields::from_record_sized(&template, cursor) {
+                    match FlowFields::from_record_sized_at(&template, cursor, Some(time_context)) {
                         Some((fields, consumed)) if consumed > 0 && consumed <= cursor.len() => {
                             self.flows.upsert_in_domain(domain, &fields, &self.counters);
                             count += 1;

@@ -23,4 +23,6 @@ fn decodes_ipfix_packet() {
     assert_eq!(&flows[0].src_ip[12..16], &[192, 168, 0, 1]);
     assert_eq!(&flows[0].dst_ip[12..16], &[8, 8, 8, 8]);
     assert_eq!(flows[0].proto, 17);
+    assert_eq!(flows[0].start_time_ns, 1_700_000_000_000_000_000);
+    assert_eq!(flows[0].end_time_ns, 1_700_000_000_000_000_000);
 }

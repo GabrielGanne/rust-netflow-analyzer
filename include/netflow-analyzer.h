@@ -35,6 +35,14 @@ typedef struct {
     uint8_t proto;
     uint64_t bytes;
     uint64_t packets;
+    /**
+     * Flow start time as Unix epoch nanoseconds.
+     */
+    uint64_t start_time_ns;
+    /**
+     * Flow end time as Unix epoch nanoseconds.
+     */
+    uint64_t end_time_ns;
 } FlowRecordFFI;
 
 /**

@@ -17,6 +17,28 @@ const IE_DESTINATION_IPV6_ADDRESS: u16 = 28;
 const IE_OCTET_TOTAL_COUNT: u16 = 85;
 const IE_PACKET_TOTAL_COUNT: u16 = 86;
 const IE_FLOW_ID: u16 = 148;
+const IE_FLOW_END_SYS_UP_TIME: u16 = 21;
+const IE_FLOW_START_SYS_UP_TIME: u16 = 22;
+const IE_FLOW_START_SECONDS: u16 = 150;
+const IE_FLOW_END_SECONDS: u16 = 151;
+const IE_FLOW_START_MILLISECONDS: u16 = 152;
+const IE_FLOW_END_MILLISECONDS: u16 = 153;
+const IE_FLOW_START_MICROSECONDS: u16 = 154;
+const IE_FLOW_END_MICROSECONDS: u16 = 155;
+const IE_FLOW_START_NANOSECONDS: u16 = 156;
+const IE_FLOW_END_NANOSECONDS: u16 = 157;
+
+const NS_PER_SECOND: u64 = 1_000_000_000;
+const NS_PER_MILLISECOND: u64 = 1_000_000;
+const NTP_UNIX_EPOCH_OFFSET: u64 = 2_208_988_800;
+const NTP_ERA_SECONDS: u64 = 1_u64 << 32;
+
+/// Packet-level clock values used to resolve relative exporter timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordTimeContext {
+    pub export_time_ns: u64,
+    pub system_uptime_ms: Option<u32>,
+}
 
 /// Identity used to key the flow state cache.
 ///
@@ -53,6 +75,10 @@ pub struct FlowFields {
     pub proto: u8,
     pub bytes: u64,
     pub packets: u64,
+    /// Flow start time, in nanoseconds since the Unix epoch.
+    pub start_time_ns: u64,
+    /// Flow end time, in nanoseconds since the Unix epoch.
+    pub end_time_ns: u64,
 }
 
 impl FlowFields {
@@ -94,7 +120,18 @@ impl FlowFields {
     /// This is required when walking variable-length records back to back,
     /// where the record boundary is only known after decoding the layout.
     pub fn from_record_sized(template: &TemplateRecord, record: &[u8]) -> Option<(Self, usize)> {
+        Self::from_record_sized_at(template, record, None)
+    }
+
+    /// Decodes a record and resolves all supported timestamp encodings to Unix
+    /// nanoseconds. Missing flow timestamps fall back to the packet export time.
+    pub fn from_record_sized_at(
+        template: &TemplateRecord,
+        record: &[u8],
+        time_context: Option<RecordTimeContext>,
+    ) -> Option<(Self, usize)> {
         let mut fields = FlowFields::default();
+        let mut timestamps = DecodedTimestamps::default();
         let mut offset: usize = 0;
 
         for field in &template.fields {
@@ -118,12 +155,18 @@ impl FlowFields {
 
             // Enterprise-specific elements share numeric ids with IANA ones, so
             // only interpret elements from the standard registry.
-            if field.enterprise_number.is_none() {
+            if field.enterprise_number.is_none()
+                && !timestamps.apply_element(field.type_id, raw)
+            {
                 fields.apply_element(field.type_id, raw);
             }
 
             offset = end;
         }
+
+        let fallback = time_context.map(|ctx| ctx.export_time_ns).unwrap_or(0);
+        fields.start_time_ns = timestamps.resolve_start(time_context).unwrap_or(fallback);
+        fields.end_time_ns = timestamps.resolve_end(time_context).unwrap_or(fallback);
 
         Some((fields, offset))
     }
@@ -133,6 +176,15 @@ impl FlowFields {
     /// Unlike v9/IPFIX, v5 has no templates: the field layout is hard-coded by
     /// the protocol. Returns `None` if the slice is shorter than one record.
     pub fn from_v5_record(record: &[u8]) -> Option<Self> {
+        Self::from_v5_record_at(record, None)
+    }
+
+    /// Decodes a NetFlow v5 record and converts its millisecond uptime stamps
+    /// to Unix nanoseconds using the packet header clock.
+    pub fn from_v5_record_at(
+        record: &[u8],
+        time_context: Option<RecordTimeContext>,
+    ) -> Option<Self> {
         let record = record.get(..V5_RECORD_LEN)?;
 
         let mut fields = FlowFields::default();
@@ -140,9 +192,15 @@ impl FlowFields {
         copy_ipv4(&mut fields.dst_ip, &record[4..8]); // dstaddr
         fields.packets = read_be_uint(&record[16..20]); // dPkts
         fields.bytes = read_be_uint(&record[20..24]); // dOctets
+        let first_ms = u32::from_be_bytes(record[24..28].try_into().ok()?);
+        let last_ms = u32::from_be_bytes(record[28..32].try_into().ok()?);
         fields.src_port = read_be_u16(&record[32..34]); // srcport
         fields.dst_port = read_be_u16(&record[34..36]); // dstport
         fields.proto = record[38]; // prot
+        if let Some(ctx) = time_context {
+            fields.start_time_ns = uptime_timestamp_ns(ctx, first_ms);
+            fields.end_time_ns = uptime_timestamp_ns(ctx, last_ms);
+        }
         Some(fields)
     }
 
@@ -168,16 +226,16 @@ impl FlowFields {
 pub struct FlowRecord {
     /// The normalized flow data accumulated by the cache.
     pub fields: FlowFields,
-    pub first_switched: Instant,
-    pub last_switched: Instant,
+    pub(crate) first_observed: Instant,
+    pub(crate) last_observed: Instant,
 }
 
 impl FlowRecord {
     pub fn from_fields(fields: &FlowFields, now: Instant) -> Self {
         Self {
             fields: *fields,
-            first_switched: now,
-            last_switched: now,
+            first_observed: now,
+            last_observed: now,
         }
     }
 }
@@ -208,6 +266,10 @@ pub struct FlowRecordFFI {
     pub proto: u8,
     pub bytes: u64,
     pub packets: u64,
+    /// Flow start time as Unix epoch nanoseconds.
+    pub start_time_ns: u64,
+    /// Flow end time as Unix epoch nanoseconds.
+    pub end_time_ns: u64,
 }
 
 impl FlowRecord {
@@ -220,8 +282,129 @@ impl FlowRecord {
             proto: self.proto,
             bytes: self.bytes,
             packets: self.packets,
+            start_time_ns: self.start_time_ns,
+            end_time_ns: self.end_time_ns,
         }
     }
+}
+
+#[derive(Default)]
+struct DecodedTimestamps {
+    start_absolute_ns: Option<u64>,
+    end_absolute_ns: Option<u64>,
+    start_precision: u8,
+    end_precision: u8,
+    start_uptime_ms: Option<u32>,
+    end_uptime_ms: Option<u32>,
+    start_ntp: Option<u64>,
+    end_ntp: Option<u64>,
+}
+
+impl DecodedTimestamps {
+    fn apply_element(&mut self, type_id: u16, raw: &[u8]) -> bool {
+        let value = read_be_uint(raw);
+        match type_id {
+            IE_FLOW_START_SYS_UP_TIME => self.start_uptime_ms = Some(value as u32),
+            IE_FLOW_END_SYS_UP_TIME => self.end_uptime_ms = Some(value as u32),
+            IE_FLOW_START_SECONDS => self.set_start(value.saturating_mul(NS_PER_SECOND), 1),
+            IE_FLOW_END_SECONDS => self.set_end(value.saturating_mul(NS_PER_SECOND), 1),
+            IE_FLOW_START_MILLISECONDS => {
+                self.set_start(value.saturating_mul(NS_PER_MILLISECOND), 2)
+            }
+            IE_FLOW_END_MILLISECONDS => self.set_end(value.saturating_mul(NS_PER_MILLISECOND), 2),
+            IE_FLOW_START_MICROSECONDS => self.start_ntp = Some(value),
+            IE_FLOW_END_MICROSECONDS => self.end_ntp = Some(value),
+            IE_FLOW_START_NANOSECONDS => self.start_ntp = Some(value),
+            IE_FLOW_END_NANOSECONDS => self.end_ntp = Some(value),
+            _ => return false,
+        }
+        true
+    }
+
+    fn set_start(&mut self, value: u64, precision: u8) {
+        if precision >= self.start_precision {
+            self.start_absolute_ns = Some(value);
+            self.start_precision = precision;
+        }
+    }
+
+    fn set_end(&mut self, value: u64, precision: u8) {
+        if precision >= self.end_precision {
+            self.end_absolute_ns = Some(value);
+            self.end_precision = precision;
+        }
+    }
+
+    fn resolve_start(&self, context: Option<RecordTimeContext>) -> Option<u64> {
+        // Prefer the sub-second NTP representation when exporters include
+        // multiple time elements for the same boundary.
+        self.start_ntp
+            .map(|v| ntp_to_unix_ns(v, context))
+            .or(self.start_absolute_ns)
+            .or_else(|| {
+                self.start_uptime_ms
+                    .zip(context)
+                    .map(|(v, ctx)| uptime_timestamp_ns(ctx, v))
+            })
+    }
+
+    fn resolve_end(&self, context: Option<RecordTimeContext>) -> Option<u64> {
+        self.end_ntp
+            .map(|v| ntp_to_unix_ns(v, context))
+            .or(self.end_absolute_ns)
+            .or_else(|| {
+                self.end_uptime_ms
+                    .zip(context)
+                    .map(|(v, ctx)| uptime_timestamp_ns(ctx, v))
+            })
+    }
+}
+
+fn uptime_timestamp_ns(context: RecordTimeContext, switched_ms: u32) -> u64 {
+    let Some(uptime_ms) = context.system_uptime_ms else {
+        return context.export_time_ns;
+    };
+    let elapsed_ms = uptime_ms.wrapping_sub(switched_ms) as u64;
+    context
+        .export_time_ns
+        .saturating_sub(elapsed_ms.saturating_mul(NS_PER_MILLISECOND))
+}
+
+/// IPFIX dateTimeMicroseconds/dateTimeNanoseconds use the 64-bit NTP format:
+/// 32 seconds bits followed by a 32-bit binary fraction. Pick the NTP era
+/// closest to the packet export time so dates after the 2036 rollover work.
+fn ntp_to_unix_ns(value: u64, context: Option<RecordTimeContext>) -> u64 {
+    let seconds_low = value >> 32;
+    let fraction = value as u32 as u64;
+    let reference_unix_seconds = context.map(|ctx| ctx.export_time_ns / NS_PER_SECOND);
+    let era = reference_unix_seconds
+        .map(|reference| {
+            let reference_ntp = reference.saturating_add(NTP_UNIX_EPOCH_OFFSET);
+            let base_era = reference_ntp / NTP_ERA_SECONDS;
+            let candidates = [
+                base_era.saturating_sub(1),
+                base_era,
+                base_era.saturating_add(1),
+            ];
+            candidates
+                .into_iter()
+                .min_by_key(|candidate| {
+                    let seconds = candidate
+                        .saturating_mul(NTP_ERA_SECONDS)
+                        .saturating_add(seconds_low);
+                    seconds.abs_diff(reference_ntp)
+                })
+                .unwrap_or(base_era)
+        })
+        .unwrap_or(0);
+    let ntp_seconds = era
+        .saturating_mul(NTP_ERA_SECONDS)
+        .saturating_add(seconds_low);
+    let unix_seconds = ntp_seconds.saturating_sub(NTP_UNIX_EPOCH_OFFSET);
+    let nanos = ((fraction as u128 * NS_PER_SECOND as u128) >> 32) as u64;
+    unix_seconds
+        .saturating_mul(NS_PER_SECOND)
+        .saturating_add(nanos)
 }
 
 // --- Bounds-checked big-endian readers ---

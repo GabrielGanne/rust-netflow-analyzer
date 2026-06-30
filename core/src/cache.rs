@@ -75,7 +75,8 @@ impl FlowCache {
 
     /// Folds a freshly decoded record into the persistent flow state.
     ///
-    /// Existing flows accumulate counters and bump their `last_switched` stamp.
+    /// Existing flows accumulate counters and update both exporter and local
+    /// observation timestamps.
     /// New flows are admitted only while the cache is below its hard cap; once
     /// full, the record is dropped and counted rather than risking OOM.
     pub fn upsert(&self, fields: &FlowFields, counters: &InternalCounters) {
@@ -94,7 +95,13 @@ impl FlowCache {
         if let Some(mut existing) = self.map.get_mut(&key) {
             existing.bytes = existing.bytes.saturating_add(fields.bytes);
             existing.packets = existing.packets.saturating_add(fields.packets);
-            existing.last_switched = Instant::now();
+            if fields.start_time_ns != 0
+                && (existing.start_time_ns == 0 || fields.start_time_ns < existing.start_time_ns)
+            {
+                existing.start_time_ns = fields.start_time_ns;
+            }
+            existing.end_time_ns = existing.end_time_ns.max(fields.end_time_ns);
+            existing.last_observed = Instant::now();
             return;
         }
 
@@ -128,7 +135,7 @@ impl FlowCache {
         let now = Instant::now();
         self.map.retain(|_key, record| {
             // Idle timeout: no activity for too long -> emit and evict.
-            if now.duration_since(record.last_switched) >= cfg.idle_timeout {
+            if now.duration_since(record.last_observed) >= cfg.idle_timeout {
                 on_emit(record);
                 counters.flows_evicted.fetch_add(1, Ordering::Relaxed);
                 return false;
@@ -136,12 +143,12 @@ impl FlowCache {
 
             // Active timeout: long-lived flow -> emit an interim snapshot and
             // reset counters without destroying the cache entry.
-            if now.duration_since(record.first_switched) >= cfg.active_timeout {
+            if now.duration_since(record.first_observed) >= cfg.active_timeout {
                 on_emit(record);
                 counters.flows_evicted.fetch_add(1, Ordering::Relaxed);
                 record.bytes = 0;
                 record.packets = 0;
-                record.first_switched = now;
+                record.first_observed = now;
             }
 
             true
@@ -275,6 +282,8 @@ mod tests {
             proto,
             bytes: 100,
             packets: 1,
+            start_time_ns: 0,
+            end_time_ns: 0,
         }
     }
 
@@ -306,11 +315,22 @@ mod tests {
     fn flow_cache_upsert_accumulates() {
         let counters = InternalCounters::default();
         let cache = FlowCache::new(10);
-        cache.upsert(&fields(6), &counters);
-        cache.upsert(&fields(6), &counters); // same key
+        let mut first = fields(6);
+        first.start_time_ns = 20;
+        first.end_time_ns = 30;
+        cache.upsert(&first, &counters);
+        let mut second = fields(6);
+        second.start_time_ns = 10;
+        second.end_time_ns = 40;
+        cache.upsert(&second, &counters); // same key
 
         assert_eq!(cache.len(), 1);
         assert_eq!(counters.flows_dropped.load(Ordering::Relaxed), 0);
+        let record = cache.map.get(&first.key()).unwrap();
+        assert_eq!(record.bytes, 200);
+        assert_eq!(record.packets, 2);
+        assert_eq!(record.start_time_ns, 10);
+        assert_eq!(record.end_time_ns, 40);
     }
 
     #[test]

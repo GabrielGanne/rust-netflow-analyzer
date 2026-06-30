@@ -153,6 +153,30 @@ impl ParsedHeader {
             ParsedHeader::Ipfix(h) => h.observation_domain_id,
         }
     }
+
+    /// Export time normalized to nanoseconds since the Unix epoch.
+    ///
+    /// NetFlow v5 supplies a nanosecond remainder. NetFlow v9 and IPFIX only
+    /// carry whole seconds in their headers, so their sub-second part is zero.
+    pub fn export_time_ns(&self) -> u64 {
+        const NS_PER_SECOND: u64 = 1_000_000_000;
+        match self {
+            ParsedHeader::V5(h) => (h.unix_seconds as u64)
+                .saturating_mul(NS_PER_SECOND)
+                .saturating_add(h.unix_nanos as u64),
+            ParsedHeader::V9(h) => (h.unix_seconds as u64).saturating_mul(NS_PER_SECOND),
+            ParsedHeader::Ipfix(h) => (h.export_time as u64).saturating_mul(NS_PER_SECOND),
+        }
+    }
+
+    /// Exporter uptime in milliseconds, when the protocol header provides it.
+    pub fn system_uptime_ms(&self) -> Option<u32> {
+        match self {
+            ParsedHeader::V5(h) => Some(h.system_uptime),
+            ParsedHeader::V9(h) => Some(h.system_uptime),
+            ParsedHeader::Ipfix(_) => None,
+        }
+    }
 }
 
 // --- FlowSet / Set Identifiers (RFC 3954 & RFC 7011) ---
