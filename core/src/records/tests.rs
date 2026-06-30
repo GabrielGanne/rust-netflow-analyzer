@@ -91,7 +91,41 @@ fn from_record_decodes_full_tuple() {
     assert_eq!(fields.src_port, 12345);
     assert_eq!(fields.dst_port, 443);
     assert_eq!(fields.proto, 6);
-    assert_eq!(fields.key().proto, 6);
+    assert!(matches!(fields.key(), FlowKey::FiveTuple { proto: 6, .. }));
+}
+
+#[test]
+fn from_record_prefers_flow_id_for_identity() {
+    let tmpl = TemplateRecord::from_fields(
+        257,
+        vec![
+            field(IE_FLOW_ID, 8),
+            field(IE_SOURCE_IPV4_ADDRESS, 4),
+            field(IE_DESTINATION_IPV4_ADDRESS, 4),
+        ],
+    );
+    let mut rec = 0x0102_0304_0506_0708_u64.to_be_bytes().to_vec();
+    rec.extend_from_slice(&[192, 0, 2, 1]);
+    rec.extend_from_slice(&[198, 51, 100, 2]);
+
+    let fields = FlowFields::from_record(&tmpl, &rec).unwrap();
+    assert_eq!(fields.flow_id, Some(0x0102_0304_0506_0708));
+    assert_eq!(
+        fields.key_in_domain(42),
+        FlowKey::FlowId {
+            observation_domain_id: 42,
+            flow_id: 0x0102_0304_0506_0708,
+        }
+    );
+}
+
+#[test]
+fn zero_flow_id_is_present_and_used_as_identity() {
+    let tmpl = TemplateRecord::from_fields(258, vec![field(IE_FLOW_ID, 8)]);
+    let fields = FlowFields::from_record(&tmpl, &[0; 8]).unwrap();
+
+    assert_eq!(fields.flow_id, Some(0));
+    assert!(matches!(fields.key(), FlowKey::FlowId { flow_id: 0, .. }));
 }
 
 #[test]
@@ -216,6 +250,7 @@ fn from_v5_record_rejects_short_input() {
 fn flow_record_round_trips_to_ffi() {
     use std::time::Instant;
     let fields = FlowFields {
+        flow_id: None,
         src_ip: [1u8; 16],
         dst_ip: [2u8; 16],
         src_port: 1,

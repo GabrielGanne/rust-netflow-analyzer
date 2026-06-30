@@ -15,21 +15,33 @@ const IE_SOURCE_IPV6_ADDRESS: u16 = 27;
 const IE_DESTINATION_IPV6_ADDRESS: u16 = 28;
 const IE_OCTET_TOTAL_COUNT: u16 = 85;
 const IE_PACKET_TOTAL_COUNT: u16 = 86;
+const IE_FLOW_ID: u16 = 148;
 
-/// Identity 5-tuple used to key the flow state cache.
+/// Identity used to key the flow state cache.
+///
+/// An exported IPFIX `flowId` takes precedence over the 5-tuple. Flow IDs are
+/// scoped to their observation domain, as required by the IPFIX registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FlowKey {
-    pub src_ip: [u8; 16],
-    pub dst_ip: [u8; 16],
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub proto: u8,
+pub enum FlowKey {
+    FlowId {
+        observation_domain_id: u32,
+        flow_id: u64,
+    },
+    FiveTuple {
+        src_ip: [u8; 16],
+        dst_ip: [u8; 16],
+        src_port: u16,
+        dst_port: u16,
+        proto: u8,
+    },
 }
 
 /// Volatile values decoded from a single data record before they are folded
 /// into the persistent `FlowRecord` state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlowFields {
+    /// Exporter-assigned flow identity (IPFIX information element 148).
+    pub flow_id: Option<u64>,
     pub src_ip: [u8; 16],
     pub dst_ip: [u8; 16],
     pub src_port: u16,
@@ -40,13 +52,27 @@ pub struct FlowFields {
 }
 
 impl FlowFields {
+    /// Builds a cache key for callers without an observation domain (notably
+    /// NetFlow v5). Prefer [`Self::key_in_domain`] for v9/IPFIX records.
     pub fn key(&self) -> FlowKey {
-        FlowKey {
-            src_ip: self.src_ip,
-            dst_ip: self.dst_ip,
-            src_port: self.src_port,
-            dst_port: self.dst_port,
-            proto: self.proto,
+        self.key_in_domain(0)
+    }
+
+    /// Builds the flow identity, preferring `flowId` when the exporter supplied
+    /// it and falling back to the traditional 5-tuple otherwise.
+    pub fn key_in_domain(&self, observation_domain_id: u32) -> FlowKey {
+        match self.flow_id {
+            Some(flow_id) => FlowKey::FlowId {
+                observation_domain_id,
+                flow_id,
+            },
+            None => FlowKey::FiveTuple {
+                src_ip: self.src_ip,
+                dst_ip: self.dst_ip,
+                src_port: self.src_port,
+                dst_port: self.dst_port,
+                proto: self.proto,
+            },
         }
     }
 
@@ -127,6 +153,7 @@ impl FlowFields {
             IE_PROTOCOL_IDENTIFIER => self.proto = raw.first().copied().unwrap_or(0),
             IE_OCTET_DELTA_COUNT | IE_OCTET_TOTAL_COUNT => self.bytes = read_be_uint(raw),
             IE_PACKET_DELTA_COUNT | IE_PACKET_TOTAL_COUNT => self.packets = read_be_uint(raw),
+            IE_FLOW_ID => self.flow_id = Some(read_be_uint(raw)),
             _ => {}
         }
     }

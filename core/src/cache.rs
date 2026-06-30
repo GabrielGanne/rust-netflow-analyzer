@@ -79,7 +79,18 @@ impl FlowCache {
     /// New flows are admitted only while the cache is below its hard cap; once
     /// full, the record is dropped and counted rather than risking OOM.
     pub fn upsert(&self, fields: &FlowFields, counters: &InternalCounters) {
-        let key = fields.key();
+        self.upsert_in_domain(0, fields, counters);
+    }
+
+    /// Like [`Self::upsert`], but scopes an exported `flowId` to the observation
+    /// domain in which the exporter guarantees it is unique.
+    pub fn upsert_in_domain(
+        &self,
+        observation_domain_id: u32,
+        fields: &FlowFields,
+        counters: &InternalCounters,
+    ) {
+        let key = fields.key_in_domain(observation_domain_id);
         if let Some(mut existing) = self.map.get_mut(&key) {
             existing.bytes = existing.bytes.saturating_add(fields.bytes);
             existing.packets = existing.packets.saturating_add(fields.packets);
@@ -256,6 +267,7 @@ mod tests {
 
     fn fields(proto: u8) -> FlowFields {
         FlowFields {
+            flow_id: None,
             src_ip: [0u8; 16],
             dst_ip: [0u8; 16],
             src_port: 1,
@@ -299,6 +311,23 @@ mod tests {
 
         assert_eq!(cache.len(), 1);
         assert_eq!(counters.flows_dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flow_id_overrides_tuple_and_is_scoped_to_domain() {
+        let counters = InternalCounters::default();
+        let cache = FlowCache::new(10);
+        let mut first = fields(6);
+        first.flow_id = Some(99);
+        let mut changed_tuple = fields(17);
+        changed_tuple.flow_id = Some(99);
+
+        cache.upsert_in_domain(10, &first, &counters);
+        cache.upsert_in_domain(10, &changed_tuple, &counters);
+        assert_eq!(cache.len(), 1, "flowId takes precedence over the tuple");
+
+        cache.upsert_in_domain(11, &changed_tuple, &counters);
+        assert_eq!(cache.len(), 2, "flowId is unique only within its domain");
     }
 
     #[test]

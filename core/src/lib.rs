@@ -173,7 +173,7 @@ impl FlowContext {
             Some(record_len) if record_len > 0 => {
                 for record in parser::split_fixed_records(body, record_len) {
                     if let Some(fields) = FlowFields::from_record(&template, record) {
-                        self.flows.upsert(&fields, &self.counters);
+                        self.flows.upsert_in_domain(domain, &fields, &self.counters);
                         count += 1;
                     }
                 }
@@ -184,7 +184,7 @@ impl FlowContext {
                 while !cursor.is_empty() {
                     match FlowFields::from_record_sized(&template, cursor) {
                         Some((fields, consumed)) if consumed > 0 && consumed <= cursor.len() => {
-                            self.flows.upsert(&fields, &self.counters);
+                            self.flows.upsert_in_domain(domain, &fields, &self.counters);
                             count += 1;
                             cursor = &cursor[consumed..];
                         }
