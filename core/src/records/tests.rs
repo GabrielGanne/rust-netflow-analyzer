@@ -250,7 +250,7 @@ fn from_v5_record_rejects_short_input() {
 fn flow_record_round_trips_to_ffi() {
     use std::time::Instant;
     let fields = FlowFields {
-        flow_id: None,
+        flow_id: Some(42),
         src_ip: [1u8; 16],
         dst_ip: [2u8; 16],
         src_port: 1,
@@ -260,6 +260,8 @@ fn flow_record_round_trips_to_ffi() {
         packets: 3,
     };
     let record = FlowRecord::from_fields(&fields, Instant::now());
+    assert_eq!(record.fields, fields);
+    assert_eq!(record.flow_id, Some(42));
     let ffi = record.to_ffi();
     assert_eq!(ffi.src_ip, [1u8; 16]);
     assert_eq!(ffi.dst_ip, [2u8; 16]);

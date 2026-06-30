@@ -1,3 +1,4 @@
+use std::ops::{Deref, DerefMut};
 use std::time::Instant;
 
 use crate::parser::{TemplateRecord, V5_RECORD_LEN, VARIABLE_LENGTH};
@@ -36,8 +37,11 @@ pub enum FlowKey {
     },
 }
 
-/// Volatile values decoded from a single data record before they are folded
-/// into the persistent `FlowRecord` state.
+/// Normalized values decoded from a single exported data record.
+///
+/// A copy of these fields is retained by [`FlowRecord`] while the flow is in
+/// the cache. Keeping the normalized data in one type avoids maintaining two
+/// parallel representations of the addresses, ports, protocol, and counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlowFields {
     /// Exporter-assigned flow identity (IPFIX information element 148).
@@ -162,13 +166,8 @@ impl FlowFields {
 /// Persistent per-flow state held in the cache between exported records.
 #[derive(Debug, Clone)]
 pub struct FlowRecord {
-    pub src_ip: [u8; 16],
-    pub dst_ip: [u8; 16],
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub proto: u8,
-    pub bytes: u64,
-    pub packets: u64,
+    /// The normalized flow data accumulated by the cache.
+    pub fields: FlowFields,
     pub first_switched: Instant,
     pub last_switched: Instant,
 }
@@ -176,16 +175,26 @@ pub struct FlowRecord {
 impl FlowRecord {
     pub fn from_fields(fields: &FlowFields, now: Instant) -> Self {
         Self {
-            src_ip: fields.src_ip,
-            dst_ip: fields.dst_ip,
-            src_port: fields.src_port,
-            dst_port: fields.dst_port,
-            proto: fields.proto,
-            bytes: fields.bytes,
-            packets: fields.packets,
+            fields: *fields,
             first_switched: now,
             last_switched: now,
         }
+    }
+}
+
+/// Preserve the convenient `record.src_ip` / `record.bytes` API while storing
+/// the normalized flow values in a single shared representation.
+impl Deref for FlowRecord {
+    type Target = FlowFields;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl DerefMut for FlowRecord {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fields
     }
 }
 
