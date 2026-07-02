@@ -17,10 +17,10 @@ include = ["netflow_analyzer_core"]
 
 [export]
 include = [
-    "AnalyzerConfig",
-    "AnalyzerContext",
-    "FlowRecordFFI",
-    "LibraryStatsFFI",
+    "NetflowAnalyzerConfig",
+    "NetflowAnalyzerContext",
+    "NetflowAnalyzerFlowRecord",
+    "NetflowAnalyzerStats",
 ]
 prefix = ""
 

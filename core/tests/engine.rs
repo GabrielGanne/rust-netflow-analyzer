@@ -59,8 +59,10 @@ fn cache_cap_drops_excess_flows() {
         .put(16, 2) // 4 + 4 + 2*4
         .put(270, 2)
         .put(2, 2)
-        .put(7, 2).put(2, 2) // SRC_PORT
-        .put(4, 2).put(1, 2); // PROTOCOL
+        .put(7, 2)
+        .put(2, 2) // SRC_PORT
+        .put(4, 2)
+        .put(1, 2); // PROTOCOL
 
     // Two data records with different source ports => two distinct keys.
     let record_len = 3; // 2 + 1
@@ -97,7 +99,10 @@ fn background_aging_evicts_and_emits() {
     ctx.stop_aging();
 
     assert_eq!(ctx.flows.len(), 0, "idle flow evicted");
-    assert!(!emitted.lock().unwrap().is_empty(), "eviction emitted a record");
+    assert!(
+        !emitted.lock().unwrap().is_empty(),
+        "eviction emitted a record"
+    );
     assert!(ctx.stats().flows_output >= 1);
 }
 

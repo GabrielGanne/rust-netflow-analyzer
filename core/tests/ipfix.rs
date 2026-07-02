@@ -11,7 +11,9 @@ use netflow_analyzer_core::FlowContext;
 #[test]
 fn decodes_ipfix_packet() {
     let ctx = FlowContext::new();
-    let processed = ctx.process_packet(&sample_ipfix_packet()).expect("parse ok");
+    let processed = ctx
+        .process_packet(&sample_ipfix_packet())
+        .expect("parse ok");
     assert_eq!(processed, 1);
 
     let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));

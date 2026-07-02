@@ -17,7 +17,7 @@ use parser::{
     SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
 };
 use records::{FlowFields, FlowRecord, RecordTimeContext};
-use stats::{InternalCounters, LibraryStatsFFI};
+use stats::{InternalCounters, NetflowAnalyzerStats};
 
 /// Error returned when clock validation rejects an otherwise parseable packet.
 pub const CLOCK_SKEW_ERROR: &str = "Packet dropped because exporter clock skew exceeds limit";
@@ -107,9 +107,7 @@ impl FlowContext {
             }
         };
 
-        self.counters
-            .pkts_parsed
-            .fetch_add(1, Ordering::Relaxed);
+        self.counters.pkts_parsed.fetch_add(1, Ordering::Relaxed);
 
         let domain = header.domain_id();
         let original_export_time_ns = header.export_time_ns();
@@ -305,7 +303,7 @@ impl FlowContext {
     }
 
     /// Non-blocking telemetry snapshot, including the live active-flow gauge.
-    pub fn stats(&self) -> LibraryStatsFFI {
+    pub fn stats(&self) -> NetflowAnalyzerStats {
         self.counters.get_ffi_snapshot(self.flows.len() as u64)
     }
 }

@@ -21,7 +21,7 @@ pub struct InternalCounters {
 
 /// C-compatible, point-in-time snapshot of the engine telemetry.
 #[repr(C)]
-pub struct LibraryStatsFFI {
+pub struct NetflowAnalyzerStats {
     /// Datagrams whose NetFlow/IPFIX header was parsed successfully.
     pub pkts_parsed: u64,
     /// Datagrams rejected because their NetFlow/IPFIX header was malformed.
@@ -43,8 +43,8 @@ pub struct LibraryStatsFFI {
 impl InternalCounters {
     /// Builds a non-blocking snapshot. `active_flows` is supplied by the caller
     /// because it is a live gauge owned by the flow cache rather than a counter.
-    pub fn get_ffi_snapshot(&self, active_flows: u64) -> LibraryStatsFFI {
-        LibraryStatsFFI {
+    pub fn get_ffi_snapshot(&self, active_flows: u64) -> NetflowAnalyzerStats {
+        NetflowAnalyzerStats {
             pkts_parsed: self.pkts_parsed.load(Ordering::Relaxed),
             pkts_parse_error: self.pkts_parse_error.load(Ordering::Relaxed),
             clock_dropped_packets: self.clock_dropped_packets.load(Ordering::Relaxed),

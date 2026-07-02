@@ -22,7 +22,7 @@ static void put_be(uint8_t *buf, size_t *off, uint64_t value, size_t width) {
 }
 
 /* Callback invoked by the library for every emitted flow. */
-static void on_flow(const FlowRecordFFI *rec, void *user_data) {
+static void on_flow(const NetflowAnalyzerFlowRecord *rec, void *user_data) {
     unsigned *count = (unsigned *)user_data;
     (*count)++;
 
@@ -80,7 +80,7 @@ int main(void) {
     unsigned emitted = 0;
 
     /* NULL config -> library defaults. */
-    AnalyzerContext *ctx = netflow_analyzer_create(NULL, on_flow, &emitted);
+    NetflowAnalyzerContext *ctx = netflow_analyzer_create(NULL, on_flow, &emitted);
     if (ctx == NULL) {
         fprintf(stderr, "failed to create analyzer context\n");
         return 1;
@@ -95,7 +95,7 @@ int main(void) {
     /* Flush emits the cached flow synchronously through on_flow. */
     netflow_analyzer_flush(ctx);
 
-    LibraryStatsFFI stats = netflow_analyzer_get_stats(ctx);
+    NetflowAnalyzerStats stats = netflow_analyzer_get_stats(ctx);
     printf("[stats] parsed=%llu parse_errors=%llu templates=%llu records=%llu output=%llu dropped=%llu active=%llu\n",
            (unsigned long long)stats.pkts_parsed,
            (unsigned long long)stats.pkts_parse_error,

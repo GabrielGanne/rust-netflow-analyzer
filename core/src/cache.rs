@@ -47,7 +47,9 @@ impl TemplateCache {
 
     /// Cheap, lock-light lookup returning a shared handle to the template.
     pub fn get(&self, domain: u32, template_id: u16) -> Option<Arc<TemplateRecord>> {
-        self.map.get(&(domain, template_id)).map(|e| e.value().clone())
+        self.map
+            .get(&(domain, template_id))
+            .map(|e| e.value().clone())
     }
 
     pub fn len(&self) -> usize {
@@ -227,9 +229,7 @@ impl AgingHandle {
                     // when the scan interval is long.
                     let mut waited = Duration::ZERO;
                     let slice = Duration::from_millis(100);
-                    while waited < cfg.scan_interval
-                        && thread_running.load(Ordering::Relaxed)
-                    {
+                    while waited < cfg.scan_interval && thread_running.load(Ordering::Relaxed) {
                         thread::sleep(slice);
                         waited += slice;
                     }
@@ -473,10 +473,9 @@ mod tests {
         };
         let emitted = Arc::new(AtomicUsize::new(0));
         let sink = emitted.clone();
-        let mut handle =
-            AgingHandle::spawn(flows.clone(), counters.clone(), cfg, move |_r| {
-                sink.fetch_add(1, Ordering::Relaxed);
-            });
+        let mut handle = AgingHandle::spawn(flows.clone(), counters.clone(), cfg, move |_r| {
+            sink.fetch_add(1, Ordering::Relaxed);
+        });
 
         // Give the worker time to perform at least one sweep.
         thread::sleep(Duration::from_millis(300));

@@ -4,19 +4,20 @@ use std::time::Duration;
 
 use netflow_analyzer_core::cache::AgingConfig;
 use netflow_analyzer_core::clock::ClockConfig;
-use netflow_analyzer_core::records::{FlowRecord, FlowRecordFFI};
-use netflow_analyzer_core::stats::LibraryStatsFFI;
+use netflow_analyzer_core::records::{FlowRecord, NetflowAnalyzerFlowRecord};
+use netflow_analyzer_core::stats::NetflowAnalyzerStats;
 use netflow_analyzer_core::{EngineConfig, FlowContext, CLOCK_SKEW_ERROR};
 
 /// C-compatible callback invoked whenever a flow is emitted (idle eviction,
 /// active-timeout rollover, or explicit flush). The `record` pointer is only
 /// valid for the duration of the call; copy out anything you need to retain.
-pub type FlowCallback = extern "C" fn(record: *const FlowRecordFFI, user_data: *mut c_void);
+pub type NetflowAnalyzerFlowCallback =
+    extern "C" fn(record: *const NetflowAnalyzerFlowRecord, user_data: *mut c_void);
 
 /// Tunable engine settings passed from C at construction time. A null pointer
 /// to [`netflow_analyzer_create`] selects library defaults for every field.
 #[repr(C)]
-pub struct AnalyzerConfig {
+pub struct NetflowAnalyzerConfig {
     pub max_flows: u64,
     pub max_templates: u64,
     pub idle_timeout_secs: u64,
@@ -39,13 +40,13 @@ unsafe impl Send for SendUserData {}
 unsafe impl Sync for SendUserData {}
 
 /// Opaque handle handed back to C. Holds the engine plus the emission callback.
-pub struct AnalyzerContext {
+pub struct NetflowAnalyzerContext {
     internal: Arc<FlowContext>,
-    callback: FlowCallback,
+    callback: NetflowAnalyzerFlowCallback,
     user_data: SendUserData,
 }
 
-fn engine_config_from(cfg: &AnalyzerConfig) -> EngineConfig {
+fn engine_config_from(cfg: &NetflowAnalyzerConfig) -> EngineConfig {
     let defaults = EngineConfig::default();
     let nonzero = |value: u64, fallback: usize| {
         if value == 0 {
@@ -86,14 +87,14 @@ fn engine_config_from(cfg: &AnalyzerConfig) -> EngineConfig {
 /// aging thread. Pass a null `config` to use the built-in defaults.
 ///
 /// # Safety
-/// `config` must be either null or a valid pointer to an `AnalyzerConfig`.
+/// `config` must be either null or a valid pointer to a `NetflowAnalyzerConfig`.
 /// `user_data` is stored verbatim and handed back to `callback` unchanged.
 #[no_mangle]
 pub unsafe extern "C" fn netflow_analyzer_create(
-    config: *const AnalyzerConfig,
-    callback: FlowCallback,
+    config: *const NetflowAnalyzerConfig,
+    callback: NetflowAnalyzerFlowCallback,
     user_data: *mut c_void,
-) -> *mut AnalyzerContext {
+) -> *mut NetflowAnalyzerContext {
     let engine_cfg = if config.is_null() {
         EngineConfig::default()
     } else {
@@ -109,7 +110,7 @@ pub unsafe extern "C" fn netflow_analyzer_create(
         emit_record(callback, user_data, record);
     });
 
-    Box::into_raw(Box::new(AnalyzerContext {
+    Box::into_raw(Box::new(NetflowAnalyzerContext {
         internal,
         callback,
         user_data,
@@ -117,9 +118,13 @@ pub unsafe extern "C" fn netflow_analyzer_create(
 }
 
 /// Converts a Rust record into its FFI shape and dispatches it to the host.
-fn emit_record(callback: FlowCallback, user_data: SendUserData, record: &FlowRecord) {
+fn emit_record(
+    callback: NetflowAnalyzerFlowCallback,
+    user_data: SendUserData,
+    record: &FlowRecord,
+) {
     let ffi = record.to_ffi();
-    callback(&ffi as *const FlowRecordFFI, user_data.0);
+    callback(&ffi as *const NetflowAnalyzerFlowRecord, user_data.0);
 }
 
 /// Non-blocking telemetry retrieval for a separate monitoring thread.
@@ -127,9 +132,11 @@ fn emit_record(callback: FlowCallback, user_data: SendUserData, record: &FlowRec
 /// # Safety
 /// `ctx` must be null or a pointer previously returned by `netflow_analyzer_create`.
 #[no_mangle]
-pub unsafe extern "C" fn netflow_analyzer_get_stats(ctx: *const AnalyzerContext) -> LibraryStatsFFI {
+pub unsafe extern "C" fn netflow_analyzer_get_stats(
+    ctx: *const NetflowAnalyzerContext,
+) -> NetflowAnalyzerStats {
     if ctx.is_null() {
-        return LibraryStatsFFI {
+        return NetflowAnalyzerStats {
             pkts_parsed: 0,
             pkts_parse_error: 0,
             clock_dropped_packets: 0,
@@ -153,7 +160,7 @@ pub unsafe extern "C" fn netflow_analyzer_get_stats(ctx: *const AnalyzerContext)
 /// least `length` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn netflow_analyzer_process_packet(
-    ctx: *const AnalyzerContext,
+    ctx: *const NetflowAnalyzerContext,
     packet_bytes: *const u8,
     length: u32,
 ) -> i32 {
@@ -176,7 +183,7 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet(
 /// The pointer requirements are identical to [`netflow_analyzer_process_packet`].
 #[no_mangle]
 pub unsafe extern "C" fn netflow_analyzer_process_packet_at(
-    ctx: *const AnalyzerContext,
+    ctx: *const NetflowAnalyzerContext,
     packet_bytes: *const u8,
     length: u32,
     receipt_time_ns: u64,
@@ -198,7 +205,7 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet_at(
 /// # Safety
 /// `ctx` must be null or a valid context pointer.
 #[no_mangle]
-pub unsafe extern "C" fn netflow_analyzer_flush(ctx: *const AnalyzerContext) {
+pub unsafe extern "C" fn netflow_analyzer_flush(ctx: *const NetflowAnalyzerContext) {
     if ctx.is_null() {
         return;
     }
@@ -216,7 +223,7 @@ pub unsafe extern "C" fn netflow_analyzer_flush(ctx: *const AnalyzerContext) {
 /// `ctx` must be null or a pointer previously returned by `netflow_analyzer_create`,
 /// and must not be used afterwards.
 #[no_mangle]
-pub unsafe extern "C" fn netflow_analyzer_destroy(ctx: *mut AnalyzerContext) {
+pub unsafe extern "C" fn netflow_analyzer_destroy(ctx: *mut NetflowAnalyzerContext) {
     if ctx.is_null() {
         return;
     }
@@ -232,7 +239,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Test callback that counts emissions and records the last flow seen.
-    extern "C" fn count_cb(record: *const FlowRecordFFI, user_data: *mut c_void) {
+    extern "C" fn count_cb(record: *const NetflowAnalyzerFlowRecord, user_data: *mut c_void) {
         unsafe {
             let state = &*(user_data as *const TestState);
             state.count.fetch_add(1, Ordering::Relaxed);
@@ -284,7 +291,7 @@ mod tests {
 
     #[test]
     fn config_from_zero_uses_defaults() {
-        let zero = AnalyzerConfig {
+        let zero = NetflowAnalyzerConfig {
             max_flows: 0,
             max_templates: 0,
             idle_timeout_secs: 0,
@@ -306,7 +313,7 @@ mod tests {
 
     #[test]
     fn config_from_values_overrides() {
-        let custom = AnalyzerConfig {
+        let custom = NetflowAnalyzerConfig {
             max_flows: 10,
             max_templates: 5,
             idle_timeout_secs: 7,
@@ -339,7 +346,8 @@ mod tests {
         assert!(!ctx.is_null());
 
         let packet = v9_packet();
-        let n = unsafe { netflow_analyzer_process_packet(ctx, packet.as_ptr(), packet.len() as u32) };
+        let n =
+            unsafe { netflow_analyzer_process_packet(ctx, packet.as_ptr(), packet.len() as u32) };
         assert_eq!(n, 1);
 
         let stats = unsafe { netflow_analyzer_get_stats(ctx) };
@@ -370,7 +378,8 @@ mod tests {
         let ctx = unsafe { netflow_analyzer_create(ptr::null(), count_cb, ud) };
 
         let bogus = [0xFFu8, 0xFF, 0x00, 0x00];
-        let rc = unsafe { netflow_analyzer_process_packet(ctx, bogus.as_ptr(), bogus.len() as u32) };
+        let rc =
+            unsafe { netflow_analyzer_process_packet(ctx, bogus.as_ptr(), bogus.len() as u32) };
         assert_eq!(rc, -2);
         let stats = unsafe { netflow_analyzer_get_stats(ctx) };
         assert_eq!(stats.pkts_parsed, 0);
@@ -381,7 +390,7 @@ mod tests {
 
     #[test]
     fn clock_rejection_has_dedicated_error_and_counter() {
-        let config = AnalyzerConfig {
+        let config = NetflowAnalyzerConfig {
             max_flows: 0,
             max_templates: 0,
             idle_timeout_secs: 0,
@@ -409,7 +418,10 @@ mod tests {
             )
         };
         assert_eq!(rc, -3);
-        assert_eq!(unsafe { netflow_analyzer_get_stats(ctx) }.clock_dropped_packets, 1);
+        assert_eq!(
+            unsafe { netflow_analyzer_get_stats(ctx) }.clock_dropped_packets,
+            1
+        );
         unsafe { netflow_analyzer_destroy(ctx) };
     }
 
@@ -434,7 +446,7 @@ mod tests {
 
     #[test]
     fn custom_config_is_applied() {
-        let cfg = AnalyzerConfig {
+        let cfg = NetflowAnalyzerConfig {
             max_flows: 1,
             max_templates: 16,
             idle_timeout_secs: 30,
@@ -453,7 +465,8 @@ mod tests {
         assert!(!ctx.is_null());
 
         let packet = v9_packet();
-        let rc = unsafe { netflow_analyzer_process_packet(ctx, packet.as_ptr(), packet.len() as u32) };
+        let rc =
+            unsafe { netflow_analyzer_process_packet(ctx, packet.as_ptr(), packet.len() as u32) };
         assert_eq!(rc, 1);
 
         unsafe { netflow_analyzer_destroy(ctx) };

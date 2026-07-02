@@ -13,7 +13,7 @@
 /**
  * Opaque handle handed back to C. Holds the engine plus the emission callback.
  */
-typedef struct AnalyzerContext AnalyzerContext;
+typedef struct NetflowAnalyzerContext NetflowAnalyzerContext;
 
 /**
  * Tunable engine settings passed from C at construction time. A null pointer
@@ -37,7 +37,7 @@ typedef struct {
      * Maximum accepted clock skew, in nanoseconds. Zero selects the default.
      */
     uint64_t max_clock_skew_ns;
-} AnalyzerConfig;
+} NetflowAnalyzerConfig;
 
 typedef struct {
     uint8_t src_ip[16];
@@ -63,14 +63,14 @@ typedef struct {
      * Unmodified exporter-derived flow end time.
      */
     uint64_t original_end_time_ns;
-} FlowRecordFFI;
+} NetflowAnalyzerFlowRecord;
 
 /**
  * C-compatible callback invoked whenever a flow is emitted (idle eviction,
  * active-timeout rollover, or explicit flush). The `record` pointer is only
  * valid for the duration of the call; copy out anything you need to retain.
  */
-typedef void (*FlowCallback)(const FlowRecordFFI *record, void *user_data);
+typedef void (*NetflowAnalyzerFlowCallback)(const NetflowAnalyzerFlowRecord *record, void *user_data);
 
 /**
  * C-compatible, point-in-time snapshot of the engine telemetry.
@@ -106,7 +106,7 @@ typedef struct {
      * Number of flows currently resident in the state cache.
      */
     uint64_t active_flows;
-} LibraryStatsFFI;
+} NetflowAnalyzerStats;
 
 #ifdef __cplusplus
 extern "C" {
@@ -117,12 +117,12 @@ extern "C" {
  * aging thread. Pass a null `config` to use the built-in defaults.
  *
  * # Safety
- * `config` must be either null or a valid pointer to an `AnalyzerConfig`.
+ * `config` must be either null or a valid pointer to a `NetflowAnalyzerConfig`.
  * `user_data` is stored verbatim and handed back to `callback` unchanged.
  */
-AnalyzerContext *netflow_analyzer_create(const AnalyzerConfig *config,
-                                         FlowCallback callback,
-                                         void *user_data);
+NetflowAnalyzerContext *netflow_analyzer_create(const NetflowAnalyzerConfig *config,
+                                                NetflowAnalyzerFlowCallback callback,
+                                                void *user_data);
 
 /**
  * Non-blocking telemetry retrieval for a separate monitoring thread.
@@ -130,7 +130,7 @@ AnalyzerContext *netflow_analyzer_create(const AnalyzerConfig *config,
  * # Safety
  * `ctx` must be null or a pointer previously returned by `netflow_analyzer_create`.
  */
-LibraryStatsFFI netflow_analyzer_get_stats(const AnalyzerContext *ctx);
+NetflowAnalyzerStats netflow_analyzer_get_stats(const NetflowAnalyzerContext *ctx);
 
 /**
  * Core processing entry point called by C worker threads when a datagram
@@ -141,7 +141,7 @@ LibraryStatsFFI netflow_analyzer_get_stats(const AnalyzerContext *ctx);
  * `ctx` must be a valid context pointer and `packet_bytes` must point to at
  * least `length` readable bytes.
  */
-int32_t netflow_analyzer_process_packet(const AnalyzerContext *ctx,
+int32_t netflow_analyzer_process_packet(const NetflowAnalyzerContext *ctx,
                                         const uint8_t *packet_bytes,
                                         uint32_t length);
 
@@ -152,7 +152,7 @@ int32_t netflow_analyzer_process_packet(const AnalyzerContext *ctx,
  * # Safety
  * The pointer requirements are identical to [`netflow_analyzer_process_packet`].
  */
-int32_t netflow_analyzer_process_packet_at(const AnalyzerContext *ctx,
+int32_t netflow_analyzer_process_packet_at(const NetflowAnalyzerContext *ctx,
                                            const uint8_t *packet_bytes,
                                            uint32_t length,
                                            uint64_t receipt_time_ns);
@@ -164,7 +164,7 @@ int32_t netflow_analyzer_process_packet_at(const AnalyzerContext *ctx,
  * # Safety
  * `ctx` must be null or a valid context pointer.
  */
-void netflow_analyzer_flush(const AnalyzerContext *ctx);
+void netflow_analyzer_flush(const NetflowAnalyzerContext *ctx);
 
 /**
  * Destructor exposed to C. Stops the aging thread and releases all memory.
@@ -173,7 +173,7 @@ void netflow_analyzer_flush(const AnalyzerContext *ctx);
  * `ctx` must be null or a pointer previously returned by `netflow_analyzer_create`,
  * and must not be used afterwards.
  */
-void netflow_analyzer_destroy(AnalyzerContext *ctx);
+void netflow_analyzer_destroy(NetflowAnalyzerContext *ctx);
 
 #ifdef __cplusplus
 } // extern "C"

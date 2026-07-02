@@ -46,13 +46,11 @@ pub struct RecordTimeContext {
 impl RecordTimeContext {
     fn adjust_to_effective_clock(self, timestamp_ns: u64) -> u64 {
         if self.effective_export_time_ns >= self.original_export_time_ns {
-            timestamp_ns.saturating_add(
-                self.effective_export_time_ns - self.original_export_time_ns,
-            )
+            timestamp_ns
+                .saturating_add(self.effective_export_time_ns - self.original_export_time_ns)
         } else {
-            timestamp_ns.saturating_sub(
-                self.original_export_time_ns - self.effective_export_time_ns,
-            )
+            timestamp_ns
+                .saturating_sub(self.original_export_time_ns - self.effective_export_time_ns)
         }
     }
 }
@@ -176,9 +174,7 @@ impl FlowFields {
 
             // Enterprise-specific elements share numeric ids with IANA ones, so
             // only interpret elements from the standard registry.
-            if field.enterprise_number.is_none()
-                && !timestamps.apply_element(field.type_id, raw)
-            {
+            if field.enterprise_number.is_none() && !timestamps.apply_element(field.type_id, raw) {
                 fields.apply_element(field.type_id, raw);
             }
 
@@ -289,7 +285,7 @@ impl DerefMut for FlowRecord {
 
 // A C-compatible representation to safely pass over the FFI boundary
 #[repr(C)]
-pub struct FlowRecordFFI {
+pub struct NetflowAnalyzerFlowRecord {
     pub src_ip: [u8; 16],
     pub dst_ip: [u8; 16],
     pub src_port: u16,
@@ -308,8 +304,8 @@ pub struct FlowRecordFFI {
 }
 
 impl FlowRecord {
-    pub fn to_ffi(&self) -> FlowRecordFFI {
-        FlowRecordFFI {
+    pub fn to_ffi(&self) -> NetflowAnalyzerFlowRecord {
+        NetflowAnalyzerFlowRecord {
             src_ip: self.src_ip,
             dst_ip: self.dst_ip,
             src_port: self.src_port,

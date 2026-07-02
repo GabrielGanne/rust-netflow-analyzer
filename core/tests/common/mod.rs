@@ -49,13 +49,20 @@ pub fn sample_v9_packet() -> Vec<u8> {
         .put(36, 2) // length
         .put(256, 2) // template id
         .put(7, 2) // field count
-        .put(1, 2).put(4, 2) // IN_BYTES
-        .put(2, 2).put(4, 2) // IN_PKTS
-        .put(8, 2).put(4, 2) // IPV4_SRC
-        .put(12, 2).put(4, 2) // IPV4_DST
-        .put(7, 2).put(2, 2) // SRC_PORT
-        .put(11, 2).put(2, 2) // DST_PORT
-        .put(4, 2).put(1, 2); // PROTOCOL
+        .put(1, 2)
+        .put(4, 2) // IN_BYTES
+        .put(2, 2)
+        .put(4, 2) // IN_PKTS
+        .put(8, 2)
+        .put(4, 2) // IPV4_SRC
+        .put(12, 2)
+        .put(4, 2) // IPV4_DST
+        .put(7, 2)
+        .put(2, 2) // SRC_PORT
+        .put(11, 2)
+        .put(2, 2) // DST_PORT
+        .put(4, 2)
+        .put(1, 2); // PROTOCOL
 
     // Data FlowSet.
     b.put(256, 2) // flowset id = template id
@@ -87,9 +94,12 @@ pub fn sample_ipfix_packet() -> Vec<u8> {
         .put(20, 2) // set length = 4 + 4 + 3*4
         .put(300, 2) // template id
         .put(3, 2) // field count
-        .put(8, 2).put(4, 2) // IPV4_SRC
-        .put(12, 2).put(4, 2) // IPV4_DST
-        .put(4, 2).put(1, 2); // PROTOCOL
+        .put(8, 2)
+        .put(4, 2) // IPV4_SRC
+        .put(12, 2)
+        .put(4, 2) // IPV4_DST
+        .put(4, 2)
+        .put(1, 2); // PROTOCOL
 
     // Data Set (set id 300): one 9-byte record.
     b.put(300, 2) // set id = template id
