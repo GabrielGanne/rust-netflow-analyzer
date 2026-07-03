@@ -1,0 +1,18 @@
+# TODO
+* compare here:include/netflow-analyzer.h na:src/netflow-parser/netflow.h
+* test template option
+
+# Pending actions
+* Options semantics: options templates + data records are now decoded and
+  counted, but their scoped values are not interpreted. Extract the sampling
+  interval (samplingInterval IE 34, samplerRandomInterval IE 305) per
+  observation domain from options records.
+* Apply the decoded sampling interval to scale flow byte/packet counters per
+  domain (defaults to a factor of 1 when no options are seen). This also
+  addresses the missing sampling-normalization gap.
+* Expose the new options metrics (options_templates_received,
+  options_records_processed) in the FFI NetflowAnalyzerStats snapshot, then
+  regenerate include/netflow-analyzer.h via `make header` (cbindgen).
+
+# To investigate
+* Phase 4: implement the dpdk_runner crate (high-performance packet source).
