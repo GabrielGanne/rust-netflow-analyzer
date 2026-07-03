@@ -206,6 +206,116 @@ fn truncated_flowset_stops_gracefully() {
     assert_eq!(ctx.stats().templates_received, 0);
 }
 
+/// A v9 packet whose template (id 256) carries L2/QoS/ICMP metadata plus the
+/// 5-tuple and counters. `include_dscp` toggles the ipClassOfService field so a
+/// second packet can omit it, exercising the cache metadata merge.
+fn metadata_v9_packet(include_dscp: bool) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.put(9, 2)
+        .put(2, 2)
+        .put(1000, 4)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(42, 4);
+
+    // Fields: bytes, packets, src, dst, sport, dport, proto, ingress, egress,
+    // srcMac, dstMac, tcpFlags, vlan, [ipClassOfService].
+    let mut fields: Vec<(u16, u16)> = vec![
+        (1, 4),
+        (2, 4),
+        (8, 4),
+        (12, 4),
+        (7, 2),
+        (11, 2),
+        (4, 1),
+        (10, 4),
+        (14, 4),
+        (56, 6),
+        (80, 6),
+        (6, 2),
+        (58, 2),
+    ];
+    if include_dscp {
+        fields.push((5, 1)); // ipClassOfService
+    }
+    let field_count = fields.len() as u64;
+    let record_len: u64 = fields.iter().map(|(_, l)| *l as u64).sum();
+
+    // Template FlowSet.
+    b.put(0, 2)
+        .put(4 + 4 + field_count * 4, 2)
+        .put(256, 2)
+        .put(field_count, 2);
+    for (id, len) in &fields {
+        b.put(*id as u64, 2).put(*len as u64, 2);
+    }
+
+    // Data FlowSet.
+    b.put(256, 2).put(4 + record_len, 2);
+    b.put(1500, 4) // bytes
+        .put(10, 4) // packets
+        .put(0xC0A8_010A, 4) // src
+        .put(0x0A00_0005, 4) // dst
+        .put(12345, 2) // sport
+        .put(443, 2) // dport
+        .put(6, 1) // proto
+        .put(3, 4) // ingress
+        .put(4, 4); // egress
+    b.buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // src mac
+    b.buf.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // dst mac
+    b.put(0x0018, 2) // tcp flags PSH+ACK
+        .put(100, 2); // vlan
+    if include_dscp {
+        b.put(0b1011_1000, 1); // ToS 0xB8 -> DSCP 46
+    }
+    b.buf
+}
+
+#[test]
+fn metadata_fields_survive_aggregation_and_flush() {
+    use netflow_analyzer_core::records::presence;
+
+    let ctx = FlowContext::new();
+    // First packet carries DSCP, second omits it: the merge must retain DSCP.
+    ctx.process_packet(&metadata_v9_packet(true)).expect("ok");
+    ctx.process_packet(&metadata_v9_packet(false)).expect("ok");
+    assert_eq!(ctx.flows.len(), 1, "same 5-tuple stays one flow");
+
+    let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = collected.clone();
+    ctx.flush(move |rec| sink.lock().unwrap().push(rec.clone()));
+
+    let flows = collected.lock().unwrap();
+    assert_eq!(flows.len(), 1);
+    let f = &flows[0];
+
+    assert_eq!(f.bytes, 3000, "counters still accumulate");
+    assert_eq!(f.packets, 20);
+    assert_eq!(f.iface_in, 3);
+    assert_eq!(f.iface_out, 4);
+    assert_eq!(f.src_mac, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    assert_eq!(f.dst_mac, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    assert_eq!(f.tcp_flags, 0x18);
+    assert_eq!(f.vlan_tag, 100);
+    assert_eq!(f.dscp, 46, "DSCP from the first packet is retained");
+    assert_eq!(f.ip_version, 4);
+
+    let want = presence::IFACE_IN
+        | presence::IFACE_OUT
+        | presence::SRC_MAC
+        | presence::DST_MAC
+        | presence::TCP_FLAGS
+        | presence::VLAN_TAG
+        | presence::DSCP
+        | presence::IP_VERSION;
+    assert_eq!(f.present & want, want);
+
+    let ffi = f.to_ffi();
+    assert_eq!(ffi.dscp, 46);
+    assert_eq!(ffi.iface_in, 3);
+    assert_eq!(ffi.present, f.present);
+}
+
 #[test]
 fn variable_length_records_via_process_packet() {
     // v9 template with a single variable-length IPv6 source field, two records.

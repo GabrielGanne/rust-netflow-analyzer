@@ -12,15 +12,29 @@ use crate::parser::{TemplateRecord, V5_RECORD_LEN, VARIABLE_LENGTH};
 const IE_OCTET_DELTA_COUNT: u16 = 1;
 const IE_PACKET_DELTA_COUNT: u16 = 2;
 const IE_PROTOCOL_IDENTIFIER: u16 = 4;
+const IE_IP_CLASS_OF_SERVICE: u16 = 5;
+const IE_TCP_CONTROL_BITS: u16 = 6;
 const IE_SOURCE_TRANSPORT_PORT: u16 = 7;
 const IE_SOURCE_IPV4_ADDRESS: u16 = 8;
+const IE_INGRESS_INTERFACE: u16 = 10;
 const IE_DESTINATION_TRANSPORT_PORT: u16 = 11;
 const IE_DESTINATION_IPV4_ADDRESS: u16 = 12;
+const IE_EGRESS_INTERFACE: u16 = 14;
 const IE_SOURCE_IPV6_ADDRESS: u16 = 27;
 const IE_DESTINATION_IPV6_ADDRESS: u16 = 28;
+const IE_ICMP_TYPE_CODE_IPV4: u16 = 32;
+const IE_SOURCE_MAC_ADDRESS: u16 = 56;
+const IE_VLAN_ID: u16 = 58;
+const IE_DESTINATION_MAC_ADDRESS: u16 = 80;
 const IE_OCTET_TOTAL_COUNT: u16 = 85;
 const IE_PACKET_TOTAL_COUNT: u16 = 86;
+const IE_POST_IP_CLASS_OF_SERVICE: u16 = 98;
+const IE_ICMP_TYPE_CODE_IPV6: u16 = 139;
 const IE_FLOW_ID: u16 = 148;
+const IE_ICMP_TYPE_IPV4: u16 = 176;
+const IE_ICMP_CODE_IPV4: u16 = 177;
+const IE_ICMP_TYPE_IPV6: u16 = 178;
+const IE_ICMP_CODE_IPV6: u16 = 179;
 const IE_FLOW_END_SYS_UP_TIME: u16 = 21;
 const IE_FLOW_START_SYS_UP_TIME: u16 = 22;
 const IE_FLOW_START_SECONDS: u16 = 150;
@@ -78,6 +92,26 @@ pub enum FlowKey {
     },
 }
 
+/// Presence bits for the optional metadata carried by [`FlowFields`].
+///
+/// Exporters advertise different information elements per template, so a field
+/// value of `0` is ambiguous: it may be a genuine zero or simply "not exported".
+/// Each bit here is set only when the corresponding field was actually decoded,
+/// letting downstream formatters reproduce the empty-vs-zero distinction.
+pub mod presence {
+    pub const FLOW_ID: u32 = 1 << 0;
+    pub const IFACE_IN: u32 = 1 << 1;
+    pub const IFACE_OUT: u32 = 1 << 2;
+    pub const SRC_MAC: u32 = 1 << 3;
+    pub const DST_MAC: u32 = 1 << 4;
+    pub const ICMP_TYPE: u32 = 1 << 5;
+    pub const ICMP_CODE: u32 = 1 << 6;
+    pub const TCP_FLAGS: u32 = 1 << 7;
+    pub const DSCP: u32 = 1 << 8;
+    pub const VLAN_TAG: u32 = 1 << 9;
+    pub const IP_VERSION: u32 = 1 << 10;
+}
+
 /// Normalized values decoded from a single exported data record.
 ///
 /// A copy of these fields is retained by [`FlowRecord`] while the flow is in
@@ -102,6 +136,29 @@ pub struct FlowFields {
     pub original_start_time_ns: u64,
     /// Unmodified exporter-derived flow end time.
     pub original_end_time_ns: u64,
+    /// Ingress interface index (`ingressInterface`, IE 10; v5 `input`).
+    pub iface_in: u64,
+    /// Egress interface index (`egressInterface`, IE 14; v5 `output`).
+    pub iface_out: u64,
+    /// Source L2 address (`sourceMacAddress`, IE 56).
+    pub src_mac: [u8; 6],
+    /// Destination L2 address (`destinationMacAddress`, IE 80).
+    pub dst_mac: [u8; 6],
+    /// ICMP message type (from `icmpTypeCode*` or `icmpType*`).
+    pub icmp_type: u8,
+    /// ICMP message code (from `icmpTypeCode*` or `icmpCode*`).
+    pub icmp_code: u8,
+    /// TCP control bits (`tcpControlBits`, IE 6; v5 `tcp_flags`).
+    pub tcp_flags: u16,
+    /// Differentiated-services code point (6 bits), derived from the ToS byte.
+    pub dscp: u8,
+    /// Source VLAN identifier (`vlanId`, IE 58). `postVlanId` is intentionally dropped.
+    pub vlan_tag: u16,
+    /// IP version marker: 4, 6, or 0 when unknown.
+    pub ip_version: u8,
+    /// Bitmask of the metadata fields above that were actually decoded. See
+    /// [`presence`] for the individual bits.
+    pub present: u32,
 }
 
 impl FlowFields {
@@ -219,13 +276,24 @@ impl FlowFields {
         let mut fields = FlowFields::default();
         copy_ipv4(&mut fields.src_ip, &record[0..4]); // srcaddr
         copy_ipv4(&mut fields.dst_ip, &record[4..8]); // dstaddr
+        fields.iface_in = read_be_u16(&record[12..14]) as u64; // input SNMP ifIndex
+        fields.iface_out = read_be_u16(&record[14..16]) as u64; // output SNMP ifIndex
         fields.packets = read_be_uint(&record[16..20]); // dPkts
         fields.bytes = read_be_uint(&record[20..24]); // dOctets
         let first_ms = u32::from_be_bytes(record[24..28].try_into().ok()?);
         let last_ms = u32::from_be_bytes(record[28..32].try_into().ok()?);
         fields.src_port = read_be_u16(&record[32..34]); // srcport
         fields.dst_port = read_be_u16(&record[34..36]); // dstport
+        fields.tcp_flags = record[37] as u16; // tcp_flags
         fields.proto = record[38]; // prot
+        fields.dscp = record[39] >> 2; // tos byte -> DSCP
+        // Every v5 record structurally carries these fields, so mark them present.
+        fields.ip_version = 4;
+        fields.present |= presence::IFACE_IN
+            | presence::IFACE_OUT
+            | presence::TCP_FLAGS
+            | presence::DSCP
+            | presence::IP_VERSION;
         if let Some(ctx) = time_context {
             fields.original_start_time_ns = uptime_timestamp_ns(ctx, first_ms);
             fields.original_end_time_ns = uptime_timestamp_ns(ctx, last_ms);
@@ -237,18 +305,132 @@ impl FlowFields {
 
     fn apply_element(&mut self, type_id: u16, raw: &[u8]) {
         match type_id {
-            IE_SOURCE_IPV4_ADDRESS => copy_ipv4(&mut self.src_ip, raw),
-            IE_DESTINATION_IPV4_ADDRESS => copy_ipv4(&mut self.dst_ip, raw),
-            IE_SOURCE_IPV6_ADDRESS => copy_ipv6(&mut self.src_ip, raw),
-            IE_DESTINATION_IPV6_ADDRESS => copy_ipv6(&mut self.dst_ip, raw),
+            IE_SOURCE_IPV4_ADDRESS => {
+                copy_ipv4(&mut self.src_ip, raw);
+                self.set_ip_version(4);
+            }
+            IE_DESTINATION_IPV4_ADDRESS => {
+                copy_ipv4(&mut self.dst_ip, raw);
+                self.set_ip_version(4);
+            }
+            IE_SOURCE_IPV6_ADDRESS => {
+                copy_ipv6(&mut self.src_ip, raw);
+                self.set_ip_version(6);
+            }
+            IE_DESTINATION_IPV6_ADDRESS => {
+                copy_ipv6(&mut self.dst_ip, raw);
+                self.set_ip_version(6);
+            }
             IE_SOURCE_TRANSPORT_PORT => self.src_port = read_be_u16(raw),
             IE_DESTINATION_TRANSPORT_PORT => self.dst_port = read_be_u16(raw),
             IE_PROTOCOL_IDENTIFIER => self.proto = raw.first().copied().unwrap_or(0),
             IE_OCTET_DELTA_COUNT | IE_OCTET_TOTAL_COUNT => self.bytes = read_be_uint(raw),
             IE_PACKET_DELTA_COUNT | IE_PACKET_TOTAL_COUNT => self.packets = read_be_uint(raw),
-            IE_FLOW_ID => self.flow_id = Some(read_be_uint(raw)),
+            IE_FLOW_ID => {
+                self.flow_id = Some(read_be_uint(raw));
+                self.present |= presence::FLOW_ID;
+            }
+            IE_INGRESS_INTERFACE => {
+                self.iface_in = read_be_uint(raw);
+                self.present |= presence::IFACE_IN;
+            }
+            IE_EGRESS_INTERFACE => {
+                self.iface_out = read_be_uint(raw);
+                self.present |= presence::IFACE_OUT;
+            }
+            IE_SOURCE_MAC_ADDRESS if copy_mac(&mut self.src_mac, raw) => {
+                self.present |= presence::SRC_MAC;
+            }
+            IE_DESTINATION_MAC_ADDRESS if copy_mac(&mut self.dst_mac, raw) => {
+                self.present |= presence::DST_MAC;
+            }
+            IE_TCP_CONTROL_BITS => {
+                self.tcp_flags = read_be_uint(raw) as u16;
+                self.present |= presence::TCP_FLAGS;
+            }
+            IE_VLAN_ID => {
+                self.vlan_tag = read_be_u16(raw);
+                self.present |= presence::VLAN_TAG;
+            }
+            // The full ToS byte carries the DSCP in its high 6 bits. It takes
+            // precedence over the post-middlebox variant regardless of field
+            // order (the post value only fills in if none was seen yet).
+            IE_IP_CLASS_OF_SERVICE => {
+                self.dscp = raw.first().copied().unwrap_or(0) >> 2;
+                self.present |= presence::DSCP;
+            }
+            IE_POST_IP_CLASS_OF_SERVICE if self.present & presence::DSCP == 0 => {
+                self.dscp = raw.first().copied().unwrap_or(0) >> 2;
+                self.present |= presence::DSCP;
+            }
+            // Combined type/code elements pack the type in the high byte.
+            IE_ICMP_TYPE_CODE_IPV4 | IE_ICMP_TYPE_CODE_IPV6 => {
+                let value = read_be_u16(raw);
+                self.icmp_type = (value >> 8) as u8;
+                self.icmp_code = value as u8;
+                self.present |= presence::ICMP_TYPE | presence::ICMP_CODE;
+            }
+            IE_ICMP_TYPE_IPV4 | IE_ICMP_TYPE_IPV6 => {
+                self.icmp_type = raw.first().copied().unwrap_or(0);
+                self.present |= presence::ICMP_TYPE;
+            }
+            IE_ICMP_CODE_IPV4 | IE_ICMP_CODE_IPV6 => {
+                self.icmp_code = raw.first().copied().unwrap_or(0);
+                self.present |= presence::ICMP_CODE;
+            }
             _ => {}
         }
+    }
+
+    /// Records the observed IP address family. The first family wins so a mixed
+    /// v4/v6 record (which the protocols forbid) keeps a stable marker.
+    fn set_ip_version(&mut self, version: u8) {
+        if self.present & presence::IP_VERSION == 0 {
+            self.ip_version = version;
+            self.present |= presence::IP_VERSION;
+        }
+    }
+
+    /// Fills in any metadata field this flow has not yet observed from a later
+    /// record of the same flow. Counters and timestamps are handled separately
+    /// by the cache; this only carries the descriptive metadata forward so a
+    /// field exported on a subsequent record is not lost.
+    pub(crate) fn merge_metadata_from(&mut self, other: &FlowFields) {
+        if self.flow_id.is_none() {
+            self.flow_id = other.flow_id;
+        }
+        let missing = other.present & !self.present;
+        if missing & presence::IFACE_IN != 0 {
+            self.iface_in = other.iface_in;
+        }
+        if missing & presence::IFACE_OUT != 0 {
+            self.iface_out = other.iface_out;
+        }
+        if missing & presence::SRC_MAC != 0 {
+            self.src_mac = other.src_mac;
+        }
+        if missing & presence::DST_MAC != 0 {
+            self.dst_mac = other.dst_mac;
+        }
+        if missing & presence::ICMP_TYPE != 0 {
+            self.icmp_type = other.icmp_type;
+        }
+        if missing & presence::ICMP_CODE != 0 {
+            self.icmp_code = other.icmp_code;
+        }
+        if missing & presence::TCP_FLAGS != 0 {
+            self.tcp_flags = other.tcp_flags;
+        }
+        if missing & presence::DSCP != 0 {
+            self.dscp = other.dscp;
+        }
+        if missing & presence::VLAN_TAG != 0 {
+            self.vlan_tag = other.vlan_tag;
+        }
+        if missing & presence::IP_VERSION != 0 {
+            self.ip_version = other.ip_version;
+        }
+        self.present |= other.present;
     }
 }
 
@@ -292,11 +474,26 @@ impl DerefMut for FlowRecord {
 pub struct NetflowAnalyzerFlowRecord {
     pub src_ip: [u8; 16],
     pub dst_ip: [u8; 16],
+    pub src_mac: [u8; 6],
+    pub dst_mac: [u8; 6],
     pub src_port: u16,
     pub dst_port: u16,
+    pub vlan_tag: u16,
+    pub tcp_flags: u16,
     pub proto: u8,
+    pub dscp: u8,
+    pub icmp_type: u8,
+    pub icmp_code: u8,
+    /// IP version marker: 4, 6, or 0 when unknown.
+    pub ip_version: u8,
     pub bytes: u64,
     pub packets: u64,
+    /// Ingress interface index (`ingressInterface`; v5 `input`).
+    pub iface_in: u64,
+    /// Egress interface index (`egressInterface`; v5 `output`).
+    pub iface_out: u64,
+    /// Exporter-assigned flow identity; `0` when absent (see `present`).
+    pub flow_id: u64,
     /// Effective flow start time as Unix epoch nanoseconds.
     pub start_time_ns: u64,
     /// Effective flow end time as Unix epoch nanoseconds.
@@ -305,6 +502,11 @@ pub struct NetflowAnalyzerFlowRecord {
     pub original_start_time_ns: u64,
     /// Unmodified exporter-derived flow end time.
     pub original_end_time_ns: u64,
+    /// Bitmask of which optional fields were actually exported. A field whose
+    /// bit is clear was not present in the source records; its value is `0` and
+    /// should be rendered as empty rather than a real zero. See the `presence`
+    /// constants for the individual bit positions.
+    pub present: u32,
 }
 
 impl FlowFields {
@@ -313,15 +515,27 @@ impl FlowFields {
         NetflowAnalyzerFlowRecord {
             src_ip: self.src_ip,
             dst_ip: self.dst_ip,
+            src_mac: self.src_mac,
+            dst_mac: self.dst_mac,
             src_port: self.src_port,
             dst_port: self.dst_port,
+            vlan_tag: self.vlan_tag,
+            tcp_flags: self.tcp_flags,
             proto: self.proto,
+            dscp: self.dscp,
+            icmp_type: self.icmp_type,
+            icmp_code: self.icmp_code,
+            ip_version: self.ip_version,
             bytes: self.bytes,
             packets: self.packets,
+            iface_in: self.iface_in,
+            iface_out: self.iface_out,
+            flow_id: self.flow_id.unwrap_or(0),
             start_time_ns: self.start_time_ns,
             end_time_ns: self.end_time_ns,
             original_start_time_ns: self.original_start_time_ns,
             original_end_time_ns: self.original_end_time_ns,
+            present: self.present,
         }
     }
 }
@@ -463,6 +677,16 @@ fn copy_ipv4(dst: &mut [u8; 16], raw: &[u8]) {
 fn copy_ipv6(dst: &mut [u8; 16], raw: &[u8]) {
     if raw.len() >= 16 {
         dst.copy_from_slice(&raw[..16]);
+    }
+}
+
+/// Copies a 6-byte MAC address, returning whether the source was long enough.
+fn copy_mac(dst: &mut [u8; 6], raw: &[u8]) -> bool {
+    if raw.len() >= 6 {
+        dst.copy_from_slice(&raw[..6]);
+        true
+    } else {
+        false
     }
 }
 

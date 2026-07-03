@@ -14,6 +14,28 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#define NETFLOW_ANALYZER_PRESENT_FLOW_ID (1 << 0)
+
+#define NETFLOW_ANALYZER_PRESENT_IFACE_IN (1 << 1)
+
+#define NETFLOW_ANALYZER_PRESENT_IFACE_OUT (1 << 2)
+
+#define NETFLOW_ANALYZER_PRESENT_SRC_MAC (1 << 3)
+
+#define NETFLOW_ANALYZER_PRESENT_DST_MAC (1 << 4)
+
+#define NETFLOW_ANALYZER_PRESENT_ICMP_TYPE (1 << 5)
+
+#define NETFLOW_ANALYZER_PRESENT_ICMP_CODE (1 << 6)
+
+#define NETFLOW_ANALYZER_PRESENT_TCP_FLAGS (1 << 7)
+
+#define NETFLOW_ANALYZER_PRESENT_DSCP (1 << 8)
+
+#define NETFLOW_ANALYZER_PRESENT_VLAN_TAG (1 << 9)
+
+#define NETFLOW_ANALYZER_PRESENT_IP_VERSION (1 << 10)
+
 /**
  * Opaque handle handed back to C. Holds the engine plus the emission callback.
  */
@@ -46,11 +68,34 @@ typedef struct {
 typedef struct {
     uint8_t src_ip[16];
     uint8_t dst_ip[16];
+    uint8_t src_mac[6];
+    uint8_t dst_mac[6];
     uint16_t src_port;
     uint16_t dst_port;
+    uint16_t vlan_tag;
+    uint16_t tcp_flags;
     uint8_t proto;
+    uint8_t dscp;
+    uint8_t icmp_type;
+    uint8_t icmp_code;
+    /**
+     * IP version marker: 4, 6, or 0 when unknown.
+     */
+    uint8_t ip_version;
     uint64_t bytes;
     uint64_t packets;
+    /**
+     * Ingress interface index (`ingressInterface`; v5 `input`).
+     */
+    uint64_t iface_in;
+    /**
+     * Egress interface index (`egressInterface`; v5 `output`).
+     */
+    uint64_t iface_out;
+    /**
+     * Exporter-assigned flow identity; `0` when absent (see `present`).
+     */
+    uint64_t flow_id;
     /**
      * Effective flow start time as Unix epoch nanoseconds.
      */
@@ -67,6 +112,13 @@ typedef struct {
      * Unmodified exporter-derived flow end time.
      */
     uint64_t original_end_time_ns;
+    /**
+     * Bitmask of which optional fields were actually exported. A field whose
+     * bit is clear was not present in the source records; its value is `0` and
+     * should be rendered as empty rather than a real zero. See the `presence`
+     * constants for the individual bit positions.
+     */
+    uint32_t present;
 } NetflowAnalyzerFlowRecord;
 
 /**

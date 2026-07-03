@@ -266,6 +266,17 @@ fn flow_record_round_trips_to_ffi() {
         end_time_ns: 1_700_000_001_987_654_321,
         original_start_time_ns: 1_700_000_000_123_456_789,
         original_end_time_ns: 1_700_000_001_987_654_321,
+        iface_in: 7,
+        iface_out: 8,
+        src_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+        dst_mac: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+        icmp_type: 3,
+        icmp_code: 1,
+        tcp_flags: 0x18,
+        dscp: 46,
+        vlan_tag: 100,
+        ip_version: 4,
+        present: presence::FLOW_ID | presence::IFACE_IN | presence::DSCP,
     };
     let record = FlowRecord::from_fields(&fields, Instant::now());
     assert_eq!(record.fields, fields);
@@ -280,6 +291,130 @@ fn flow_record_round_trips_to_ffi() {
     assert_eq!(ffi.end_time_ns, 1_700_000_001_987_654_321);
     assert_eq!(ffi.original_start_time_ns, 1_700_000_000_123_456_789);
     assert_eq!(ffi.original_end_time_ns, 1_700_000_001_987_654_321);
+    assert_eq!(ffi.flow_id, 42);
+    assert_eq!(ffi.iface_in, 7);
+    assert_eq!(ffi.iface_out, 8);
+    assert_eq!(ffi.src_mac, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    assert_eq!(ffi.dst_mac, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    assert_eq!(ffi.icmp_type, 3);
+    assert_eq!(ffi.icmp_code, 1);
+    assert_eq!(ffi.tcp_flags, 0x18);
+    assert_eq!(ffi.dscp, 46);
+    assert_eq!(ffi.vlan_tag, 100);
+    assert_eq!(ffi.ip_version, 4);
+    assert_eq!(ffi.present, fields.present);
+}
+
+#[test]
+fn from_record_decodes_l2_qos_and_icmp_metadata() {
+    let tmpl = TemplateRecord::from_fields(
+        700,
+        vec![
+            field(IE_INGRESS_INTERFACE, 4),
+            field(IE_EGRESS_INTERFACE, 4),
+            field(IE_SOURCE_MAC_ADDRESS, 6),
+            field(IE_DESTINATION_MAC_ADDRESS, 6),
+            field(IE_IP_CLASS_OF_SERVICE, 1),
+            field(IE_TCP_CONTROL_BITS, 2),
+            field(IE_VLAN_ID, 2),
+            field(IE_ICMP_TYPE_CODE_IPV4, 2),
+            field(IE_SOURCE_IPV4_ADDRESS, 4),
+        ],
+    );
+    let mut rec = Vec::new();
+    rec.extend_from_slice(&5u32.to_be_bytes()); // ingress
+    rec.extend_from_slice(&9u32.to_be_bytes()); // egress
+    rec.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // src mac
+    rec.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // dst mac
+    rec.push(0b1011_1000); // ToS 0xB8 -> DSCP 46 (EF)
+    rec.extend_from_slice(&0x0018u16.to_be_bytes()); // tcp flags PSH+ACK
+    rec.extend_from_slice(&100u16.to_be_bytes()); // vlan
+    rec.extend_from_slice(&0x0301u16.to_be_bytes()); // icmp type 3, code 1
+    rec.extend_from_slice(&[192, 0, 2, 1]); // src ipv4
+
+    let fields = FlowFields::from_record(&tmpl, &rec).unwrap();
+    assert_eq!(fields.iface_in, 5);
+    assert_eq!(fields.iface_out, 9);
+    assert_eq!(fields.src_mac, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    assert_eq!(fields.dst_mac, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    assert_eq!(fields.dscp, 46);
+    assert_eq!(fields.tcp_flags, 0x18);
+    assert_eq!(fields.vlan_tag, 100);
+    assert_eq!(fields.icmp_type, 3);
+    assert_eq!(fields.icmp_code, 1);
+    assert_eq!(fields.ip_version, 4);
+
+    let expected = presence::IFACE_IN
+        | presence::IFACE_OUT
+        | presence::SRC_MAC
+        | presence::DST_MAC
+        | presence::DSCP
+        | presence::TCP_FLAGS
+        | presence::VLAN_TAG
+        | presence::ICMP_TYPE
+        | presence::ICMP_CODE
+        | presence::IP_VERSION;
+    assert_eq!(fields.present, expected);
+}
+
+#[test]
+fn ip_class_of_service_takes_precedence_over_post_variant() {
+    // Regardless of field order, ipClassOfService wins over postIpClassOfService.
+    let tmpl = TemplateRecord::from_fields(
+        701,
+        vec![
+            field(IE_POST_IP_CLASS_OF_SERVICE, 1),
+            field(IE_IP_CLASS_OF_SERVICE, 1),
+        ],
+    );
+    let rec = [0b0001_0000, 0b1011_1000]; // post -> DSCP 4, real -> DSCP 46
+    let fields = FlowFields::from_record(&tmpl, &rec).unwrap();
+    assert_eq!(fields.dscp, 46);
+    assert_eq!(fields.present & presence::DSCP, presence::DSCP);
+}
+
+#[test]
+fn absent_metadata_leaves_presence_bits_clear() {
+    // The plain 5-tuple template exports none of the optional metadata.
+    let fields = FlowFields::from_record(&tuple_template(), &{
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&1500u32.to_be_bytes());
+        rec.extend_from_slice(&10u32.to_be_bytes());
+        rec.extend_from_slice(&[192, 168, 1, 10]);
+        rec.extend_from_slice(&[10, 0, 0, 5]);
+        rec.extend_from_slice(&12345u16.to_be_bytes());
+        rec.extend_from_slice(&443u16.to_be_bytes());
+        rec.push(6);
+        rec
+    })
+    .unwrap();
+
+    // Only the IP-version bit is set (from decoding the v4 addresses).
+    assert_eq!(fields.present, presence::IP_VERSION);
+    assert_eq!(fields.tcp_flags, 0);
+    assert_eq!(fields.present & presence::TCP_FLAGS, 0, "zero != present");
+}
+
+#[test]
+fn v5_record_populates_structural_metadata() {
+    let mut rec = v5_record([192, 168, 1, 1], [8, 8, 4, 4], 7, 980, 53, 5353, 6);
+    rec[12..14].copy_from_slice(&3u16.to_be_bytes()); // input iface
+    rec[14..16].copy_from_slice(&4u16.to_be_bytes()); // output iface
+    rec[37] = 0x12; // tcp flags SYN+ACK
+    rec[39] = 0b1011_1000; // ToS 0xB8 -> DSCP 46
+
+    let fields = FlowFields::from_v5_record(&rec).unwrap();
+    assert_eq!(fields.iface_in, 3);
+    assert_eq!(fields.iface_out, 4);
+    assert_eq!(fields.tcp_flags, 0x12);
+    assert_eq!(fields.dscp, 46);
+    assert_eq!(fields.ip_version, 4);
+    let expected = presence::IFACE_IN
+        | presence::IFACE_OUT
+        | presence::TCP_FLAGS
+        | presence::DSCP
+        | presence::IP_VERSION;
+    assert_eq!(fields.present, expected);
 }
 
 #[test]

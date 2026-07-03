@@ -154,6 +154,9 @@ impl FlowCache {
                 existing.original_end_time_ns = existing
                     .original_end_time_ns
                     .max(fields.original_end_time_ns);
+                // Descriptive metadata is kept from the first record that carried
+                // it; fill in anything a later record adds without overwriting.
+                existing.merge_metadata_from(fields);
                 existing.last_observed = Instant::now();
             }
             Entry::Vacant(vacant) => {
@@ -340,18 +343,12 @@ mod tests {
 
     fn fields(proto: u8) -> FlowFields {
         FlowFields {
-            flow_id: None,
-            src_ip: [0u8; 16],
-            dst_ip: [0u8; 16],
             src_port: 1,
             dst_port: 2,
             proto,
             bytes: 100,
             packets: 1,
-            start_time_ns: 0,
-            end_time_ns: 0,
-            original_start_time_ns: 0,
-            original_end_time_ns: 0,
+            ..Default::default()
         }
     }
 

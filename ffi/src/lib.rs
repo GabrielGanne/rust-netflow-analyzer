@@ -29,6 +29,23 @@ pub type NetflowAnalyzerRecordCallback = extern "C" fn(
     user_data: *mut c_void,
 );
 
+// Presence bits for `NetflowAnalyzerFlowRecord::present`. A field whose bit is
+// clear was not exported by the source records: its value is `0` and should be
+// treated as absent rather than a real zero. These are literals (rather than
+// re-exports of the core `presence` module) because cbindgen cannot evaluate
+// cross-crate constant paths; `presence_bits_match_core` keeps them in sync.
+pub const NETFLOW_ANALYZER_PRESENT_FLOW_ID: u32 = 1 << 0;
+pub const NETFLOW_ANALYZER_PRESENT_IFACE_IN: u32 = 1 << 1;
+pub const NETFLOW_ANALYZER_PRESENT_IFACE_OUT: u32 = 1 << 2;
+pub const NETFLOW_ANALYZER_PRESENT_SRC_MAC: u32 = 1 << 3;
+pub const NETFLOW_ANALYZER_PRESENT_DST_MAC: u32 = 1 << 4;
+pub const NETFLOW_ANALYZER_PRESENT_ICMP_TYPE: u32 = 1 << 5;
+pub const NETFLOW_ANALYZER_PRESENT_ICMP_CODE: u32 = 1 << 6;
+pub const NETFLOW_ANALYZER_PRESENT_TCP_FLAGS: u32 = 1 << 7;
+pub const NETFLOW_ANALYZER_PRESENT_DSCP: u32 = 1 << 8;
+pub const NETFLOW_ANALYZER_PRESENT_VLAN_TAG: u32 = 1 << 9;
+pub const NETFLOW_ANALYZER_PRESENT_IP_VERSION: u32 = 1 << 10;
+
 /// Tunable engine settings passed from C at construction time. A null pointer
 /// to [`netflow_analyzer_create`] selects library defaults for every field.
 #[repr(C)]
@@ -459,6 +476,22 @@ mod tests {
             state.last_proto.store(observation_domain_id, Ordering::Relaxed);
             assert!(!record.is_null());
         }
+    }
+
+    #[test]
+    fn presence_bits_match_core() {
+        use netflow_analyzer_core::records::presence;
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_FLOW_ID, presence::FLOW_ID);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_IFACE_IN, presence::IFACE_IN);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_IFACE_OUT, presence::IFACE_OUT);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_SRC_MAC, presence::SRC_MAC);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_DST_MAC, presence::DST_MAC);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_ICMP_TYPE, presence::ICMP_TYPE);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_ICMP_CODE, presence::ICMP_CODE);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_TCP_FLAGS, presence::TCP_FLAGS);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_DSCP, presence::DSCP);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_VLAN_TAG, presence::VLAN_TAG);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_IP_VERSION, presence::IP_VERSION);
     }
 
     #[test]
