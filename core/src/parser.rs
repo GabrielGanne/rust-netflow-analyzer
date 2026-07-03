@@ -282,10 +282,17 @@ fn parse_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
     let (rest, field_count) = be_u16(input)?;
     input = rest;
 
+    // Fallible pre-allocation: reserve the exact capacity up front so the
+    // per-field `push` calls below never trigger an implicit (infallible,
+    // abort-on-OOM) reallocation. A failed reservation from an absurd field
+    // count is surfaced as a parse failure instead of aborting the process.
     let mut fields = Vec::new();
-    // Bounded pre-allocation: avoid an implicit grow for the common case while
-    // refusing to honour an absurd field count from a malicious exporter.
-    let _ = fields.try_reserve(field_count as usize);
+    if fields.try_reserve_exact(field_count as usize).is_err() {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
 
     for _ in 0..field_count {
         let (rest, field) = parse_field_specifier(input)?;

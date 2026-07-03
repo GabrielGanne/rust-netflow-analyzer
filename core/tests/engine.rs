@@ -6,7 +6,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{sample_v9_packet, Builder};
+use common::{sample_v5_packet, sample_v9_packet, Builder, V5Flow};
 use netflow_analyzer_core::cache::AgingConfig;
 use netflow_analyzer_core::clock::ClockConfig;
 use netflow_analyzer_core::records::FlowRecord;
@@ -74,6 +74,86 @@ fn cache_cap_drops_excess_flows() {
     assert_eq!(processed, 2, "both records decoded");
     assert_eq!(ctx.flows.len(), 1, "cap keeps only one flow");
     assert_eq!(ctx.stats().flows_dropped, 1);
+}
+
+/// End-to-end proof that the flow cap bounds heap growth when a hostile or
+/// high-volume exporter floods the engine with unique flows through the real
+/// `process_packet` path. This is the meaningful OOM-tolerance property: the
+/// only structure that grows over the process lifetime is hard-capped.
+#[test]
+fn flow_cap_bounds_growth_under_flood() {
+    const CAP: usize = 100;
+    const FLOOD: usize = 1000;
+
+    let cfg = EngineConfig {
+        max_flows: CAP,
+        ..EngineConfig::default()
+    };
+    let ctx = FlowContext::with_config(cfg);
+
+    // Each record carries a distinct source IP, so every one is a new flow key.
+    let records: Vec<V5Flow> = (0..FLOOD)
+        .map(|i| {
+            let ip = (i as u32).to_be_bytes();
+            (ip, [10, 0, 0, 1], 1, 100, 1234, 80, 6)
+        })
+        .collect();
+    let packet = sample_v5_packet(&records);
+
+    let processed = ctx.process_packet(&packet).expect("parse ok");
+
+    assert_eq!(processed, FLOOD, "every record decodes");
+    assert_eq!(ctx.flows.len(), CAP, "cache never exceeds the hard cap");
+    assert_eq!(
+        ctx.stats().flows_dropped as usize,
+        FLOOD - CAP,
+        "every flow beyond the cap is dropped and counted"
+    );
+}
+
+/// Same guarantee for the template cache: a flood of unique template ids in a
+/// single packet cannot grow the template map beyond `max_templates`.
+#[test]
+fn template_cap_bounds_growth_under_flood() {
+    const CAP: usize = 100;
+    const FLOOD: usize = 1000;
+
+    let cfg = EngineConfig {
+        max_templates: CAP,
+        ..EngineConfig::default()
+    };
+    let ctx = FlowContext::with_config(cfg);
+
+    let mut b = Builder::new();
+    // NetFlow v9 header.
+    b.put(9, 2) // version
+        .put(FLOOD as u64, 2) // count (informational)
+        .put(1000, 4) // sys uptime
+        .put(1_700_000_000, 4) // unix seconds
+        .put(1, 4) // sequence
+        .put(42, 4); // source id
+
+    // One template FlowSet packed with FLOOD single-field templates. Each
+    // template record is 8 bytes: id(2) + field_count(2) + one specifier(4).
+    let set_len = 4 + FLOOD * 8;
+    b.put(0, 2) // flowset id = template
+        .put(set_len as u64, 2);
+    for id in 0..FLOOD {
+        let template_id = 256 + id as u64; // distinct, >= FIRST_DATA_SET_ID range
+        b.put(template_id, 2) // template id
+            .put(1, 2) // field count
+            .put(8, 2) // IPV4_SRC
+            .put(4, 2); // length
+    }
+
+    ctx.process_packet(&b.buf).expect("parse ok");
+
+    assert_eq!(ctx.stats().templates_received, FLOOD as u64);
+    assert_eq!(
+        ctx.templates.len(),
+        CAP,
+        "template cache never exceeds the hard cap"
+    );
 }
 
 #[test]
