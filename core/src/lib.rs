@@ -96,10 +96,51 @@ impl FlowContext {
 
     /// Like [`Self::process_packet`], with an explicit Unix-nanosecond receipt
     /// timestamp. Capture readers should pass the packet's capture timestamp.
+    ///
+    /// This is the fused decode + aggregate entry point: it decodes the datagram
+    /// and folds every data record into the flow cache. It is a thin wrapper over
+    /// [`Self::decode_packet_at`], supplying the flow-cache upsert as the sink.
     pub fn process_packet_at(
         &self,
         raw_bytes: &[u8],
         receipt_time_ns: u64,
+    ) -> Result<usize, &'static str> {
+        self.decode_packet_at(raw_bytes, receipt_time_ns, &mut |domain, fields| {
+            self.flows.upsert_in_domain(domain, fields, &self.counters);
+        })
+    }
+
+    /// Decode-only counterpart of [`Self::process_packet`]: parses a datagram and
+    /// emits each decoded data record through `sink` **without** touching the flow
+    /// cache. Template and options-template state is still updated (it is required
+    /// to decode), but no aggregation, timeouts, or eviction take place.
+    ///
+    /// The receipt timestamp defaults to the current wall clock. Use
+    /// [`Self::decode_packet_at`] to supply a capture timestamp explicitly.
+    pub fn decode_packet(
+        &self,
+        raw_bytes: &[u8],
+        sink: &mut dyn FnMut(u32, &FlowFields),
+    ) -> Result<usize, &'static str> {
+        let receipt_time_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        self.decode_packet_at(raw_bytes, receipt_time_ns, sink)
+    }
+
+    /// Decode-only entry point with an explicit Unix-nanosecond receipt timestamp.
+    ///
+    /// Each decoded data record is delivered to `sink` as `(observation_domain_id,
+    /// &FlowFields)`. NetFlow v5 records report domain `0`. Options data records
+    /// are counted but not emitted, mirroring the fused path. The flow cache is
+    /// never consulted or mutated, so this can drive an external aggregator.
+    pub fn decode_packet_at(
+        &self,
+        raw_bytes: &[u8],
+        receipt_time_ns: u64,
+        sink: &mut dyn FnMut(u32, &FlowFields),
     ) -> Result<usize, &'static str> {
         let (mut payload, header) = match parser::parse_packet_header(raw_bytes) {
             Ok(parsed) => parsed,
@@ -148,7 +189,7 @@ impl FlowContext {
         // NetFlow v5 is template-less: the payload is simply `count` fixed-size
         // records, so it takes a dedicated decode path instead of a set walk.
         if let ParsedHeader::V5(ref h) = header {
-            return Ok(self.process_v5_records(payload, h.count as usize, time_context));
+            return Ok(self.process_v5_records(payload, h.count as usize, time_context, sink));
         }
 
         let mut data_records = 0usize;
@@ -196,7 +237,7 @@ impl FlowContext {
                     }
                 }
                 id if id >= FIRST_DATA_SET_ID => {
-                    data_records += self.process_data_set(domain, id, body, time_context);
+                    data_records += self.process_data_set(domain, id, body, time_context, sink);
                 }
                 // Reserved/unknown set ids (e.g. 4..=255) are ignored.
                 _ => {}
@@ -226,6 +267,7 @@ impl FlowContext {
         payload: &[u8],
         count: usize,
         time_context: RecordTimeContext,
+        sink: &mut dyn FnMut(u32, &FlowFields),
     ) -> usize {
         let mut decoded = 0usize;
         // Trust the header count but never read past the buffer.
@@ -235,7 +277,8 @@ impl FlowContext {
             .take(count.min(available))
         {
             if let Some(fields) = FlowFields::from_v5_record_at(record, Some(time_context)) {
-                self.flows.upsert(&fields, &self.counters);
+                // NetFlow v5 is template-less and has no observation domain.
+                sink(0, &fields);
                 decoded += 1;
             }
         }
@@ -252,6 +295,7 @@ impl FlowContext {
         template_id: u16,
         body: &[u8],
         time_context: RecordTimeContext,
+        sink: &mut dyn FnMut(u32, &FlowFields),
     ) -> usize {
         // Without the template we cannot interpret the records yet; the exporter
         // will resend it periodically, so we simply skip until then.
@@ -271,7 +315,7 @@ impl FlowContext {
                     .options_records_processed
                     .fetch_add(1, Ordering::Relaxed);
             } else {
-                self.flows.upsert_in_domain(domain, fields, &self.counters);
+                sink(domain, fields);
                 count += 1;
             }
         };

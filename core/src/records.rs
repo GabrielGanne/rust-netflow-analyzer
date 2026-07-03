@@ -307,7 +307,8 @@ pub struct NetflowAnalyzerFlowRecord {
     pub original_end_time_ns: u64,
 }
 
-impl FlowRecord {
+impl FlowFields {
+    /// Projects the normalized flow values into the C-compatible record shape.
     pub fn to_ffi(&self) -> NetflowAnalyzerFlowRecord {
         NetflowAnalyzerFlowRecord {
             src_ip: self.src_ip,
@@ -322,6 +323,12 @@ impl FlowRecord {
             original_start_time_ns: self.original_start_time_ns,
             original_end_time_ns: self.original_end_time_ns,
         }
+    }
+}
+
+impl FlowRecord {
+    pub fn to_ffi(&self) -> NetflowAnalyzerFlowRecord {
+        self.fields.to_ffi()
     }
 }
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use netflow_analyzer_core::cache::AgingConfig;
 use netflow_analyzer_core::clock::ClockConfig;
-use netflow_analyzer_core::records::{FlowRecord, NetflowAnalyzerFlowRecord};
+use netflow_analyzer_core::records::{FlowFields, FlowRecord, NetflowAnalyzerFlowRecord};
 use netflow_analyzer_core::stats::NetflowAnalyzerStats;
 use netflow_analyzer_core::{EngineConfig, FlowContext, CLOCK_SKEW_ERROR};
 
@@ -17,6 +17,17 @@ use netflow_analyzer_core::{EngineConfig, FlowContext, CLOCK_SKEW_ERROR};
 /// valid for the duration of the call; copy out anything you need to retain.
 pub type NetflowAnalyzerFlowCallback =
     extern "C" fn(record: *const NetflowAnalyzerFlowRecord, user_data: *mut c_void);
+
+/// C-compatible callback invoked once per decoded data record on the decode-only
+/// path (`netflow_analyzer_decode_packet[_at]`), before any aggregation. The
+/// `observation_domain_id` scopes the record (NetFlow v5 reports `0`). The
+/// `record` pointer is only valid for the duration of the call; copy out anything
+/// you need to retain.
+pub type NetflowAnalyzerRecordCallback = extern "C" fn(
+    observation_domain_id: u32,
+    record: *const NetflowAnalyzerFlowRecord,
+    user_data: *mut c_void,
+);
 
 /// Tunable engine settings passed from C at construction time. A null pointer
 /// to [`netflow_analyzer_create`] selects library defaults for every field.
@@ -203,6 +214,70 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet_at(
     }
 }
 
+/// Decode-only entry point: parses a datagram and invokes `callback` once per
+/// decoded data record, **without** aggregating into the flow cache. Template
+/// state is still updated (it is required to decode). Returns the number of data
+/// records decoded, or a negative error code (`-1` invalid arguments, `-2`
+/// malformed packet, `-3` clock rejection).
+///
+/// This lets a host run the parser as an independent stage and feed its own
+/// aggregator, mirroring the local `netflow-parser` node.
+///
+/// # Safety
+/// `ctx` must be a valid context pointer and `packet_bytes` must point to at
+/// least `length` readable bytes. `user_data` is passed through unchanged.
+#[no_mangle]
+pub unsafe extern "C" fn netflow_analyzer_decode_packet(
+    ctx: *const NetflowAnalyzerContext,
+    packet_bytes: *const u8,
+    length: u32,
+    callback: NetflowAnalyzerRecordCallback,
+    user_data: *mut c_void,
+) -> i32 {
+    if ctx.is_null() || packet_bytes.is_null() {
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+    let mut sink = |domain: u32, fields: &FlowFields| {
+        let record = fields.to_ffi();
+        callback(domain, &record as *const NetflowAnalyzerFlowRecord, user_data);
+    };
+    match (*ctx).internal.decode_packet(data, &mut sink) {
+        Ok(records) => records as i32,
+        Err(CLOCK_SKEW_ERROR) => -3,
+        Err(_) => -2,
+    }
+}
+
+/// Decode-only entry point with an explicit Unix-nanosecond receipt timestamp.
+/// Preferred for offline packet-capture readers.
+///
+/// # Safety
+/// The pointer requirements are identical to [`netflow_analyzer_decode_packet`].
+#[no_mangle]
+pub unsafe extern "C" fn netflow_analyzer_decode_packet_at(
+    ctx: *const NetflowAnalyzerContext,
+    packet_bytes: *const u8,
+    length: u32,
+    receipt_time_ns: u64,
+    callback: NetflowAnalyzerRecordCallback,
+    user_data: *mut c_void,
+) -> i32 {
+    if ctx.is_null() || packet_bytes.is_null() {
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+    let mut sink = |domain: u32, fields: &FlowFields| {
+        let record = fields.to_ffi();
+        callback(domain, &record as *const NetflowAnalyzerFlowRecord, user_data);
+    };
+    match (*ctx).internal.decode_packet_at(data, receipt_time_ns, &mut sink) {
+        Ok(records) => records as i32,
+        Err(CLOCK_SKEW_ERROR) => -3,
+        Err(_) => -2,
+    }
+}
+
 /// Forces every cached flow to be emitted through the callback immediately.
 /// Useful before shutdown so no residual state is lost.
 ///
@@ -368,6 +443,58 @@ mod tests {
         let stats = unsafe { netflow_analyzer_get_stats(ctx) };
         assert_eq!(stats.flows_output, 1);
         assert_eq!(stats.flows_dropped, 0);
+
+        unsafe { netflow_analyzer_destroy(ctx) };
+    }
+
+    /// Decode-only callback: counts per-record emissions and records the domain.
+    extern "C" fn record_cb(
+        observation_domain_id: u32,
+        record: *const NetflowAnalyzerFlowRecord,
+        user_data: *mut c_void,
+    ) {
+        unsafe {
+            let state = &*(user_data as *const TestState);
+            state.count.fetch_add(1, Ordering::Relaxed);
+            state.last_proto.store(observation_domain_id, Ordering::Relaxed);
+            assert!(!record.is_null());
+        }
+    }
+
+    #[test]
+    fn decode_packet_emits_per_record_and_skips_aggregation() {
+        let state = TestState {
+            count: AtomicU32::new(0),
+            last_proto: AtomicU32::new(0),
+        };
+        let ud = &state as *const TestState as *mut c_void;
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), count_cb, ud) };
+
+        let packet = v9_packet();
+        let n = unsafe {
+            netflow_analyzer_decode_packet(
+                ctx,
+                packet.as_ptr(),
+                packet.len() as u32,
+                record_cb,
+                ud,
+            )
+        };
+        assert_eq!(n, 1, "one data record decoded");
+        // The decode-only callback fired once, carrying the observation domain (42).
+        assert_eq!(state.count.load(Ordering::Relaxed), 1);
+        assert_eq!(state.last_proto.load(Ordering::Relaxed), 42);
+
+        // Nothing was aggregated: the flow gauge stays at zero.
+        let stats = unsafe { netflow_analyzer_get_stats(ctx) };
+        assert_eq!(stats.data_records_processed, 1);
+        assert_eq!(stats.active_flows, 0);
+
+        // Null-argument guards.
+        let rc = unsafe {
+            netflow_analyzer_decode_packet(ptr::null(), packet.as_ptr(), packet.len() as u32, record_cb, ud)
+        };
+        assert_eq!(rc, -1);
 
         unsafe { netflow_analyzer_destroy(ctx) };
     }

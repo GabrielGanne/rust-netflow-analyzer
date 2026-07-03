@@ -112,6 +112,17 @@ typedef struct {
     uint64_t active_flows;
 } NetflowAnalyzerStats;
 
+/**
+ * C-compatible callback invoked once per decoded data record on the decode-only
+ * path (`netflow_analyzer_decode_packet[_at]`), before any aggregation. The
+ * `observation_domain_id` scopes the record (NetFlow v5 reports `0`). The
+ * `record` pointer is only valid for the duration of the call; copy out anything
+ * you need to retain.
+ */
+typedef void (*NetflowAnalyzerRecordCallback)(uint32_t observation_domain_id,
+                                              const NetflowAnalyzerFlowRecord *record,
+                                              void *user_data);
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -160,6 +171,40 @@ int32_t netflow_analyzer_process_packet_at(const NetflowAnalyzerContext *ctx,
                                            const uint8_t *packet_bytes,
                                            uint32_t length,
                                            uint64_t receipt_time_ns);
+
+/**
+ * Decode-only entry point: parses a datagram and invokes `callback` once per
+ * decoded data record, **without** aggregating into the flow cache. Template
+ * state is still updated (it is required to decode). Returns the number of data
+ * records decoded, or a negative error code (`-1` invalid arguments, `-2`
+ * malformed packet, `-3` clock rejection).
+ *
+ * This lets a host run the parser as an independent stage and feed its own
+ * aggregator, mirroring the local `netflow-parser` node.
+ *
+ * # Safety
+ * `ctx` must be a valid context pointer and `packet_bytes` must point to at
+ * least `length` readable bytes. `user_data` is passed through unchanged.
+ */
+int32_t netflow_analyzer_decode_packet(const NetflowAnalyzerContext *ctx,
+                                       const uint8_t *packet_bytes,
+                                       uint32_t length,
+                                       NetflowAnalyzerRecordCallback callback,
+                                       void *user_data);
+
+/**
+ * Decode-only entry point with an explicit Unix-nanosecond receipt timestamp.
+ * Preferred for offline packet-capture readers.
+ *
+ * # Safety
+ * The pointer requirements are identical to [`netflow_analyzer_decode_packet`].
+ */
+int32_t netflow_analyzer_decode_packet_at(const NetflowAnalyzerContext *ctx,
+                                          const uint8_t *packet_bytes,
+                                          uint32_t length,
+                                          uint64_t receipt_time_ns,
+                                          NetflowAnalyzerRecordCallback callback,
+                                          void *user_data);
 
 /**
  * Forces every cached flow to be emitted through the callback immediately.
