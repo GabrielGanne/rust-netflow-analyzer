@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! End-to-end tests for NetFlow v9 (RFC 3954): template FlowSets, data
 //! records, options handling, truncation, and variable-length fields.
 

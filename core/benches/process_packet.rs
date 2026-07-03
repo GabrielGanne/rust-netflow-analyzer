@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Throughput benchmarks for the core ingestion path, [`FlowContext::process_packet`].
 //!
 //! Each benchmark reuses a single long-lived `FlowContext` (mirroring the
