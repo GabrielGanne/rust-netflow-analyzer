@@ -3,12 +3,13 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 use crate::parser::TemplateRecord;
 use crate::records::{FlowFields, FlowKey, FlowRecord};
 use crate::stats::InternalCounters;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// Template lookup key: templates are scoped to the exporter's observation
 /// domain so that identical template ids from different domains never collide.
@@ -23,6 +24,9 @@ pub const DEFAULT_MAX_FLOWS: usize = 1_000_000;
 pub struct TemplateCache {
     map: DashMap<TemplateKey, Arc<TemplateRecord>>,
     max_templates: usize,
+    /// Live entry count, reserved atomically so the hard cap cannot be
+    /// overshot by concurrent writers racing on a `len()` snapshot.
+    count: AtomicUsize,
 }
 
 impl TemplateCache {
@@ -30,19 +34,43 @@ impl TemplateCache {
         Self {
             map: DashMap::new(),
             max_templates,
+            count: AtomicUsize::new(0),
         }
     }
 
     /// Inserts or refreshes a template. Re-defining an existing template id is
     /// always allowed (exporters legitimately re-issue templates); only the
     /// introduction of a brand new key is subject to the hard cap.
+    ///
+    /// The vacant path holds the per-key shard lock (via the `Entry` API) and
+    /// reserves a slot with an atomic compare-and-update, so two threads can
+    /// never both admit a new key past the cap.
     pub fn insert(&self, domain: u32, template: TemplateRecord) -> bool {
         let key = (domain, template.template_id);
-        if !self.map.contains_key(&key) && self.map.len() >= self.max_templates {
-            return false;
+        match self.map.entry(key) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(Arc::new(template));
+                true
+            }
+            Entry::Vacant(entry) => {
+                if self.reserve_slot() {
+                    entry.insert(Arc::new(template));
+                    true
+                } else {
+                    false
+                }
+            }
         }
-        self.map.insert(key, Arc::new(template));
-        true
+    }
+
+    /// Atomically claims one slot below the hard cap, returning `false` when the
+    /// cache is already full.
+    fn reserve_slot(&self) -> bool {
+        self.count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < self.max_templates).then_some(count + 1)
+            })
+            .is_ok()
     }
 
     /// Cheap, lock-light lookup returning a shared handle to the template.
@@ -65,6 +93,9 @@ impl TemplateCache {
 pub struct FlowCache {
     map: DashMap<FlowKey, FlowRecord>,
     max_flows: usize,
+    /// Live entry count, reserved atomically so the hard cap cannot be
+    /// overshot by concurrent writers racing on a `len()` snapshot.
+    count: AtomicUsize,
 }
 
 impl FlowCache {
@@ -72,6 +103,7 @@ impl FlowCache {
         Self {
             map: DashMap::new(),
             max_flows,
+            count: AtomicUsize::new(0),
         }
     }
 
@@ -94,35 +126,50 @@ impl FlowCache {
         counters: &InternalCounters,
     ) {
         let key = fields.key_in_domain(observation_domain_id);
-        if let Some(mut existing) = self.map.get_mut(&key) {
-            existing.bytes = existing.bytes.saturating_add(fields.bytes);
-            existing.packets = existing.packets.saturating_add(fields.packets);
-            if fields.start_time_ns != 0
-                && (existing.start_time_ns == 0 || fields.start_time_ns < existing.start_time_ns)
-            {
-                existing.start_time_ns = fields.start_time_ns;
+        // The `Entry` API holds the shard lock for `key`, so the vacant branch
+        // (which reserves a capacity slot) cannot race another writer inserting
+        // the same key.
+        match self.map.entry(key) {
+            Entry::Occupied(mut occupied) => {
+                let existing = occupied.get_mut();
+                existing.bytes = existing.bytes.saturating_add(fields.bytes);
+                existing.packets = existing.packets.saturating_add(fields.packets);
+                if fields.start_time_ns != 0
+                    && (existing.start_time_ns == 0
+                        || fields.start_time_ns < existing.start_time_ns)
+                {
+                    existing.start_time_ns = fields.start_time_ns;
+                }
+                existing.end_time_ns = existing.end_time_ns.max(fields.end_time_ns);
+                if fields.original_start_time_ns != 0
+                    && (existing.original_start_time_ns == 0
+                        || fields.original_start_time_ns < existing.original_start_time_ns)
+                {
+                    existing.original_start_time_ns = fields.original_start_time_ns;
+                }
+                existing.original_end_time_ns = existing
+                    .original_end_time_ns
+                    .max(fields.original_end_time_ns);
+                existing.last_observed = Instant::now();
             }
-            existing.end_time_ns = existing.end_time_ns.max(fields.end_time_ns);
-            if fields.original_start_time_ns != 0
-                && (existing.original_start_time_ns == 0
-                    || fields.original_start_time_ns < existing.original_start_time_ns)
-            {
-                existing.original_start_time_ns = fields.original_start_time_ns;
+            Entry::Vacant(vacant) => {
+                if self.reserve_slot() {
+                    vacant.insert(FlowRecord::from_fields(fields, Instant::now()));
+                } else {
+                    counters.flows_dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            existing.original_end_time_ns = existing
-                .original_end_time_ns
-                .max(fields.original_end_time_ns);
-            existing.last_observed = Instant::now();
-            return;
         }
+    }
 
-        if self.map.len() >= self.max_flows {
-            counters.flows_dropped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
-        self.map
-            .insert(key, FlowRecord::from_fields(fields, Instant::now()));
+    /// Atomically claims one slot below the hard cap, returning `false` when the
+    /// cache is already full.
+    fn reserve_slot(&self) -> bool {
+        self.count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < self.max_flows).then_some(count + 1)
+            })
+            .is_ok()
     }
 
     pub fn len(&self) -> usize {
@@ -144,11 +191,14 @@ impl FlowCache {
         F: Fn(&FlowRecord),
     {
         let now = Instant::now();
+        let count = &self.count;
         self.map.retain(|_key, record| {
             // Idle timeout: no activity for too long -> emit and evict.
             if now.duration_since(record.last_observed) >= cfg.idle_timeout {
                 on_emit(record);
                 counters.flows_output.fetch_add(1, Ordering::Relaxed);
+                // Release the reserved capacity slot as the entry leaves.
+                count.fetch_sub(1, Ordering::Relaxed);
                 return false;
             }
 
@@ -172,9 +222,12 @@ impl FlowCache {
     where
         F: Fn(&FlowRecord),
     {
+        let count = &self.count;
         self.map.retain(|_key, record| {
             on_emit(record);
             counters.flows_output.fetch_add(1, Ordering::Relaxed);
+            // Release the reserved capacity slot as the entry leaves.
+            count.fetch_sub(1, Ordering::Relaxed);
             false
         });
     }

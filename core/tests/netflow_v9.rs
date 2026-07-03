@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use common::{sample_v9_packet, Builder};
@@ -97,8 +98,9 @@ fn data_without_template_is_skipped() {
 }
 
 #[test]
-fn options_template_set_is_skipped() {
-    // A v9 options template (flowset id 1) must be ignored without error.
+fn malformed_options_template_is_handled_gracefully() {
+    // A v9 options template (flowset id 1) whose declared field lengths run
+    // past the buffer must be rejected without error and store nothing.
     let mut b = Builder::new();
     b.put(9, 2)
         .put(1, 2)
@@ -106,7 +108,7 @@ fn options_template_set_is_skipped() {
         .put(1_700_000_000, 4)
         .put(1, 4)
         .put(42, 4)
-        // Options template flowset (id 1) with arbitrary 8-byte body.
+        // Options template flowset (id 1) with a nonsensical 8-byte body.
         .put(1, 2)
         .put(12, 2)
         .put(0xABCD, 4)
@@ -116,6 +118,49 @@ fn options_template_set_is_skipped() {
     let processed = ctx.process_packet(&b.buf).expect("parse ok");
     assert_eq!(processed, 0);
     assert_eq!(ctx.stats().templates_received, 0);
+    assert_eq!(ctx.counters.options_templates_received.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn options_template_and_data_are_decoded_but_not_flows() {
+    // A well-formed v9 options template (1 scope field + 1 option field)
+    // followed by one options data record. The template must be stored and the
+    // record decoded and counted, but it must never enter the flow cache.
+    let mut b = Builder::new();
+    b.put(9, 2) // version
+        .put(2, 2) // count
+        .put(1000, 4) // sys uptime
+        .put(1_700_000_000, 4) // unix seconds
+        .put(1, 4) // sequence
+        .put(42, 4); // source id
+
+    // Options Template FlowSet (id 1). Record: template id 260, scope length 4
+    // bytes (one field), option length 4 bytes (one field).
+    b.put(1, 2) // flowset id = options template
+        .put(18, 2) // length = 4 header + 14 record
+        .put(260, 2) // template id
+        .put(4, 2) // option scope length (bytes)
+        .put(4, 2) // option length (bytes)
+        .put(1, 2) // scope field: SYSTEM
+        .put(4, 2) // scope field length
+        .put(34, 2) // option field: samplingInterval
+        .put(4, 2); // option field length
+
+    // Options Data FlowSet (id 260): one 8-byte record (scope + option value).
+    b.put(260, 2) // set id = options template id
+        .put(12, 2) // length = 4 + 8
+        .put(0x0000_0001, 4) // scope value (system)
+        .put(1000, 4); // samplingInterval value
+
+    let ctx = FlowContext::new();
+    let processed = ctx.process_packet(&b.buf).expect("parse ok");
+
+    // Options records are not flows: nothing is returned or cached as a flow.
+    assert_eq!(processed, 0);
+    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.stats().templates_received, 0, "options are not regular templates");
+    assert_eq!(ctx.counters.options_templates_received.load(Ordering::Relaxed), 1);
+    assert_eq!(ctx.counters.options_records_processed.load(Ordering::Relaxed), 1);
 }
 
 #[test]

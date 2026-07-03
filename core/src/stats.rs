@@ -13,7 +13,12 @@ pub struct InternalCounters {
     pub clock_dropped_packets: AtomicU64,
     pub clock_fallback_packets: AtomicU64,
     pub templates_received: AtomicU64,
+    /// Options templates decoded and stored (NetFlow v9 set id 1, IPFIX set id 3).
+    pub options_templates_received: AtomicU64,
     pub data_records_processed: AtomicU64,
+    /// Options data records decoded. These carry exporter metadata rather than
+    /// observed flows, so they are counted here instead of the flow cache.
+    pub options_records_processed: AtomicU64,
     /// Flow records delivered to the configured output callback.
     pub flows_output: AtomicU64,
     pub flows_dropped: AtomicU64,

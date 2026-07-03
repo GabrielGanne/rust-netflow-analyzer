@@ -178,8 +178,19 @@ impl FlowContext {
                         }
                     }
                 }
-                // Options templates carry metadata, not flow records; skip them.
-                id if id == FLOWSET_ID_V9_OPTIONS || id == SET_ID_IPFIX_OPTIONS => {}
+                // Options templates describe the layout of options data records
+                // (exporter metadata). Decode and store them so their data sets
+                // can later be interpreted rather than silently dropped.
+                id if id == FLOWSET_ID_V9_OPTIONS => {
+                    if let Ok((_, templates)) = parser::parse_v9_options_template_set(body) {
+                        self.store_options_templates(domain, templates);
+                    }
+                }
+                id if id == SET_ID_IPFIX_OPTIONS => {
+                    if let Ok((_, templates)) = parser::parse_ipfix_options_template_set(body) {
+                        self.store_options_templates(domain, templates);
+                    }
+                }
                 id if id >= FIRST_DATA_SET_ID => {
                     data_records += self.process_data_set(domain, id, body, time_context);
                 }
@@ -193,6 +204,16 @@ impl FlowContext {
             .fetch_add(data_records as u64, Ordering::Relaxed);
 
         Ok(data_records)
+    }
+
+    /// Records every decoded options template under `domain`, counting each one.
+    fn store_options_templates(&self, domain: u32, templates: Vec<parser::TemplateRecord>) {
+        for template in templates {
+            self.counters
+                .options_templates_received
+                .fetch_add(1, Ordering::Relaxed);
+            self.templates.insert(domain, template);
+        }
     }
 
     /// Decodes up to `count` fixed-format NetFlow v5 records from the payload.
@@ -234,7 +255,22 @@ impl FlowContext {
             return 0;
         };
 
+        // Options data records carry exporter metadata, not observed flows, so
+        // they are decoded and counted separately without polluting the flow
+        // cache. `count` therefore tracks only flow records for the return value.
+        let is_options = template.is_options;
         let mut count = 0usize;
+
+        let mut consume = |fields: &FlowFields| {
+            if is_options {
+                self.counters
+                    .options_records_processed
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.flows.upsert_in_domain(domain, fields, &self.counters);
+                count += 1;
+            }
+        };
 
         match template.fixed_length {
             Some(record_len) if record_len > 0 => {
@@ -242,8 +278,7 @@ impl FlowContext {
                     if let Some((fields, _)) =
                         FlowFields::from_record_sized_at(&template, record, Some(time_context))
                     {
-                        self.flows.upsert_in_domain(domain, &fields, &self.counters);
-                        count += 1;
+                        consume(&fields);
                     }
                 }
             }
@@ -253,8 +288,7 @@ impl FlowContext {
                 while !cursor.is_empty() {
                     match FlowFields::from_record_sized_at(&template, cursor, Some(time_context)) {
                         Some((fields, consumed)) if consumed > 0 && consumed <= cursor.len() => {
-                            self.flows.upsert_in_domain(domain, &fields, &self.counters);
-                            count += 1;
+                            consume(&fields);
                             cursor = &cursor[consumed..];
                         }
                         _ => break,

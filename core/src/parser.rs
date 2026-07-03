@@ -217,19 +217,49 @@ pub struct TemplateRecord {
     /// Sum of all fixed field lengths. `None` if the template contains any
     /// variable-length field (record size must then be computed per record).
     pub fixed_length: Option<usize>,
+    /// `true` when this is an Options Template. Its data records carry exporter
+    /// metadata (scoped options) rather than observed flows.
+    pub is_options: bool,
+    /// Number of leading fields that form the option scope. Zero for ordinary
+    /// (non-options) templates.
+    pub scope_field_count: u16,
 }
 
 impl TemplateRecord {
-    pub(crate) fn from_fields(template_id: u16, fields: Vec<TemplateField>) -> Self {
-        let fixed_length = if fields.iter().any(|f| f.length == VARIABLE_LENGTH) {
+    fn fixed_length_of(fields: &[TemplateField]) -> Option<usize> {
+        if fields.iter().any(|f| f.length == VARIABLE_LENGTH) {
             None
         } else {
             Some(fields.iter().map(|f| f.length as usize).sum())
-        };
+        }
+    }
+
+    pub(crate) fn from_fields(template_id: u16, fields: Vec<TemplateField>) -> Self {
+        let fixed_length = Self::fixed_length_of(&fields);
         Self {
             template_id,
             fields,
             fixed_length,
+            is_options: false,
+            scope_field_count: 0,
+        }
+    }
+
+    /// Builds an Options Template. `scope_field_count` is the number of leading
+    /// `fields` that form the scope; the remainder are the option fields. Both
+    /// share the same on-wire layout, so decoding walks them uniformly.
+    pub(crate) fn from_options_fields(
+        template_id: u16,
+        scope_field_count: u16,
+        fields: Vec<TemplateField>,
+    ) -> Self {
+        let fixed_length = Self::fixed_length_of(&fields);
+        Self {
+            template_id,
+            fields,
+            fixed_length,
+            is_options: true,
+            scope_field_count,
         }
     }
 }
@@ -278,28 +308,9 @@ fn parse_field_specifier(input: &[u8]) -> IResult<&[u8], TemplateField> {
 
 /// Parses a single template record (template id, field count, field specifiers).
 fn parse_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
-    let (mut input, template_id) = be_u16(input)?;
-    let (rest, field_count) = be_u16(input)?;
-    input = rest;
-
-    // Fallible pre-allocation: reserve the exact capacity up front so the
-    // per-field `push` calls below never trigger an implicit (infallible,
-    // abort-on-OOM) reallocation. A failed reservation from an absurd field
-    // count is surfaced as a parse failure instead of aborting the process.
-    let mut fields = Vec::new();
-    if fields.try_reserve_exact(field_count as usize).is_err() {
-        return Err(nom::Err::Failure(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::TooLarge,
-        )));
-    }
-
-    for _ in 0..field_count {
-        let (rest, field) = parse_field_specifier(input)?;
-        input = rest;
-        fields.push(field);
-    }
-
+    let (input, template_id) = be_u16(input)?;
+    let (input, field_count) = be_u16(input)?;
+    let (input, fields) = parse_field_specifiers(input, field_count as usize)?;
     Ok((input, TemplateRecord::from_fields(template_id, fields)))
 }
 
@@ -315,6 +326,88 @@ pub fn parse_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>
         templates.push(template);
     }
 
+    Ok((body, templates))
+}
+
+/// Reads `count` field specifiers into a fallibly pre-allocated vector,
+/// refusing an absurd count rather than risking an abort on allocation.
+fn parse_field_specifiers(mut input: &[u8], count: usize) -> IResult<&[u8], Vec<TemplateField>> {
+    let mut fields = Vec::new();
+    if fields.try_reserve_exact(count).is_err() {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+    for _ in 0..count {
+        let (rest, field) = parse_field_specifier(input)?;
+        input = rest;
+        fields.push(field);
+    }
+    Ok((input, fields))
+}
+
+/// Parses a single NetFlow v9 Options Template record (RFC 3954 §6.1).
+///
+/// Layout: template id, option scope length (bytes), option length (bytes),
+/// then the scope field specifiers followed by the option field specifiers.
+/// The two length fields are byte counts; every v9 field specifier is 4 bytes.
+fn parse_v9_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
+    let (input, template_id) = be_u16(input)?;
+    let (input, scope_len_bytes) = be_u16(input)?;
+    let (input, option_len_bytes) = be_u16(input)?;
+
+    let scope_field_count = scope_len_bytes / 4;
+    let option_field_count = option_len_bytes / 4;
+    let total = scope_field_count as usize + option_field_count as usize;
+
+    let (input, fields) = parse_field_specifiers(input, total)?;
+    Ok((
+        input,
+        TemplateRecord::from_options_fields(template_id, scope_field_count, fields),
+    ))
+}
+
+/// Parses every options-template record in a NetFlow v9 Options Template
+/// FlowSet body (set id 1). Trailing alignment padding is ignored.
+pub fn parse_v9_options_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
+    let mut templates = Vec::new();
+    // Minimum record is the 6-byte header (id + two length fields).
+    while body.len() >= 6 {
+        let (rest, template) = parse_v9_options_template_record(body)?;
+        body = rest;
+        templates.push(template);
+    }
+    Ok((body, templates))
+}
+
+/// Parses a single IPFIX Options Template record (RFC 7011 §3.4.2.2).
+///
+/// Layout: template id, total field count, scope field count, then that many
+/// field specifiers (scope fields first). `field_count` includes the scope
+/// fields, so exactly `field_count` specifiers follow.
+fn parse_ipfix_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
+    let (input, template_id) = be_u16(input)?;
+    let (input, field_count) = be_u16(input)?;
+    let (input, scope_field_count) = be_u16(input)?;
+
+    let (input, fields) = parse_field_specifiers(input, field_count as usize)?;
+    Ok((
+        input,
+        TemplateRecord::from_options_fields(template_id, scope_field_count, fields),
+    ))
+}
+
+/// Parses every options-template record in an IPFIX Options Template Set body
+/// (set id 3). Trailing alignment padding is ignored.
+pub fn parse_ipfix_options_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
+    let mut templates = Vec::new();
+    // Minimum record is the 6-byte header (id + two count fields).
+    while body.len() >= 6 {
+        let (rest, template) = parse_ipfix_options_template_record(body)?;
+        body = rest;
+        templates.push(template);
+    }
     Ok((body, templates))
 }
 
