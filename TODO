@@ -1,18 +1,157 @@
 # TODO
-* compare here:include/netflow-analyzer.h na:src/netflow-parser/netflow.h
-* test template option
 
-# Pending actions
-* Options semantics: options templates + data records are now decoded and
+## Publication readiness — release blockers
+
+### Cargo packages and release contents
+
+- [ ] Add shared package metadata for both crates: `license = "MPL-2.0"`,
+  descriptions, repository, readme, keywords/categories, and the supported
+  `rust-version`.
+- [ ] Add a registry version to the FFI crate's `netflow_analyzer_core` path
+  dependency, then document and verify the publication order (core before FFI).
+- [ ] Ensure each `.crate` archive contains its license and README.
+- [ ] Move the UDP listener under the core package root, or explicitly stop
+  advertising it as a published example; Cargo currently omits the
+  `../examples/udp_listener.rs` target from the core archive.
+- [ ] Package the generated C header with the FFI crate instead of leaving it
+  outside the crate root. Keep the packaged header synchronized with cbindgen.
+- [ ] Make `cargo package -p netflow_analyzer_core` and
+  `cargo package -p netflow_analyzer_ffi` complete without errors or warnings,
+  and inspect both archives with `cargo package --list`.
+- [ ] Recheck and reserve the intended crates.io names immediately before the
+  first release; registry names are allocated first-come-first-served.
+
+### Exporter identity and protocol correctness
+
+- [ ] Decide the exporter/session identity model before publishing the API.
+  Prefer accepting an explicit transport-session/exporter key; the smaller
+  alternative is to require and document one `FlowContext` per exporter.
+- [ ] Scope template and clock state by exporter/transport session plus
+  observation domain, not observation domain alone.
+- [ ] Scope five-tuple flow keys by the chosen exporter identity and observation
+  domain so unrelated exporters or domains cannot be aggregated together.
+- [ ] Update the UDP listener to maintain separate state for each exporter when
+  it receives packets from multiple peers.
+- [ ] Enforce the IPFIX message `total_length` and reject inconsistent/truncated
+  message and Set lengths instead of parsing bytes beyond the declared message.
+- [ ] Decide and document strict rejection versus explicit partial decoding for
+  malformed packet bodies. In either mode, return useful diagnostics and update
+  malformed-packet counters instead of silently returning success.
+- [ ] Validate template field counts against the remaining input before
+  reserving memory, and define conservative per-message/template limits to
+  prevent allocation churn from hostile datagrams.
+- [ ] Add template lifetime/expiry and transport-session reset semantics so the
+  bounded template cache cannot fill permanently with stale entries.
+- [ ] Validate template IDs, options scope counts/lengths, and template
+  replacement/lifecycle rules against NetFlow v9 and IPFIX requirements.
+
+### FFI safety and ABI stability
+
+- [ ] Invoke flow callbacks only after releasing `DashMap` shard locks so a slow
+  or reentrant callback cannot block ingestion or deadlock on flush/process.
+- [ ] Define the callback contract in Rust and in the generated C header:
+  non-null requirements, callback thread, reentrancy, record-pointer lifetime,
+  and `user_data` lifetime/synchronization responsibilities.
+- [ ] Represent optional callbacks safely (for example,
+  `Option<NetflowAnalyzerFlowCallback>`), or validate/reject missing callbacks
+  without accepting an invalid Rust function-pointer value from C.
+- [ ] Prevent destruction from an aging callback and concurrent destruction
+  while another API call is active; document the required shutdown sequence.
+- [ ] Prevent Rust panics from reaching an `extern "C"` boundary. Replace
+  avoidable `expect` paths in FFI-reachable code and define failure behavior for
+  worker-thread creation and poisoned state.
+- [ ] Add an ABI version query and size/version fields (or reserved space) to
+  extensible public structs before changing `NetflowAnalyzerConfig`,
+  `NetflowAnalyzerStats`, or `NetflowAnalyzerFlowRecord`.
+- [ ] Define a supported-platform/ABI policy and test public symbol lists,
+  structure sizes, alignments, calling conventions, and C/C++ compilation.
+- [ ] Decide how C releases are distributed. If shipping binaries, publish
+  versioned shared/static libraries, the header, license, checksums, and
+  pkg-config or CMake metadata for each supported platform.
+
+### Public Rust API and documentation
+
+- [ ] Review the public API before 0.1: reduce public modules, fields, caches,
+  parser internals, and atomic counters to the surface intended for SemVer
+  support. This is a breaking API design decision if postponed.
+- [ ] Replace stringly `Result<_, &'static str>` failures with a documented,
+  typed error enum that callers can match without comparing message text.
+- [ ] Add crate-level documentation and examples for both crates, then document
+  every intended public item or explicitly allow narrowly justified omissions.
+- [ ] Fix the broken rustdoc link to `FlowFields::from_record` and make
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` pass.
+- [ ] Add a public README covering supported protocols, architecture, Rust and C
+  quick starts, threading/lifecycle rules, resource limits, security posture,
+  feature limitations, MSRV, license, and support status.
+- [ ] Add a changelog, security policy/reporting instructions, contribution
+  guidance, and a documented release procedure with version tags.
+- [ ] Rewrite or exclude `netflow-analyzer-migration.md` for public release; it
+  currently contains environment-specific paths and downstream-project details.
+- [ ] Compare `include/netflow-analyzer.h` with the downstream
+  `src/netflow-parser/netflow.h` contract and document intentional differences.
+
+### Security and dependency policy
+
+- [ ] Update `crossbeam-epoch` from 0.9.18 to at least 0.9.20 and make
+  `cargo audit` pass without RUSTSEC-2026-0204. It is currently reached through
+  benchmark/dev dependencies, not the runtime dependency path.
+- [ ] Add and review a `deny.toml` policy for advisories, allowed licenses,
+  dependency sources, duplicate versions, and banned crates; make
+  `cargo deny check` a release gate.
+- [ ] Document deployment hardening for the public UDP listener: trusted exporter
+  allow-lists, rate limiting, conservative cache caps, observability, and the
+  memory/CPU consequences of hostile high-cardinality traffic.
+- [ ] Add recurring secret/certificate scans and dependency/license checks to CI.
+
+## Testing and local verification
+
+- [ ] Fix the existing rustfmt drift so `./tools/test.sh` is a passing local gate.
+- [ ] Keep the local gate as the documented correctness command: locked debug and
+  release tests, documentation tests, Clippy with warnings denied, and the C
+  ABI smoke test.
+- [ ] Add CI for formatting, strict Clippy, debug/release/all-target tests,
+  strict rustdoc, package verification, header freshness, the C smoke test,
+  dependency policy, and the declared MSRV/platform matrix.
+- [ ] Preserve the current high test coverage with an explicit CI threshold and
+  report line/region coverage on changes to parser, cache, clock, or FFI code.
+- [ ] Add table-driven packet builders and fixtures for header/FlowSet length
+  boundaries, truncation, padding, unknown fields, template replacement and
+  expiry, multiple observation domains, options semantics, and all documented
+  error paths.
+- [ ] Add deterministic clock, concurrency, and lifecycle coverage for concurrent
+  processing/flushing, repeated aging start/stop, and bounded cache behavior.
+  Replace timing sleeps with an injectable or controllable clock where tests
+  require deterministic time.
+- [ ] Expand the runnable examples and C ABI checks to cover decode-only callbacks,
+  callback field values, null/empty inputs, explicit timestamps, and public
+  structure sizes and layouts.
+- [ ] Keep benchmark workloads representative and runnable locally; cover packet
+  size, records per packet, template warmness, cache hit/miss behavior, and
+  cold versus warm contexts. Record environment details when comparing runs.
+- [ ] Add a packet-parser fuzz crate with checked-in seeds for headers, FlowSets,
+  templates, and variable-length records. Add optional sanitizer and dependency
+  audit commands when the required tools and policies are defined.
+- [ ] Add sanitizer/Miri coverage where supported for unsafe FFI lifecycle and
+  concurrency paths.
+- [ ] Declare a supported `rust-version` before adding an MSRV test runner.
+
+## Pending actions
+
+- [ ] Options semantics: options templates + data records are now decoded and
   counted, but their scoped values are not interpreted. Extract the sampling
   interval (samplingInterval IE 34, samplerRandomInterval IE 305) per
   observation domain from options records.
-* Apply the decoded sampling interval to scale flow byte/packet counters per
+- [ ] Apply the decoded sampling interval to scale flow byte/packet counters per
   domain (defaults to a factor of 1 when no options are seen). This also
   addresses the missing sampling-normalization gap.
-* Expose the new options metrics (options_templates_received,
+- [ ] Expose the new options metrics (options_templates_received,
   options_records_processed) in the FFI NetflowAnalyzerStats snapshot, then
   regenerate include/netflow-analyzer.h via `make header` (cbindgen).
+- [ ] Decide which aggregation semantics are in scope for the first public
+  release: stitching, deduplication, bidirectional aggregation, periodic
+  intermediate emission, and empty-record dropping. Document unsupported modes.
+- [ ] Test options-template data interpretation and enrichment end to end.
 
-# To investigate
-* Phase 4: implement the dpdk_runner crate (high-performance packet source).
+## To investigate
+
+- [ ] Phase 4: implement the dpdk_runner crate (high-performance packet source).

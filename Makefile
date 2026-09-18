@@ -3,7 +3,7 @@
 CARGO  ?= cargo
 HEADER := include/netflow-analyzer.h
 
-.PHONY: all build release test header c-example clean
+.PHONY: all build release test check header c-example bench clean
 
 all: build
 
@@ -19,6 +19,11 @@ release:
 test:
 	$(CARGO) test
 
+# Full local verification, including formatting, Clippy, release tests, and
+# the C ABI smoke test.
+check:
+	./tools/test.sh
+
 # Regenerate the C header from the Rust sources (requires cbindgen).
 # Install with: cargo install cbindgen
 header:
@@ -27,6 +32,9 @@ header:
 # Build and run the C integration test-bench against the release staticlib.
 c-example: release
 	$(MAKE) -C examples/c_integration run
+
+bench:
+	./tools/bench.sh
 
 # Run the reference UDP listener (Ctrl-C to stop). ADDR overrides the bind addr.
 ADDR ?= 0.0.0.0:2055
