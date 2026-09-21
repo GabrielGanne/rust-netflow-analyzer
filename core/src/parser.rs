@@ -7,6 +7,8 @@ use nom::{
     IResult,
 };
 
+use crate::scope::Scope;
+
 /// Supported versions of the NetFlow/IPFIX protocol
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProtocolVersion {
@@ -155,6 +157,22 @@ impl ParsedHeader {
             ParsedHeader::V5(_) => 0,
             ParsedHeader::V9(h) => h.source_id,
             ParsedHeader::Ipfix(h) => h.observation_domain_id,
+        }
+    }
+
+    /// Returns the protocol-tagged [`Scope`] used to key per-exporter state.
+    ///
+    /// Unlike [`Self::domain_id`], this keeps NetFlow v9, IPFIX, and NetFlow v5
+    /// engine namespaces distinct so their identically numbered domains cannot
+    /// collide within a single exporter. See `docs/exporter-identity.md`.
+    pub fn scope(&self) -> Scope {
+        match self {
+            ParsedHeader::V5(h) => Scope::V5Engine {
+                engine_type: h.engine_type,
+                engine_id: h.engine_id,
+            },
+            ParsedHeader::V9(h) => Scope::V9Domain(h.source_id),
+            ParsedHeader::Ipfix(h) => Scope::IpfixDomain(h.observation_domain_id),
         }
     }
 

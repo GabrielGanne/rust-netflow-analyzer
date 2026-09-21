@@ -8,6 +8,12 @@ use std::time::Duration;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
+use crate::scope::{ExporterKey, Scope};
+
+/// Clock state is tracked per exporter/transport session and protocol-tagged
+/// observation [`Scope`], mirroring how templates and flows are scoped.
+type ClockKey = (ExporterKey, Scope);
+
 /// Exporter-clock validation and recovery settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockConfig {
@@ -48,24 +54,26 @@ pub(crate) enum ClockDecision {
     Drop,
 }
 
-/// Concurrent, bounded exporter-clock state keyed by observation domain.
+/// Concurrent, bounded exporter-clock state keyed by `(exporter, scope)`.
 pub struct ClockTracker {
-    states: DashMap<u32, ClockState>,
-    max_domains: usize,
-    domain_count: AtomicUsize,
+    states: DashMap<ClockKey, ClockState>,
+    max_scopes: usize,
+    scope_count: AtomicUsize,
 }
 
 impl ClockTracker {
-    pub fn new(max_domains: usize) -> Self {
+    pub fn new(max_scopes: usize) -> Self {
         Self {
             states: DashMap::new(),
-            max_domains,
-            domain_count: AtomicUsize::new(0),
+            max_scopes,
+            scope_count: AtomicUsize::new(0),
         }
     }
 
-    pub fn get(&self, domain: u32) -> Option<ClockState> {
-        self.states.get(&domain).map(|entry| *entry.value())
+    pub fn get(&self, exporter: ExporterKey, scope: Scope) -> Option<ClockState> {
+        self.states
+            .get(&(exporter, scope))
+            .map(|entry| *entry.value())
     }
 
     pub fn len(&self) -> usize {
@@ -78,7 +86,8 @@ impl ClockTracker {
 
     pub(crate) fn observe(
         &self,
-        domain: u32,
+        exporter: ExporterKey,
+        scope: Scope,
         export_time_ns: u64,
         receipt_time_ns: u64,
         config: ClockConfig,
@@ -87,7 +96,7 @@ impl ClockTracker {
         let max_skew_ns = config.max_skew.as_nanos().min(u64::MAX as u128) as u64;
         let usable = !config.sync_check_enabled || skew_ns <= max_skew_ns;
 
-        match self.states.entry(domain) {
+        match self.states.entry((exporter, scope)) {
             Entry::Occupied(mut entry) => {
                 let state = entry.get_mut();
                 state.last_export_time_ns = export_time_ns;
@@ -99,9 +108,9 @@ impl ClockTracker {
             }
             Entry::Vacant(entry) => {
                 let reserved = self
-                    .domain_count
+                    .scope_count
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                        (count < self.max_domains).then_some(count + 1)
+                        (count < self.max_scopes).then_some(count + 1)
                     })
                     .is_ok();
                 if reserved {
@@ -135,17 +144,21 @@ impl ClockTracker {
 mod tests {
     use super::*;
 
+    use crate::scope::SINGLE_EXPORTER;
+
+    const D7: Scope = Scope::V9Domain(7);
+
     #[test]
     fn disabled_check_accepts_and_tracks_large_skew() {
         let tracker = ClockTracker::new(4);
-        let decision = tracker.observe(7, 10, 1_000, ClockConfig::default());
+        let decision = tracker.observe(SINGLE_EXPORTER, D7, 10, 1_000, ClockConfig::default());
         assert_eq!(
             decision,
             ClockDecision::Accept {
                 effective_export_time_ns: 10
             }
         );
-        let state = tracker.get(7).unwrap();
+        let state = tracker.get(SINGLE_EXPORTER, D7).unwrap();
         assert_eq!(state.last_skew_ns, 990);
         assert!(state.last_was_usable);
     }
@@ -158,27 +171,76 @@ mod tests {
             max_skew: Duration::from_nanos(5),
             fallback_to_receipt_time: false,
         };
-        assert_eq!(tracker.observe(7, 10, 20, config), ClockDecision::Drop);
+        assert_eq!(
+            tracker.observe(SINGLE_EXPORTER, D7, 10, 20, config),
+            ClockDecision::Drop
+        );
 
         config.fallback_to_receipt_time = true;
         assert_eq!(
-            tracker.observe(7, 10, 20, config),
+            tracker.observe(SINGLE_EXPORTER, D7, 10, 20, config),
             ClockDecision::Fallback {
                 effective_export_time_ns: 20
             }
         );
-        let state = tracker.get(7).unwrap();
+        let state = tracker.get(SINGLE_EXPORTER, D7).unwrap();
         assert_eq!(state.packets_seen, 2);
         assert_eq!(state.clock_issues, 2);
         assert!(!state.last_was_usable);
     }
 
     #[test]
-    fn domain_state_is_bounded() {
+    fn scope_state_is_bounded() {
         let tracker = ClockTracker::new(1);
-        tracker.observe(1, 10, 10, ClockConfig::default());
-        tracker.observe(2, 20, 20, ClockConfig::default());
-        assert!(tracker.get(1).is_some());
-        assert!(tracker.get(2).is_none());
+        tracker.observe(
+            SINGLE_EXPORTER,
+            Scope::V9Domain(1),
+            10,
+            10,
+            ClockConfig::default(),
+        );
+        tracker.observe(
+            SINGLE_EXPORTER,
+            Scope::V9Domain(2),
+            20,
+            20,
+            ClockConfig::default(),
+        );
+        assert!(tracker.get(SINGLE_EXPORTER, Scope::V9Domain(1)).is_some());
+        assert!(tracker.get(SINGLE_EXPORTER, Scope::V9Domain(2)).is_none());
+    }
+
+    #[test]
+    fn state_is_independent_per_exporter_and_protocol() {
+        let tracker = ClockTracker::new(8);
+        let cfg = ClockConfig::default();
+        // Same numeric domain 7 stays distinct across exporters and protocols.
+        tracker.observe(1, Scope::V9Domain(7), 10, 10, cfg);
+        tracker.observe(2, Scope::V9Domain(7), 20, 20, cfg);
+        tracker.observe(1, Scope::IpfixDomain(7), 30, 30, cfg);
+
+        assert_eq!(tracker.len(), 3);
+        assert_eq!(
+            tracker
+                .get(1, Scope::V9Domain(7))
+                .unwrap()
+                .last_export_time_ns,
+            10
+        );
+        assert_eq!(
+            tracker
+                .get(2, Scope::V9Domain(7))
+                .unwrap()
+                .last_export_time_ns,
+            20
+        );
+        assert_eq!(
+            tracker
+                .get(1, Scope::IpfixDomain(7))
+                .unwrap()
+                .last_export_time_ns,
+            30
+        );
+        assert!(tracker.get(2, Scope::IpfixDomain(7)).is_none());
     }
 }

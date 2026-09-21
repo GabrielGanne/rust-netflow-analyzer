@@ -6,6 +6,7 @@ pub mod cache;
 pub mod clock;
 pub mod parser;
 pub mod records;
+pub mod scope;
 pub mod stats;
 
 use std::sync::atomic::Ordering;
@@ -21,6 +22,7 @@ use parser::{
     SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
 };
 use records::{FlowFields, FlowRecord, RecordTimeContext};
+use scope::{Scope, SINGLE_EXPORTER};
 use stats::{InternalCounters, NetflowAnalyzerStats};
 
 /// Error returned when clock validation rejects an otherwise parseable packet.
@@ -155,9 +157,16 @@ impl FlowContext {
         self.counters.pkts_parsed.fetch_add(1, Ordering::Relaxed);
 
         let domain = header.domain_id();
+        // Per-exporter, protocol-tagged scope used to key template and clock
+        // state (see docs/exporter-identity.md). The public entry points do not
+        // yet accept a caller-supplied key, so it is the reserved single-exporter
+        // value for now; the `domain` above still drives the flow-cache sink.
+        let exporter = SINGLE_EXPORTER;
+        let scope = header.scope();
         let original_export_time_ns = header.export_time_ns();
         let effective_export_time_ns = match self.clocks.observe(
-            domain,
+            exporter,
+            scope,
             original_export_time_ns,
             receipt_time_ns,
             self.clock_cfg,
@@ -219,7 +228,7 @@ impl FlowContext {
                             self.counters
                                 .templates_received
                                 .fetch_add(1, Ordering::Relaxed);
-                            self.templates.insert(domain, template);
+                            self.templates.insert(exporter, scope, template);
                         }
                     }
                 }
@@ -228,16 +237,24 @@ impl FlowContext {
                 // can later be interpreted rather than silently dropped.
                 id if id == FLOWSET_ID_V9_OPTIONS => {
                     if let Ok((_, templates)) = parser::parse_v9_options_template_set(body) {
-                        self.store_options_templates(domain, templates);
+                        self.store_options_templates(exporter, scope, templates);
                     }
                 }
                 id if id == SET_ID_IPFIX_OPTIONS => {
                     if let Ok((_, templates)) = parser::parse_ipfix_options_template_set(body) {
-                        self.store_options_templates(domain, templates);
+                        self.store_options_templates(exporter, scope, templates);
                     }
                 }
                 id if id >= FIRST_DATA_SET_ID => {
-                    data_records += self.process_data_set(domain, id, body, time_context, sink);
+                    data_records += self.process_data_set(
+                        exporter,
+                        scope,
+                        domain,
+                        id,
+                        body,
+                        time_context,
+                        sink,
+                    );
                 }
                 // Reserved/unknown set ids (e.g. 4..=255) are ignored.
                 _ => {}
@@ -251,13 +268,19 @@ impl FlowContext {
         Ok(data_records)
     }
 
-    /// Records every decoded options template under `domain`, counting each one.
-    fn store_options_templates(&self, domain: u32, templates: Vec<parser::TemplateRecord>) {
+    /// Records every decoded options template under `(exporter, scope)`,
+    /// counting each one.
+    fn store_options_templates(
+        &self,
+        exporter: scope::ExporterKey,
+        scope: Scope,
+        templates: Vec<parser::TemplateRecord>,
+    ) {
         for template in templates {
             self.counters
                 .options_templates_received
                 .fetch_add(1, Ordering::Relaxed);
-            self.templates.insert(domain, template);
+            self.templates.insert(exporter, scope, template);
         }
     }
 
@@ -289,8 +312,14 @@ impl FlowContext {
     }
 
     /// Decodes every data record in a data FlowSet body against its template.
+    ///
+    /// `(exporter, scope)` keys the template lookup; `domain` is the observation
+    /// domain reported to the flow-cache `sink`.
+    #[allow(clippy::too_many_arguments)]
     fn process_data_set(
         &self,
+        exporter: scope::ExporterKey,
+        scope: Scope,
         domain: u32,
         template_id: u16,
         body: &[u8],
@@ -299,7 +328,7 @@ impl FlowContext {
     ) -> usize {
         // Without the template we cannot interpret the records yet; the exporter
         // will resend it periodically, so we simply skip until then.
-        let Some(template) = self.templates.get(domain, template_id) else {
+        let Some(template) = self.templates.get(exporter, scope, template_id) else {
             return 0;
         };
 

@@ -12,12 +12,14 @@ use dashmap::DashMap;
 
 use crate::parser::TemplateRecord;
 use crate::records::{FlowFields, FlowKey, FlowRecord};
+use crate::scope::{ExporterKey, Scope};
 use crate::stats::InternalCounters;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-/// Template lookup key: templates are scoped to the exporter's observation
-/// domain so that identical template ids from different domains never collide.
-pub type TemplateKey = (u32, u16);
+/// Template lookup key: templates are scoped to the exporter/transport session
+/// and its protocol-tagged observation [`Scope`], so identical template ids from
+/// different exporters, protocol versions, or domains never collide.
+pub type TemplateKey = (ExporterKey, Scope, u16);
 
 /// Default hard caps. These bound heap growth even under a hostile exporter
 /// that floods the engine with unique templates or flows.
@@ -49,8 +51,8 @@ impl TemplateCache {
     /// The vacant path holds the per-key shard lock (via the `Entry` API) and
     /// reserves a slot with an atomic compare-and-update, so two threads can
     /// never both admit a new key past the cap.
-    pub fn insert(&self, domain: u32, template: TemplateRecord) -> bool {
-        let key = (domain, template.template_id);
+    pub fn insert(&self, exporter: ExporterKey, scope: Scope, template: TemplateRecord) -> bool {
+        let key = (exporter, scope, template.template_id);
         match self.map.entry(key) {
             Entry::Occupied(mut entry) => {
                 entry.insert(Arc::new(template));
@@ -78,9 +80,14 @@ impl TemplateCache {
     }
 
     /// Cheap, lock-light lookup returning a shared handle to the template.
-    pub fn get(&self, domain: u32, template_id: u16) -> Option<Arc<TemplateRecord>> {
+    pub fn get(
+        &self,
+        exporter: ExporterKey,
+        scope: Scope,
+        template_id: u16,
+    ) -> Option<Arc<TemplateRecord>> {
         self.map
-            .get(&(domain, template_id))
+            .get(&(exporter, scope, template_id))
             .map(|e| e.value().clone())
     }
 
@@ -328,6 +335,7 @@ impl Drop for AgingHandle {
 mod tests {
     use super::*;
     use crate::parser::{TemplateField, TemplateRecord};
+    use crate::scope::SINGLE_EXPORTER;
     use std::sync::atomic::AtomicUsize;
 
     fn sample_template(id: u16) -> TemplateRecord {
@@ -356,23 +364,51 @@ mod tests {
     fn template_cache_insert_get_and_scope() {
         let cache = TemplateCache::new(10);
         assert!(cache.is_empty());
-        assert!(cache.insert(1, sample_template(256)));
-        assert!(cache.insert(2, sample_template(256))); // same id, different domain
+        let d1 = Scope::V9Domain(1);
+        let d2 = Scope::V9Domain(2);
+        let d3 = Scope::V9Domain(3);
+        assert!(cache.insert(SINGLE_EXPORTER, d1, sample_template(256)));
+        assert!(cache.insert(SINGLE_EXPORTER, d2, sample_template(256))); // same id, different domain
 
         assert_eq!(cache.len(), 2);
-        assert!(cache.get(1, 256).is_some());
-        assert!(cache.get(2, 256).is_some());
-        assert!(cache.get(3, 256).is_none());
+        assert!(cache.get(SINGLE_EXPORTER, d1, 256).is_some());
+        assert!(cache.get(SINGLE_EXPORTER, d2, 256).is_some());
+        assert!(cache.get(SINGLE_EXPORTER, d3, 256).is_none());
+    }
+
+    #[test]
+    fn template_cache_scopes_by_exporter_and_protocol() {
+        let cache = TemplateCache::new(10);
+        // Same numeric domain id is a distinct key per exporter and per protocol.
+        assert!(cache.insert(1, Scope::V9Domain(7), sample_template(256)));
+        assert!(cache.insert(2, Scope::V9Domain(7), sample_template(256)));
+        assert!(cache.insert(1, Scope::IpfixDomain(7), sample_template(256)));
+        assert!(cache.insert(
+            1,
+            Scope::V5Engine {
+                engine_type: 0,
+                engine_id: 7,
+            },
+            sample_template(256),
+        ));
+
+        assert_eq!(cache.len(), 4);
+        assert!(cache.get(1, Scope::V9Domain(7), 256).is_some());
+        assert!(cache.get(2, Scope::V9Domain(7), 256).is_some());
+        assert!(cache.get(1, Scope::IpfixDomain(7), 256).is_some());
+        // A different exporter's IPFIX domain 7 was never installed.
+        assert!(cache.get(2, Scope::IpfixDomain(7), 256).is_none());
     }
 
     #[test]
     fn template_cache_enforces_cap_but_allows_redefinition() {
         let cache = TemplateCache::new(1);
-        assert!(cache.insert(1, sample_template(256)));
+        let d1 = Scope::V9Domain(1);
+        assert!(cache.insert(SINGLE_EXPORTER, d1, sample_template(256)));
         // New distinct key rejected once full.
-        assert!(!cache.insert(1, sample_template(257)));
+        assert!(!cache.insert(SINGLE_EXPORTER, d1, sample_template(257)));
         // Re-defining an existing key is always allowed.
-        assert!(cache.insert(1, sample_template(256)));
+        assert!(cache.insert(SINGLE_EXPORTER, d1, sample_template(256)));
         assert_eq!(cache.len(), 1);
     }
 

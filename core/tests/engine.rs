@@ -14,6 +14,7 @@ use common::{sample_v5_packet, sample_v9_packet, Builder, V5Flow};
 use netflow_analyzer_core::cache::AgingConfig;
 use netflow_analyzer_core::clock::ClockConfig;
 use netflow_analyzer_core::records::FlowRecord;
+use netflow_analyzer_core::scope::{Scope, SINGLE_EXPORTER};
 use netflow_analyzer_core::{EngineConfig, FlowContext};
 
 #[test]
@@ -209,7 +210,10 @@ fn clock_check_drops_skewed_packet_and_tracks_domain() {
     assert_eq!(ctx.stats().clock_fallback_packets, 0);
     assert_eq!(ctx.templates.len(), 0, "the entire packet is rejected");
 
-    let state = ctx.clocks.get(42).expect("domain clock state");
+    let state = ctx
+        .clocks
+        .get(SINGLE_EXPORTER, Scope::V9Domain(42))
+        .expect("domain clock state");
     assert_eq!(state.last_skew_ns, 11);
     assert_eq!(state.clock_issues, 1);
     assert!(!state.last_was_usable);
@@ -260,11 +264,17 @@ fn clock_state_is_independent_per_domain() {
 
     assert_eq!(ctx.clocks.len(), 2);
     assert_eq!(
-        ctx.clocks.get(42).unwrap().last_receipt_time_ns,
+        ctx.clocks
+            .get(SINGLE_EXPORTER, Scope::V9Domain(42))
+            .unwrap()
+            .last_receipt_time_ns,
         1_700_000_001_000_000_000
     );
     assert_eq!(
-        ctx.clocks.get(43).unwrap().last_receipt_time_ns,
+        ctx.clocks
+            .get(SINGLE_EXPORTER, Scope::V9Domain(43))
+            .unwrap()
+            .last_receipt_time_ns,
         1_700_000_002_000_000_000
     );
 }
