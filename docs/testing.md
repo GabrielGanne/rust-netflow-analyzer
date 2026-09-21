@@ -40,7 +40,7 @@ Additional Criterion arguments can be passed after the command, for example
   malformed/truncated input, limits, metadata, and aging behavior.
 - FFI unit tests cover lifecycle, error mapping, configuration, callbacks, and
   decode-only callbacks.
-- `examples/udp_listener.rs` is a runnable Rust example.
+- `core/examples/udp_listener.rs` is a runnable Rust example.
 - `examples/c_integration/main.c` is a runnable C ABI smoke test.
 - `core/benches/process_packet.rs` provides v5, v9, IPFIX, warm-cache, and
   cold-context throughput cases.

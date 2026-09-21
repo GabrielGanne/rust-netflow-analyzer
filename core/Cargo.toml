@@ -17,11 +17,8 @@ dashmap = "6.0"
 [dev-dependencies]
 criterion = "0.5"
 
-# The reference OS-socket listener lives at the workspace root per the project
-# layout; expose it as a runnable example of the core crate.
-[[example]]
-name = "udp_listener"
-path = "../examples/udp_listener.rs"
+# The reference OS-socket listener in `examples/udp_listener.rs` is auto-discovered
+# by cargo and packaged with the crate; no explicit `[[example]]` target needed.
 
 [[bench]]
 name = "process_packet"
