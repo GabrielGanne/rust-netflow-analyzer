@@ -118,25 +118,22 @@ impl FlowCache {
         }
     }
 
-    /// Folds a freshly decoded record into the persistent flow state.
+    /// Folds a freshly decoded record into the persistent flow state, scoped to
+    /// the exporter/transport session and protocol-tagged observation [`Scope`]
+    /// it belongs to.
     ///
     /// Existing flows accumulate counters and update both exporter and local
     /// observation timestamps.
     /// New flows are admitted only while the cache is below its hard cap; once
     /// full, the record is dropped and counted rather than risking OOM.
-    pub fn upsert(&self, fields: &FlowFields, counters: &InternalCounters) {
-        self.upsert_in_domain(0, fields, counters);
-    }
-
-    /// Like [`Self::upsert`], but scopes an exported `flowId` to the observation
-    /// domain in which the exporter guarantees it is unique.
-    pub fn upsert_in_domain(
+    pub fn upsert(
         &self,
-        observation_domain_id: u32,
+        exporter: ExporterKey,
+        scope: Scope,
         fields: &FlowFields,
         counters: &InternalCounters,
     ) {
-        let key = fields.key_in_domain(observation_domain_id);
+        let key = fields.key(exporter, scope);
         // The `Entry` API holds the shard lock for `key`, so the vacant branch
         // (which reserves a capacity slot) cannot race another writer inserting
         // the same key.
@@ -168,7 +165,12 @@ impl FlowCache {
             }
             Entry::Vacant(vacant) => {
                 if self.reserve_slot() {
-                    vacant.insert(FlowRecord::from_fields(fields, Instant::now()));
+                    vacant.insert(FlowRecord::from_fields(
+                        fields,
+                        exporter,
+                        scope,
+                        Instant::now(),
+                    ));
                 } else {
                     counters.flows_dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -360,6 +362,10 @@ mod tests {
         }
     }
 
+    /// A representative scope for the flow-cache tests that do not exercise
+    /// scope separation directly.
+    const TEST_SCOPE: Scope = Scope::V9Domain(0);
+
     #[test]
     fn template_cache_insert_get_and_scope() {
         let cache = TemplateCache::new(10);
@@ -421,17 +427,20 @@ mod tests {
         first.end_time_ns = 30;
         first.original_start_time_ns = 25;
         first.original_end_time_ns = 35;
-        cache.upsert(&first, &counters);
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &first, &counters);
         let mut second = fields(6);
         second.start_time_ns = 10;
         second.end_time_ns = 40;
         second.original_start_time_ns = 15;
         second.original_end_time_ns = 45;
-        cache.upsert(&second, &counters); // same key
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &second, &counters); // same key
 
         assert_eq!(cache.len(), 1);
         assert_eq!(counters.flows_dropped.load(Ordering::Relaxed), 0);
-        let record = cache.map.get(&first.key()).unwrap();
+        let record = cache
+            .map
+            .get(&first.key(SINGLE_EXPORTER, TEST_SCOPE))
+            .unwrap();
         assert_eq!(record.bytes, 200);
         assert_eq!(record.packets, 2);
         assert_eq!(record.start_time_ns, 10);
@@ -441,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_id_overrides_tuple_and_is_scoped_to_domain() {
+    fn flow_id_overrides_tuple_and_is_scoped_to_scope() {
         let counters = InternalCounters::default();
         let cache = FlowCache::new(10);
         let mut first = fields(6);
@@ -449,20 +458,47 @@ mod tests {
         let mut changed_tuple = fields(17);
         changed_tuple.flow_id = Some(99);
 
-        cache.upsert_in_domain(10, &first, &counters);
-        cache.upsert_in_domain(10, &changed_tuple, &counters);
+        let s10 = Scope::V9Domain(10);
+        cache.upsert(SINGLE_EXPORTER, s10, &first, &counters);
+        cache.upsert(SINGLE_EXPORTER, s10, &changed_tuple, &counters);
         assert_eq!(cache.len(), 1, "flowId takes precedence over the tuple");
 
-        cache.upsert_in_domain(11, &changed_tuple, &counters);
-        assert_eq!(cache.len(), 2, "flowId is unique only within its domain");
+        cache.upsert(
+            SINGLE_EXPORTER,
+            Scope::V9Domain(11),
+            &changed_tuple,
+            &counters,
+        );
+        assert_eq!(cache.len(), 2, "flowId is unique only within its scope");
+    }
+
+    #[test]
+    fn flows_are_scoped_by_exporter_and_protocol() {
+        let counters = InternalCounters::default();
+        let cache = FlowCache::new(10);
+        // Same 5-tuple under different exporters/protocols must not aggregate.
+        cache.upsert(1, Scope::V9Domain(7), &fields(6), &counters);
+        cache.upsert(2, Scope::V9Domain(7), &fields(6), &counters);
+        cache.upsert(1, Scope::IpfixDomain(7), &fields(6), &counters);
+        cache.upsert(
+            1,
+            Scope::V5Engine {
+                engine_type: 0,
+                engine_id: 7,
+            },
+            &fields(6),
+            &counters,
+        );
+        assert_eq!(cache.len(), 4);
+        assert_eq!(counters.flows_dropped.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn flow_cache_respects_cap() {
         let counters = InternalCounters::default();
         let cache = FlowCache::new(1);
-        cache.upsert(&fields(6), &counters); // admitted
-        cache.upsert(&fields(17), &counters); // distinct key -> dropped
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters); // admitted
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(17), &counters); // distinct key -> dropped
 
         assert_eq!(cache.len(), 1);
         assert_eq!(counters.flows_dropped.load(Ordering::Relaxed), 1);
@@ -472,7 +508,7 @@ mod tests {
     fn sweep_evicts_idle_flows() {
         let counters = InternalCounters::default();
         let cache = FlowCache::new(10);
-        cache.upsert(&fields(6), &counters);
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
 
         let cfg = AgingConfig {
             idle_timeout: Duration::ZERO, // everything is "idle"
@@ -493,7 +529,7 @@ mod tests {
     fn sweep_rolls_over_active_flows() {
         let counters = InternalCounters::default();
         let cache = FlowCache::new(10);
-        cache.upsert(&fields(6), &counters);
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
 
         let cfg = AgingConfig {
             idle_timeout: Duration::from_secs(3600), // never idle
@@ -515,7 +551,7 @@ mod tests {
     fn sweep_keeps_fresh_flows() {
         let counters = InternalCounters::default();
         let cache = FlowCache::new(10);
-        cache.upsert(&fields(6), &counters);
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
 
         let cfg = AgingConfig {
             idle_timeout: Duration::from_secs(3600),
@@ -530,8 +566,8 @@ mod tests {
     fn flush_all_drains_cache() {
         let counters = InternalCounters::default();
         let cache = FlowCache::new(10);
-        cache.upsert(&fields(6), &counters);
-        cache.upsert(&fields(17), &counters);
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(17), &counters);
 
         let emitted = AtomicUsize::new(0);
         cache.flush_all(&counters, &|_r| {
@@ -554,7 +590,7 @@ mod tests {
     fn aging_handle_runs_and_stops() {
         let counters = Arc::new(InternalCounters::default());
         let flows = Arc::new(FlowCache::new(10));
-        flows.upsert(&fields(6), &counters);
+        flows.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
 
         let cfg = AgingConfig {
             idle_timeout: Duration::ZERO,

@@ -14,6 +14,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#define NETFLOW_ANALYZER_SCOPE_V9 0
+
+#define NETFLOW_ANALYZER_SCOPE_IPFIX 1
+
+#define NETFLOW_ANALYZER_SCOPE_V5 2
+
 #define NETFLOW_ANALYZER_PRESENT_FLOW_ID (1 << 0)
 
 #define NETFLOW_ANALYZER_PRESENT_IFACE_IN (1 << 1)
@@ -82,6 +88,23 @@ typedef struct {
      * IP version marker: 4, 6, or 0 when unknown.
      */
     uint8_t ip_version;
+    /**
+     * Protocol discriminator for the scope fields (`NETFLOW_ANALYZER_SCOPE_*`):
+     * `0` v9, `1` IPFIX, `2` v5.
+     */
+    uint8_t scope_protocol;
+    /**
+     * NetFlow v5 switching-engine type; `0` for v9/IPFIX.
+     */
+    uint8_t scope_engine_type;
+    /**
+     * NetFlow v5 switching-engine id; `0` for v9/IPFIX.
+     */
+    uint8_t scope_engine_id;
+    /**
+     * Observation domain (v9 `source_id` / IPFIX domain); `0` for v5.
+     */
+    uint32_t observation_domain;
     uint64_t bytes;
     uint64_t packets;
     /**
@@ -96,6 +119,10 @@ typedef struct {
      * Exporter-assigned flow identity; `0` when absent (see `present`).
      */
     uint64_t flow_id;
+    /**
+     * Caller-supplied exporter/transport-session key this flow belongs to.
+     */
+    uint64_t exporter_key;
     /**
      * Effective flow start time as Unix epoch nanoseconds.
      */

@@ -22,11 +22,20 @@ use parser::{
     SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
 };
 use records::{FlowFields, FlowRecord, RecordTimeContext};
-use scope::{Scope, SINGLE_EXPORTER};
+use scope::{ExporterKey, Scope, SINGLE_EXPORTER};
 use stats::{InternalCounters, NetflowAnalyzerStats};
 
 /// Error returned when clock validation rejects an otherwise parseable packet.
 pub const CLOCK_SKEW_ERROR: &str = "Packet dropped because exporter clock skew exceeds limit";
+
+/// Current wall-clock time as Unix nanoseconds, saturating at `u64::MAX`.
+fn now_unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
 
 /// Top-level engine configuration combining cache caps and aging timings.
 #[derive(Debug, Clone, Copy)]
@@ -88,12 +97,7 @@ impl FlowContext {
     /// The input is borrowed and never copied: parsing operates directly on the
     /// caller's buffer.
     pub fn process_packet(&self, raw_bytes: &[u8]) -> Result<usize, &'static str> {
-        let receipt_time_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
-        self.process_packet_at(raw_bytes, receipt_time_ns)
+        self.process_packet_at(raw_bytes, now_unix_ns())
     }
 
     /// Like [`Self::process_packet`], with an explicit Unix-nanosecond receipt
@@ -107,9 +111,14 @@ impl FlowContext {
         raw_bytes: &[u8],
         receipt_time_ns: u64,
     ) -> Result<usize, &'static str> {
-        self.decode_packet_at(raw_bytes, receipt_time_ns, &mut |domain, fields| {
-            self.flows.upsert_in_domain(domain, fields, &self.counters);
-        })
+        self.decode_at(
+            SINGLE_EXPORTER,
+            raw_bytes,
+            receipt_time_ns,
+            &mut |exporter, scope, fields| {
+                self.flows.upsert(exporter, scope, fields, &self.counters);
+            },
+        )
     }
 
     /// Decode-only counterpart of [`Self::process_packet`]: parses a datagram and
@@ -119,16 +128,17 @@ impl FlowContext {
     ///
     /// The receipt timestamp defaults to the current wall clock. Use
     /// [`Self::decode_packet_at`] to supply a capture timestamp explicitly.
+    ///
+    /// This is a **lossy legacy sink**: it reports only the observation domain
+    /// (`0` for NetFlow v5) and cannot distinguish protocol-tagged scopes or
+    /// exporters. Use [`Self::decode_packet_scoped`] to receive the full
+    /// `(ExporterKey, Scope)` identity.
     pub fn decode_packet(
         &self,
         raw_bytes: &[u8],
         sink: &mut dyn FnMut(u32, &FlowFields),
     ) -> Result<usize, &'static str> {
-        let receipt_time_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
+        let receipt_time_ns = now_unix_ns();
         self.decode_packet_at(raw_bytes, receipt_time_ns, sink)
     }
 
@@ -138,11 +148,56 @@ impl FlowContext {
     /// &FlowFields)`. NetFlow v5 records report domain `0`. Options data records
     /// are counted but not emitted, mirroring the fused path. The flow cache is
     /// never consulted or mutated, so this can drive an external aggregator.
+    ///
+    /// See [`Self::decode_packet`] for the lossy-domain caveat.
     pub fn decode_packet_at(
         &self,
         raw_bytes: &[u8],
         receipt_time_ns: u64,
         sink: &mut dyn FnMut(u32, &FlowFields),
+    ) -> Result<usize, &'static str> {
+        self.decode_at(
+            SINGLE_EXPORTER,
+            raw_bytes,
+            receipt_time_ns,
+            &mut |_exporter, scope, fields| sink(scope.observation_domain(), fields),
+        )
+    }
+
+    /// Scope-aware decode-only entry point: like [`Self::decode_packet`], but
+    /// each record is delivered as `(exporter_key, scope, &FlowFields)` so a
+    /// consumer can attribute it to its exporter, protocol, and domain. The
+    /// exporter key is the reserved single-exporter value until the key-aware
+    /// entry points land.
+    pub fn decode_packet_scoped(
+        &self,
+        raw_bytes: &[u8],
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
+    ) -> Result<usize, &'static str> {
+        let receipt_time_ns = now_unix_ns();
+        self.decode_packet_scoped_at(raw_bytes, receipt_time_ns, sink)
+    }
+
+    /// Scope-aware decode-only entry point with an explicit receipt timestamp.
+    /// See [`Self::decode_packet_scoped`].
+    pub fn decode_packet_scoped_at(
+        &self,
+        raw_bytes: &[u8],
+        receipt_time_ns: u64,
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
+    ) -> Result<usize, &'static str> {
+        self.decode_at(SINGLE_EXPORTER, raw_bytes, receipt_time_ns, sink)
+    }
+
+    /// Core decode routine shared by every entry point. Decodes the datagram
+    /// under `exporter` and the packet's protocol-tagged [`Scope`], updating
+    /// template and clock state and delivering each data record to `sink`.
+    fn decode_at(
+        &self,
+        exporter: ExporterKey,
+        raw_bytes: &[u8],
+        receipt_time_ns: u64,
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
     ) -> Result<usize, &'static str> {
         let (mut payload, header) = match parser::parse_packet_header(raw_bytes) {
             Ok(parsed) => parsed,
@@ -156,12 +211,8 @@ impl FlowContext {
 
         self.counters.pkts_parsed.fetch_add(1, Ordering::Relaxed);
 
-        let domain = header.domain_id();
-        // Per-exporter, protocol-tagged scope used to key template and clock
-        // state (see docs/exporter-identity.md). The public entry points do not
-        // yet accept a caller-supplied key, so it is the reserved single-exporter
-        // value for now; the `domain` above still drives the flow-cache sink.
-        let exporter = SINGLE_EXPORTER;
+        // Per-exporter, protocol-tagged scope used to key template, clock, and
+        // flow state and to stamp emitted records (see docs/exporter-identity.md).
         let scope = header.scope();
         let original_export_time_ns = header.export_time_ns();
         let effective_export_time_ns = match self.clocks.observe(
@@ -198,7 +249,14 @@ impl FlowContext {
         // NetFlow v5 is template-less: the payload is simply `count` fixed-size
         // records, so it takes a dedicated decode path instead of a set walk.
         if let ParsedHeader::V5(ref h) = header {
-            return Ok(self.process_v5_records(payload, h.count as usize, time_context, sink));
+            return Ok(self.process_v5_records(
+                exporter,
+                scope,
+                payload,
+                h.count as usize,
+                time_context,
+                sink,
+            ));
         }
 
         let mut data_records = 0usize;
@@ -246,15 +304,8 @@ impl FlowContext {
                     }
                 }
                 id if id >= FIRST_DATA_SET_ID => {
-                    data_records += self.process_data_set(
-                        exporter,
-                        scope,
-                        domain,
-                        id,
-                        body,
-                        time_context,
-                        sink,
-                    );
+                    data_records +=
+                        self.process_data_set(exporter, scope, id, body, time_context, sink);
                 }
                 // Reserved/unknown set ids (e.g. 4..=255) are ignored.
                 _ => {}
@@ -287,10 +338,12 @@ impl FlowContext {
     /// Decodes up to `count` fixed-format NetFlow v5 records from the payload.
     fn process_v5_records(
         &self,
+        exporter: ExporterKey,
+        scope: Scope,
         payload: &[u8],
         count: usize,
         time_context: RecordTimeContext,
-        sink: &mut dyn FnMut(u32, &FlowFields),
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
     ) -> usize {
         let mut decoded = 0usize;
         // Trust the header count but never read past the buffer.
@@ -300,8 +353,7 @@ impl FlowContext {
             .take(count.min(available))
         {
             if let Some(fields) = FlowFields::from_v5_record_at(record, Some(time_context)) {
-                // NetFlow v5 is template-less and has no observation domain.
-                sink(0, &fields);
+                sink(exporter, scope, &fields);
                 decoded += 1;
             }
         }
@@ -313,18 +365,15 @@ impl FlowContext {
 
     /// Decodes every data record in a data FlowSet body against its template.
     ///
-    /// `(exporter, scope)` keys the template lookup; `domain` is the observation
-    /// domain reported to the flow-cache `sink`.
-    #[allow(clippy::too_many_arguments)]
+    /// `(exporter, scope)` keys the template lookup and is forwarded to `sink`.
     fn process_data_set(
         &self,
-        exporter: scope::ExporterKey,
+        exporter: ExporterKey,
         scope: Scope,
-        domain: u32,
         template_id: u16,
         body: &[u8],
         time_context: RecordTimeContext,
-        sink: &mut dyn FnMut(u32, &FlowFields),
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
     ) -> usize {
         // Without the template we cannot interpret the records yet; the exporter
         // will resend it periodically, so we simply skip until then.
@@ -344,7 +393,7 @@ impl FlowContext {
                     .options_records_processed
                     .fetch_add(1, Ordering::Relaxed);
             } else {
-                sink(domain, fields);
+                sink(exporter, scope, fields);
                 count += 1;
             }
         };

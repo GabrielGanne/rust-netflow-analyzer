@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::parser::{TemplateField, TemplateRecord};
+use crate::scope::SINGLE_EXPORTER;
 
 fn field(type_id: u16, length: u16) -> TemplateField {
     TemplateField {
@@ -95,7 +96,10 @@ fn from_record_decodes_full_tuple() {
     assert_eq!(fields.src_port, 12345);
     assert_eq!(fields.dst_port, 443);
     assert_eq!(fields.proto, 6);
-    assert!(matches!(fields.key(), FlowKey::FiveTuple { proto: 6, .. }));
+    assert!(matches!(
+        fields.key(SINGLE_EXPORTER, Scope::V9Domain(0)).identity,
+        FlowIdentity::FiveTuple { proto: 6, .. }
+    ));
 }
 
 #[test]
@@ -115,10 +119,11 @@ fn from_record_prefers_flow_id_for_identity() {
     let fields = FlowFields::from_record(&tmpl, &rec).unwrap();
     assert_eq!(fields.flow_id, Some(0x0102_0304_0506_0708));
     assert_eq!(
-        fields.key_in_domain(42),
-        FlowKey::FlowId {
-            observation_domain_id: 42,
-            flow_id: 0x0102_0304_0506_0708,
+        fields.key(SINGLE_EXPORTER, Scope::V9Domain(42)),
+        FlowKey {
+            exporter: SINGLE_EXPORTER,
+            scope: Scope::V9Domain(42),
+            identity: FlowIdentity::FlowId(0x0102_0304_0506_0708),
         }
     );
 }
@@ -129,7 +134,10 @@ fn zero_flow_id_is_present_and_used_as_identity() {
     let fields = FlowFields::from_record(&tmpl, &[0; 8]).unwrap();
 
     assert_eq!(fields.flow_id, Some(0));
-    assert!(matches!(fields.key(), FlowKey::FlowId { flow_id: 0, .. }));
+    assert!(matches!(
+        fields.key(SINGLE_EXPORTER, Scope::V9Domain(0)).identity,
+        FlowIdentity::FlowId(0)
+    ));
 }
 
 #[test]
@@ -278,10 +286,18 @@ fn flow_record_round_trips_to_ffi() {
         ip_version: 4,
         present: presence::FLOW_ID | presence::IFACE_IN | presence::DSCP,
     };
-    let record = FlowRecord::from_fields(&fields, Instant::now());
+    let record = FlowRecord::from_fields(
+        &fields,
+        SINGLE_EXPORTER,
+        Scope::IpfixDomain(9),
+        Instant::now(),
+    );
     assert_eq!(record.fields, fields);
     assert_eq!(record.flow_id, Some(42));
     let ffi = record.to_ffi();
+    assert_eq!(ffi.exporter_key, SINGLE_EXPORTER);
+    assert_eq!(ffi.scope_protocol, crate::scope::SCOPE_PROTOCOL_IPFIX);
+    assert_eq!(ffi.observation_domain, 9);
     assert_eq!(ffi.src_ip, [1u8; 16]);
     assert_eq!(ffi.dst_ip, [2u8; 16]);
     assert_eq!(ffi.proto, 17);

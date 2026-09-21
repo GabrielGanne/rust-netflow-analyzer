@@ -6,6 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::Instant;
 
 use crate::parser::{TemplateRecord, V5_RECORD_LEN, VARIABLE_LENGTH};
+use crate::scope::{ExporterKey, Scope};
 
 // --- IANA Information Element identifiers we normalize into the FlowRecord ---
 // Reference: https://www.iana.org/assignments/ipfix/ipfix.xhtml
@@ -73,16 +74,14 @@ impl RecordTimeContext {
     }
 }
 
-/// Identity used to key the flow state cache.
+/// The within-scope identity of a flow.
 ///
-/// An exported IPFIX `flowId` takes precedence over the 5-tuple. Flow IDs are
-/// scoped to their observation domain, as required by the IPFIX registry.
+/// An exported IPFIX `flowId` takes precedence over the 5-tuple. Both are only
+/// unique within a single `(exporter, scope)`, which is why [`FlowKey`] carries
+/// that context alongside the identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FlowKey {
-    FlowId {
-        observation_domain_id: u32,
-        flow_id: u64,
-    },
+pub enum FlowIdentity {
+    FlowId(u64),
     FiveTuple {
         src_ip: [u8; 16],
         dst_ip: [u8; 16],
@@ -90,6 +89,19 @@ pub enum FlowKey {
         dst_port: u16,
         proto: u8,
     },
+}
+
+/// Identity used to key the flow state cache.
+///
+/// Flows are scoped by the exporter/transport session and the protocol-tagged
+/// observation [`Scope`], so unrelated exporters, protocol versions, or domains
+/// that happen to share a `flowId` or 5-tuple are never aggregated together.
+/// See `docs/exporter-identity.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowKey {
+    pub exporter: ExporterKey,
+    pub scope: Scope,
+    pub identity: FlowIdentity,
 }
 
 /// Presence bits for the optional metadata carried by [`FlowFields`].
@@ -162,27 +174,24 @@ pub struct FlowFields {
 }
 
 impl FlowFields {
-    /// Builds a cache key for callers without an observation domain (notably
-    /// NetFlow v5). Prefer [`Self::key_in_domain`] for v9/IPFIX records.
-    pub fn key(&self) -> FlowKey {
-        self.key_in_domain(0)
-    }
-
-    /// Builds the flow identity, preferring `flowId` when the exporter supplied
-    /// it and falling back to the traditional 5-tuple otherwise.
-    pub fn key_in_domain(&self, observation_domain_id: u32) -> FlowKey {
-        match self.flow_id {
-            Some(flow_id) => FlowKey::FlowId {
-                observation_domain_id,
-                flow_id,
-            },
-            None => FlowKey::FiveTuple {
+    /// Builds the flow cache key for this record within `(exporter, scope)`,
+    /// preferring the exported `flowId` when present and falling back to the
+    /// traditional 5-tuple otherwise.
+    pub fn key(&self, exporter: ExporterKey, scope: Scope) -> FlowKey {
+        let identity = match self.flow_id {
+            Some(flow_id) => FlowIdentity::FlowId(flow_id),
+            None => FlowIdentity::FiveTuple {
                 src_ip: self.src_ip,
                 dst_ip: self.dst_ip,
                 src_port: self.src_port,
                 dst_port: self.dst_port,
                 proto: self.proto,
             },
+        };
+        FlowKey {
+            exporter,
+            scope,
+            identity,
         }
     }
 
@@ -439,14 +448,25 @@ impl FlowFields {
 pub struct FlowRecord {
     /// The normalized flow data accumulated by the cache.
     pub fields: FlowFields,
+    /// Exporter/transport session this flow belongs to (see the identity model).
+    pub exporter: ExporterKey,
+    /// Protocol-tagged observation scope this flow belongs to.
+    pub scope: Scope,
     pub(crate) first_observed: Instant,
     pub(crate) last_observed: Instant,
 }
 
 impl FlowRecord {
-    pub fn from_fields(fields: &FlowFields, now: Instant) -> Self {
+    pub fn from_fields(
+        fields: &FlowFields,
+        exporter: ExporterKey,
+        scope: Scope,
+        now: Instant,
+    ) -> Self {
         Self {
             fields: *fields,
+            exporter,
+            scope,
             first_observed: now,
             last_observed: now,
         }
@@ -469,8 +489,14 @@ impl DerefMut for FlowRecord {
     }
 }
 
-// A C-compatible representation to safely pass over the FFI boundary
+// A C-compatible representation to safely pass over the FFI boundary.
+//
+// `#[non_exhaustive]` is a deliberate ABI decision: consumers must not assume
+// this layout is frozen and must not exhaustively construct or match it, so
+// future additions (coordinated with an ABI version/size mechanism) do not break
+// callers. See `docs/exporter-identity.md`.
 #[repr(C)]
+#[non_exhaustive]
 pub struct NetflowAnalyzerFlowRecord {
     pub src_ip: [u8; 16],
     pub dst_ip: [u8; 16],
@@ -486,6 +512,15 @@ pub struct NetflowAnalyzerFlowRecord {
     pub icmp_code: u8,
     /// IP version marker: 4, 6, or 0 when unknown.
     pub ip_version: u8,
+    /// Protocol discriminator for the scope fields (`NETFLOW_ANALYZER_SCOPE_*`):
+    /// `0` v9, `1` IPFIX, `2` v5.
+    pub scope_protocol: u8,
+    /// NetFlow v5 switching-engine type; `0` for v9/IPFIX.
+    pub scope_engine_type: u8,
+    /// NetFlow v5 switching-engine id; `0` for v9/IPFIX.
+    pub scope_engine_id: u8,
+    /// Observation domain (v9 `source_id` / IPFIX domain); `0` for v5.
+    pub observation_domain: u32,
     pub bytes: u64,
     pub packets: u64,
     /// Ingress interface index (`ingressInterface`; v5 `input`).
@@ -494,6 +529,8 @@ pub struct NetflowAnalyzerFlowRecord {
     pub iface_out: u64,
     /// Exporter-assigned flow identity; `0` when absent (see `present`).
     pub flow_id: u64,
+    /// Caller-supplied exporter/transport-session key this flow belongs to.
+    pub exporter_key: u64,
     /// Effective flow start time as Unix epoch nanoseconds.
     pub start_time_ns: u64,
     /// Effective flow end time as Unix epoch nanoseconds.
@@ -510,8 +547,10 @@ pub struct NetflowAnalyzerFlowRecord {
 }
 
 impl FlowFields {
-    /// Projects the normalized flow values into the C-compatible record shape.
-    pub fn to_ffi(&self) -> NetflowAnalyzerFlowRecord {
+    /// Projects the normalized flow values into the C-compatible record shape,
+    /// stamping the emitted record with its `(exporter, scope)` identity.
+    pub fn to_ffi(&self, exporter: ExporterKey, scope: Scope) -> NetflowAnalyzerFlowRecord {
+        let (engine_type, engine_id) = scope.engine();
         NetflowAnalyzerFlowRecord {
             src_ip: self.src_ip,
             dst_ip: self.dst_ip,
@@ -526,11 +565,16 @@ impl FlowFields {
             icmp_type: self.icmp_type,
             icmp_code: self.icmp_code,
             ip_version: self.ip_version,
+            scope_protocol: scope.protocol_tag(),
+            scope_engine_type: engine_type,
+            scope_engine_id: engine_id,
+            observation_domain: scope.observation_domain(),
             bytes: self.bytes,
             packets: self.packets,
             iface_in: self.iface_in,
             iface_out: self.iface_out,
             flow_id: self.flow_id.unwrap_or(0),
+            exporter_key: exporter,
             start_time_ns: self.start_time_ns,
             end_time_ns: self.end_time_ns,
             original_start_time_ns: self.original_start_time_ns,
@@ -542,7 +586,7 @@ impl FlowFields {
 
 impl FlowRecord {
     pub fn to_ffi(&self) -> NetflowAnalyzerFlowRecord {
-        self.fields.to_ffi()
+        self.fields.to_ffi(self.exporter, self.scope)
     }
 }
 

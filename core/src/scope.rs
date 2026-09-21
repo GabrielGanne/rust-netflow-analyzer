@@ -40,3 +40,40 @@ pub enum Scope {
     /// NetFlow v5 switching engine, which has no observation domain.
     V5Engine { engine_type: u8, engine_id: u8 },
 }
+
+/// Protocol discriminator for a [`Scope`], as surfaced on emitted records so a
+/// consumer can tell the flattened scope fields apart. Mirrored on the FFI side.
+pub const SCOPE_PROTOCOL_V9: u8 = 0;
+pub const SCOPE_PROTOCOL_IPFIX: u8 = 1;
+pub const SCOPE_PROTOCOL_V5: u8 = 2;
+
+impl Scope {
+    /// Observation domain reported to the legacy domain-only decode sink: the
+    /// v9/IPFIX domain, or `0` for NetFlow v5 (which has no observation domain).
+    pub fn observation_domain(&self) -> u32 {
+        match self {
+            Scope::V9Domain(d) | Scope::IpfixDomain(d) => *d,
+            Scope::V5Engine { .. } => 0,
+        }
+    }
+
+    /// Protocol discriminator (`SCOPE_PROTOCOL_*`) for the flattened emitted form.
+    pub fn protocol_tag(&self) -> u8 {
+        match self {
+            Scope::V9Domain(_) => SCOPE_PROTOCOL_V9,
+            Scope::IpfixDomain(_) => SCOPE_PROTOCOL_IPFIX,
+            Scope::V5Engine { .. } => SCOPE_PROTOCOL_V5,
+        }
+    }
+
+    /// NetFlow v5 `(engine_type, engine_id)`; `(0, 0)` for v9/IPFIX.
+    pub fn engine(&self) -> (u8, u8) {
+        match self {
+            Scope::V5Engine {
+                engine_type,
+                engine_id,
+            } => (*engine_type, *engine_id),
+            _ => (0, 0),
+        }
+    }
+}

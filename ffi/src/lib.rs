@@ -9,8 +9,17 @@ use std::time::Duration;
 use netflow_analyzer_core::cache::AgingConfig;
 use netflow_analyzer_core::clock::ClockConfig;
 use netflow_analyzer_core::records::{FlowFields, FlowRecord, NetflowAnalyzerFlowRecord};
+use netflow_analyzer_core::scope::{ExporterKey, Scope};
 use netflow_analyzer_core::stats::NetflowAnalyzerStats;
 use netflow_analyzer_core::{EngineConfig, FlowContext, CLOCK_SKEW_ERROR};
+
+// Protocol discriminator values for `NetflowAnalyzerFlowRecord::scope_protocol`.
+// These are literals (rather than re-exports of the core `scope` constants)
+// because cbindgen cannot evaluate cross-crate constant paths;
+// `scope_protocol_tags_match_core` keeps them in sync.
+pub const NETFLOW_ANALYZER_SCOPE_V9: u8 = 0;
+pub const NETFLOW_ANALYZER_SCOPE_IPFIX: u8 = 1;
+pub const NETFLOW_ANALYZER_SCOPE_V5: u8 = 2;
 
 /// C-compatible callback invoked whenever a flow is emitted (idle eviction,
 /// active-timeout rollover, or explicit flush). The `record` pointer is only
@@ -255,15 +264,15 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet(
         return -1;
     }
     let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    let mut sink = |domain: u32, fields: &FlowFields| {
-        let record = fields.to_ffi();
+    let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
+        let record = fields.to_ffi(exporter, scope);
         callback(
-            domain,
+            scope.observation_domain(),
             &record as *const NetflowAnalyzerFlowRecord,
             user_data,
         );
     };
-    match (*ctx).internal.decode_packet(data, &mut sink) {
+    match (*ctx).internal.decode_packet_scoped(data, &mut sink) {
         Ok(records) => records as i32,
         Err(CLOCK_SKEW_ERROR) => -3,
         Err(_) => -2,
@@ -288,17 +297,17 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_at(
         return -1;
     }
     let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    let mut sink = |domain: u32, fields: &FlowFields| {
-        let record = fields.to_ffi();
+    let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
+        let record = fields.to_ffi(exporter, scope);
         callback(
-            domain,
+            scope.observation_domain(),
             &record as *const NetflowAnalyzerFlowRecord,
             user_data,
         );
     };
     match (*ctx)
         .internal
-        .decode_packet_at(data, receipt_time_ns, &mut sink)
+        .decode_packet_scoped_at(data, receipt_time_ns, &mut sink)
     {
         Ok(records) => records as i32,
         Err(CLOCK_SKEW_ERROR) => -3,
@@ -505,6 +514,14 @@ mod tests {
         assert_eq!(NETFLOW_ANALYZER_PRESENT_DSCP, presence::DSCP);
         assert_eq!(NETFLOW_ANALYZER_PRESENT_VLAN_TAG, presence::VLAN_TAG);
         assert_eq!(NETFLOW_ANALYZER_PRESENT_IP_VERSION, presence::IP_VERSION);
+    }
+
+    #[test]
+    fn scope_protocol_tags_match_core() {
+        use netflow_analyzer_core::scope;
+        assert_eq!(NETFLOW_ANALYZER_SCOPE_V9, scope::SCOPE_PROTOCOL_V9);
+        assert_eq!(NETFLOW_ANALYZER_SCOPE_IPFIX, scope::SCOPE_PROTOCOL_IPFIX);
+        assert_eq!(NETFLOW_ANALYZER_SCOPE_V5, scope::SCOPE_PROTOCOL_V5);
     }
 
     #[test]
