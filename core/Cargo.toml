@@ -2,6 +2,13 @@
 name = "netflow_analyzer_core"
 version = "0.1.0"
 edition = "2021"
+description = "Zero-copy NetFlow v5/v9 and IPFIX decoding and flow-aggregation engine."
+readme = "README.md"
+keywords = ["netflow", "ipfix", "network", "monitoring", "flow"]
+categories = ["network-programming", "parser-implementations"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 nom = "7.1"

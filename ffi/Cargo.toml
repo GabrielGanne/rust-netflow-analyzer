@@ -2,6 +2,13 @@
 name = "netflow_analyzer_ffi"
 version = "0.1.0"
 edition = "2021"
+description = "C ABI (FFI) bindings for the netflow_analyzer_core NetFlow/IPFIX engine."
+readme = "README.md"
+keywords = ["netflow", "ipfix", "ffi", "c-bindings", "network"]
+categories = ["network-programming", "external-ffi-bindings"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib", "staticlib"]

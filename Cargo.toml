@@ -4,3 +4,11 @@ members = [
     "ffi"
 ]
 resolver = "2"
+
+# Metadata shared by every published crate in the workspace. Individual crates
+# opt in with `field.workspace = true` and add their own description, readme,
+# keywords, and categories.
+[workspace.package]
+license = "MPL-2.0"
+repository = "https://github.com/GabrielGanne/rust-netflow-analyzer"
+rust-version = "1.82"
