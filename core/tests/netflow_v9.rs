@@ -122,7 +122,12 @@ fn malformed_options_template_is_handled_gracefully() {
     let processed = ctx.process_packet(&b.buf).expect("parse ok");
     assert_eq!(processed, 0);
     assert_eq!(ctx.stats().templates_received, 0);
-    assert_eq!(ctx.counters.options_templates_received.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        ctx.counters
+            .options_templates_received
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[test]
@@ -162,9 +167,23 @@ fn options_template_and_data_are_decoded_but_not_flows() {
     // Options records are not flows: nothing is returned or cached as a flow.
     assert_eq!(processed, 0);
     assert_eq!(ctx.flows.len(), 0);
-    assert_eq!(ctx.stats().templates_received, 0, "options are not regular templates");
-    assert_eq!(ctx.counters.options_templates_received.load(Ordering::Relaxed), 1);
-    assert_eq!(ctx.counters.options_records_processed.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        ctx.stats().templates_received,
+        0,
+        "options are not regular templates"
+    );
+    assert_eq!(
+        ctx.counters
+            .options_templates_received
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        ctx.counters
+            .options_records_processed
+            .load(Ordering::Relaxed),
+        1
+    );
 }
 
 #[test]
@@ -261,8 +280,10 @@ fn metadata_v9_packet(include_dscp: bool) -> Vec<u8> {
         .put(6, 1) // proto
         .put(3, 4) // ingress
         .put(4, 4); // egress
-    b.buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // src mac
-    b.buf.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // dst mac
+    b.buf
+        .extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // src mac
+    b.buf
+        .extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // dst mac
     b.put(0x0018, 2) // tcp flags PSH+ACK
         .put(100, 2); // vlan
     if include_dscp {

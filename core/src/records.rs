@@ -287,7 +287,7 @@ impl FlowFields {
         fields.tcp_flags = record[37] as u16; // tcp_flags
         fields.proto = record[38]; // prot
         fields.dscp = record[39] >> 2; // tos byte -> DSCP
-        // Every v5 record structurally carries these fields, so mark them present.
+                                       // Every v5 record structurally carries these fields, so mark them present.
         fields.ip_version = 4;
         fields.present |= presence::IFACE_IN
             | presence::IFACE_OUT

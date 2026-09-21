@@ -117,7 +117,9 @@ fn decode_counts_options_records_but_never_emits_them() {
     assert_eq!(processed, 0, "options records are not flows");
     assert_eq!(emitted, 0, "sink is never called for options data");
     assert_eq!(
-        ctx.counters.options_records_processed.load(Ordering::Relaxed),
+        ctx.counters
+            .options_records_processed
+            .load(Ordering::Relaxed),
         1
     );
     assert_eq!(ctx.flows.len(), 0);

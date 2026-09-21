@@ -257,7 +257,11 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet(
     let data = std::slice::from_raw_parts(packet_bytes, length as usize);
     let mut sink = |domain: u32, fields: &FlowFields| {
         let record = fields.to_ffi();
-        callback(domain, &record as *const NetflowAnalyzerFlowRecord, user_data);
+        callback(
+            domain,
+            &record as *const NetflowAnalyzerFlowRecord,
+            user_data,
+        );
     };
     match (*ctx).internal.decode_packet(data, &mut sink) {
         Ok(records) => records as i32,
@@ -286,9 +290,16 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_at(
     let data = std::slice::from_raw_parts(packet_bytes, length as usize);
     let mut sink = |domain: u32, fields: &FlowFields| {
         let record = fields.to_ffi();
-        callback(domain, &record as *const NetflowAnalyzerFlowRecord, user_data);
+        callback(
+            domain,
+            &record as *const NetflowAnalyzerFlowRecord,
+            user_data,
+        );
     };
-    match (*ctx).internal.decode_packet_at(data, receipt_time_ns, &mut sink) {
+    match (*ctx)
+        .internal
+        .decode_packet_at(data, receipt_time_ns, &mut sink)
+    {
         Ok(records) => records as i32,
         Err(CLOCK_SKEW_ERROR) => -3,
         Err(_) => -2,
@@ -473,7 +484,9 @@ mod tests {
         unsafe {
             let state = &*(user_data as *const TestState);
             state.count.fetch_add(1, Ordering::Relaxed);
-            state.last_proto.store(observation_domain_id, Ordering::Relaxed);
+            state
+                .last_proto
+                .store(observation_domain_id, Ordering::Relaxed);
             assert!(!record.is_null());
         }
     }
@@ -505,13 +518,7 @@ mod tests {
 
         let packet = v9_packet();
         let n = unsafe {
-            netflow_analyzer_decode_packet(
-                ctx,
-                packet.as_ptr(),
-                packet.len() as u32,
-                record_cb,
-                ud,
-            )
+            netflow_analyzer_decode_packet(ctx, packet.as_ptr(), packet.len() as u32, record_cb, ud)
         };
         assert_eq!(n, 1, "one data record decoded");
         // The decode-only callback fired once, carrying the observation domain (42).
@@ -525,7 +532,13 @@ mod tests {
 
         // Null-argument guards.
         let rc = unsafe {
-            netflow_analyzer_decode_packet(ptr::null(), packet.as_ptr(), packet.len() as u32, record_cb, ud)
+            netflow_analyzer_decode_packet(
+                ptr::null(),
+                packet.as_ptr(),
+                packet.len() as u32,
+                record_cb,
+                ud,
+            )
         };
         assert_eq!(rc, -1);
 

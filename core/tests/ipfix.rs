@@ -69,7 +69,21 @@ fn options_template_and_data_are_decoded_but_not_flows() {
 
     assert_eq!(processed, 0);
     assert_eq!(ctx.flows.len(), 0);
-    assert_eq!(ctx.stats().templates_received, 0, "options are not regular templates");
-    assert_eq!(ctx.counters.options_templates_received.load(Ordering::Relaxed), 1);
-    assert_eq!(ctx.counters.options_records_processed.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        ctx.stats().templates_received,
+        0,
+        "options are not regular templates"
+    );
+    assert_eq!(
+        ctx.counters
+            .options_templates_received
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        ctx.counters
+            .options_records_processed
+            .load(Ordering::Relaxed),
+        1
+    );
 }
