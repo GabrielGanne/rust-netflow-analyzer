@@ -1,7 +1,7 @@
 # Builds the C test-bench against the Rust static library.
 
 ROOT    := ../..
-INCLUDE := $(ROOT)/include
+INCLUDE := $(ROOT)/ffi/include
 LIBDIR  := $(ROOT)/target/release
 STATIC  := $(LIBDIR)/libnetflow_analyzer_ffi.a
 

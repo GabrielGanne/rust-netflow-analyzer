@@ -1,7 +1,7 @@
 # cbindgen configuration for the netflow_analyzer_ffi crate.
 # Generate with:  make header   (or)   cbindgen --config ffi/cbndgen.toml \
 #                                         --crate netflow_analyzer_ffi \
-#                                         --output include/netflow-analyzer.h
+#                                         --output ffi/include/netflow-analyzer.h
 
 language = "C"
 header = """

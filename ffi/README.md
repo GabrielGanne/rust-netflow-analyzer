@@ -6,7 +6,7 @@ engine.
 This crate builds a `cdylib` and `staticlib` exposing a C-callable surface for
 creating an engine, processing datagrams, registering flow/record callbacks, and
 reading a telemetry snapshot. The generated C header is
-[`include/netflow-analyzer.h`](../include/netflow-analyzer.h); regenerate it with
+[`include/netflow-analyzer.h`](include/netflow-analyzer.h); regenerate it with
 `make header` (cbindgen).
 
 ## Quick start

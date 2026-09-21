@@ -1,7 +1,7 @@
 # Automation for the NetFlow/IPFIX analyzer workspace.
 
 CARGO  ?= cargo
-HEADER := include/netflow-analyzer.h
+HEADER := ffi/include/netflow-analyzer.h
 
 .PHONY: all build release test check header c-example bench clean
 
