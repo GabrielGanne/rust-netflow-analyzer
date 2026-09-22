@@ -206,6 +206,31 @@ impl FlowCache {
             .is_ok()
     }
 
+    /// Removes `key` and releases its reserved capacity slot when
+    /// `should_remove` returns true, returning the owned record so the caller
+    /// can emit it **after** the shard lock is dropped.
+    ///
+    /// Both the predicate and the slot release run inside `remove_if`'s shard
+    /// write lock, atomically with the erase. Decrementing the count under that
+    /// same lock closes the window where a concurrent `upsert` on a full cache
+    /// could see the key already gone yet the slot still reserved, and drop a
+    /// packet even though the removal had freed room.
+    fn remove_and_release(
+        &self,
+        key: &FlowKey,
+        should_remove: impl FnOnce(&FlowRecord) -> bool,
+    ) -> Option<FlowRecord> {
+        self.map
+            .remove_if(key, |_k, record| {
+                let remove = should_remove(record);
+                if remove {
+                    self.count.fetch_sub(1, Ordering::Relaxed);
+                }
+                remove
+            })
+            .map(|(_k, record)| record)
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -216,54 +241,87 @@ impl FlowCache {
 
     /// Sweeps the cache once, evicting idle flows and rolling over flows that
     /// have exceeded their active timeout. Eviction and active-rollover events
-    /// are emitted through `on_emit` before the entry is mutated or removed.
+    /// are emitted through `on_emit`.
     ///
-    /// Iteration is shard-isolated (DashMap's `retain`), so worker threads keep
-    /// processing other shards while the aging sweep runs.
+    /// `on_emit` is always invoked **after** the entry's shard lock is released,
+    /// so a slow or re-entrant callback cannot block ingestion on other shards
+    /// or deadlock by calling back into the engine. A candidate flow's timeout
+    /// is re-checked while its lock is held before it is evicted or rolled over,
+    /// so a flow that a concurrent packet refreshed in between is left alone.
     pub fn sweep<F>(&self, cfg: &AgingConfig, counters: &InternalCounters, on_emit: &F)
     where
         F: Fn(&FlowRecord),
     {
         let now = Instant::now();
-        let count = &self.count;
-        self.map.retain(|_key, record| {
-            // Idle timeout: no activity for too long -> emit and evict.
-            if now.duration_since(record.last_observed) >= cfg.idle_timeout {
-                on_emit(record);
+
+        // Read pass: collect only the keys that currently look due. Holding
+        // read locks here is safe because no user callback runs; each candidate
+        // is re-checked under a write lock below. The buffer is proportional to
+        // the number of expiring flows, not the whole cache.
+        let candidates: Vec<FlowKey> = self
+            .map
+            .iter()
+            .filter(|entry| {
+                let r = entry.value();
+                now.duration_since(r.last_observed) >= cfg.idle_timeout
+                    || now.duration_since(r.first_observed) >= cfg.active_timeout
+            })
+            .map(|entry| *entry.key())
+            .collect();
+
+        for key in candidates {
+            // Idle timeout: remove (and release the slot) atomically, but only
+            // if still idle, then emit the owned record with the lock released.
+            if let Some(record) = self.remove_and_release(&key, |r| {
+                now.duration_since(r.last_observed) >= cfg.idle_timeout
+            }) {
+                on_emit(&record);
                 counters.flows_output.fetch_add(1, Ordering::Relaxed);
-                // Release the reserved capacity slot as the entry leaves.
-                count.fetch_sub(1, Ordering::Relaxed);
-                return false;
+                continue;
             }
 
-            // Active timeout: long-lived flow -> emit an interim snapshot and
-            // reset counters without destroying the cache entry.
-            if now.duration_since(record.first_observed) >= cfg.active_timeout {
-                on_emit(record);
+            // Active timeout: snapshot and reset the counters in place under a
+            // brief write lock (dropped as the closure returns), then emit the
+            // snapshot outside the lock.
+            let snapshot = self.map.get_mut(&key).and_then(|mut entry| {
+                let record = entry.value_mut();
+                if now.duration_since(record.first_observed) >= cfg.active_timeout {
+                    let snapshot = record.clone();
+                    record.bytes = 0;
+                    record.packets = 0;
+                    record.first_observed = now;
+                    Some(snapshot)
+                } else {
+                    None
+                }
+            });
+            if let Some(record) = snapshot {
+                on_emit(&record);
                 counters.flows_output.fetch_add(1, Ordering::Relaxed);
-                record.bytes = 0;
-                record.packets = 0;
-                record.first_observed = now;
             }
-
-            true
-        });
+        }
     }
 
     /// Drains every remaining flow, emitting each one. Used on shutdown so the
     /// host never loses the residual state still held in the cache.
+    ///
+    /// Like [`sweep`] and [`purge_exporter`], each record is removed with a
+    /// brief shard lock and emitted only after that lock is released, so the
+    /// callback never runs while a shard is locked.
+    ///
+    /// [`sweep`]: Self::sweep
+    /// [`purge_exporter`]: Self::purge_exporter
     pub fn flush_all<F>(&self, counters: &InternalCounters, on_emit: &F)
     where
         F: Fn(&FlowRecord),
     {
-        let count = &self.count;
-        self.map.retain(|_key, record| {
-            on_emit(record);
-            counters.flows_output.fetch_add(1, Ordering::Relaxed);
-            // Release the reserved capacity slot as the entry leaves.
-            count.fetch_sub(1, Ordering::Relaxed);
-            false
-        });
+        let keys: Vec<FlowKey> = self.map.iter().map(|entry| *entry.key()).collect();
+        for key in keys {
+            if let Some(record) = self.remove_and_release(&key, |_| true) {
+                on_emit(&record);
+                counters.flows_output.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Emits and removes every flow belonging to `exporter`, across all of its
@@ -307,11 +365,9 @@ impl FlowCache {
 
         let mut emitted = 0usize;
         for key in keys {
-            // `remove` takes the shard write lock only for the removal and
-            // returns the owned record; the lock is released before `on_emit`.
-            if let Some((_key, record)) = self.map.remove(&key) {
-                // Release the reserved capacity slot as the entry leaves.
-                self.count.fetch_sub(1, Ordering::Relaxed);
+            // Remove and release the slot atomically under the shard lock, then
+            // emit the owned record once that lock is dropped.
+            if let Some(record) = self.remove_and_release(&key, |_| true) {
                 on_emit(&record);
                 counters.flows_output.fetch_add(1, Ordering::Relaxed);
                 emitted += 1;
@@ -700,6 +756,51 @@ mod tests {
             scan_interval: Duration::from_secs(1),
         };
         cache.sweep(&cfg, &counters, &|_r| panic!("should not emit"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn sweep_callback_can_reenter_the_cache_without_deadlock() {
+        // Regression: sweep emits after releasing the entry's shard lock, so an
+        // idle-eviction callback that locks the same shard (re-inserting the
+        // evicted key) completes instead of deadlocking. Under the old
+        // callback-under-retain code this would hang.
+        let counters = InternalCounters::default();
+        let cache = FlowCache::new(10);
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
+
+        let cfg = AgingConfig {
+            idle_timeout: Duration::ZERO, // the flow is immediately idle
+            active_timeout: Duration::from_secs(3600),
+            scan_interval: Duration::from_secs(1),
+        };
+        let reentered = AtomicUsize::new(0);
+        cache.sweep(&cfg, &counters, &|_record| {
+            cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
+            reentered.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(reentered.load(Ordering::Relaxed), 1);
+        // The idle flow was evicted and the callback re-admitted one.
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn flush_callback_can_reenter_the_cache_without_deadlock() {
+        // Regression: flush_all emits each record after releasing its shard
+        // lock, so a callback that locks the same shard does not deadlock.
+        let counters = InternalCounters::default();
+        let cache = FlowCache::new(10);
+        cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
+
+        let reentered = AtomicUsize::new(0);
+        cache.flush_all(&counters, &|_record| {
+            cache.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
+            reentered.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(reentered.load(Ordering::Relaxed), 1);
+        // The original flow was drained and the callback re-admitted one.
         assert_eq!(cache.len(), 1);
     }
 
