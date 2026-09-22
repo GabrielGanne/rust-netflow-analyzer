@@ -353,6 +353,14 @@ impl FlowContext {
         }
 
         let mut data_records = 0usize;
+        // Set when a template/options set fails to parse or validate. Template
+        // sets are transactional (see `parse_template_set`), so a rejected set
+        // applies none of its templates and the previously cached definition is
+        // retained. Decoding must then stop for the rest of this packet: any
+        // following data set could otherwise be decoded against a *stale* layout
+        // (e.g. an old 4-byte template splitting one new 8-byte record into two),
+        // silently corrupting flows.
+        let mut rejected_template = false;
 
         // Walk each FlowSet/Set in the payload. A structural inconsistency stops
         // the walk without panicking; the unconsumed remainder is detected after
@@ -375,12 +383,18 @@ impl FlowContext {
 
             match fs.set_id {
                 id if id == FLOWSET_ID_V9_TEMPLATE || id == SET_ID_IPFIX_TEMPLATE => {
-                    if let Ok((_, templates)) = parser::parse_template_set(body) {
-                        for template in templates {
-                            self.counters
-                                .templates_received
-                                .fetch_add(1, Ordering::Relaxed);
-                            self.templates.insert(exporter, scope, template);
+                    match parser::parse_template_set(body) {
+                        Ok((_, templates)) => {
+                            for template in templates {
+                                self.counters
+                                    .templates_received
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.templates.insert(exporter, scope, template);
+                            }
+                        }
+                        Err(_) => {
+                            rejected_template = true;
+                            break;
                         }
                     }
                 }
@@ -388,13 +402,25 @@ impl FlowContext {
                 // (exporter metadata). Decode and store them so their data sets
                 // can later be interpreted rather than silently dropped.
                 id if id == FLOWSET_ID_V9_OPTIONS => {
-                    if let Ok((_, templates)) = parser::parse_v9_options_template_set(body) {
-                        self.store_options_templates(exporter, scope, templates);
+                    match parser::parse_v9_options_template_set(body) {
+                        Ok((_, templates)) => {
+                            self.store_options_templates(exporter, scope, templates)
+                        }
+                        Err(_) => {
+                            rejected_template = true;
+                            break;
+                        }
                     }
                 }
                 id if id == SET_ID_IPFIX_OPTIONS => {
-                    if let Ok((_, templates)) = parser::parse_ipfix_options_template_set(body) {
-                        self.store_options_templates(exporter, scope, templates);
+                    match parser::parse_ipfix_options_template_set(body) {
+                        Ok((_, templates)) => {
+                            self.store_options_templates(exporter, scope, templates)
+                        }
+                        Err(_) => {
+                            rejected_template = true;
+                            break;
+                        }
                     }
                 }
                 id if id >= FIRST_DATA_SET_ID => {
@@ -406,13 +432,15 @@ impl FlowContext {
             }
         }
 
-        // Partial decoding: any unconsumed bytes mean a FlowSet/Set length was
-        // inconsistent (overran the message) or a trailing Set header was
-        // truncated. A cleanly framed message ends with the payload fully
-        // consumed. Keep the records decoded so far but flag the datagram as
-        // malformed rather than silently succeeding. (IPFIX messages are already
-        // validated to tile exactly above, so this only fires for NetFlow v9.)
-        if !payload.is_empty() {
+        // Partial decoding: a rejected template set, any unconsumed bytes (a
+        // FlowSet/Set length that overran or truncated the message), or a
+        // trailing truncated Set header all mean the body could not be fully and
+        // consistently walked. A cleanly framed message ends with the payload
+        // fully consumed and no rejection. Keep the records decoded so far but
+        // flag the datagram as malformed rather than silently succeeding. (IPFIX
+        // messages are already validated to tile exactly above, so unconsumed
+        // bytes only arise for NetFlow v9.)
+        if rejected_template || !payload.is_empty() {
             self.counters
                 .malformed_packets
                 .fetch_add(1, Ordering::Relaxed);

@@ -136,7 +136,8 @@ fn template_set_with_two_records() {
 #[test]
 fn template_field_count_exceeding_input_is_rejected() {
     // template 256 declares 10 fields but only one 4-byte specifier follows.
-    // The impossible count must be rejected before any large allocation.
+    // The impossible count must be rejected before any large allocation, and
+    // (transactionally) the whole set is discarded.
     let mut body = Vec::new();
     body.extend_from_slice(&[0x01, 0x00, 0x00, 0x0A, 0x00, 0x08, 0x00, 0x04]);
 
@@ -156,6 +157,98 @@ fn template_field_count_over_cap_is_rejected() {
     }
 
     assert!(parse_template_set(&body).is_err());
+}
+
+#[test]
+fn reserved_template_id_rejects_the_set() {
+    // A template *definition* using a reserved id (< 256) is invalid, and per
+    // RFC 7011 §9.1 the whole (malformed) set is discarded transactionally.
+    let mut body = Vec::new();
+    // Valid: template 256 with one field.
+    body.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x04]);
+    // Invalid: definition with reserved template id 100.
+    body.extend_from_slice(&[0x00, 0x64, 0x00, 0x01, 0x00, 0x08, 0x00, 0x04]);
+
+    assert!(parse_template_set(&body).is_err());
+}
+
+#[test]
+fn template_withdrawal_is_accepted() {
+    // {template_id: 2, field_count: 0} is the All Templates Withdrawal
+    // (RFC 7011 §8.1); it parses as a valid (fieldless) record rather than
+    // being rejected as a reserved id.
+    let body = [0x00, 0x02, 0x00, 0x00]; // template id 2, field count 0
+    let (_rest, templates) = parse_template_set(&body).unwrap();
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].template_id, 2);
+}
+
+#[test]
+fn ipfix_options_scope_count_is_validated() {
+    // scope field count 0 is invalid (RFC 7011 requires at least one scope);
+    // the whole set is discarded.
+    let zero_scope = [
+        0x01, 0x04, // template id 260
+        0x00, 0x02, // field count 2
+        0x00, 0x00, // scope field count 0
+        0x00, 0x08, 0x00, 0x04, // field
+        0x00, 0x22, 0x00, 0x04, // field
+    ];
+    assert!(
+        parse_ipfix_options_template_set(&zero_scope).is_err(),
+        "zero scope count is rejected"
+    );
+
+    // scope field count greater than the total field count is invalid.
+    let scope_too_big = [
+        0x01, 0x04, // template id 260
+        0x00, 0x01, // field count 1
+        0x00, 0x02, // scope field count 2 (> field count)
+        0x00, 0x08, 0x00, 0x04, // field
+    ];
+    assert!(
+        parse_ipfix_options_template_set(&scope_too_big).is_err(),
+        "scope count above field count is rejected"
+    );
+}
+
+#[test]
+fn v9_options_lengths_are_validated() {
+    // A zero scope length is accepted: RFC 3954 does not require v9 options
+    // templates to carry a scope field (unlike IPFIX).
+    let zero_scope = [
+        0x01, 0x04, // template id 260
+        0x00, 0x00, // scope length 0
+        0x00, 0x04, // option length 4
+        0x00, 0x08, 0x00, 0x04, // one field
+    ];
+    let (_r, t) = parse_v9_options_template_set(&zero_scope).unwrap();
+    assert_eq!(t.len(), 1, "zero scope length is accepted for v9");
+
+    // A scope length that is not a multiple of the 4-byte field width is invalid.
+    let unaligned = [
+        0x01, 0x04, // template id 260
+        0x00, 0x03, // scope length 3 (not a multiple of 4)
+        0x00, 0x04, // option length 4
+        0x00, 0x08, 0x00, 0x04, // one field
+    ];
+    assert!(
+        parse_v9_options_template_set(&unaligned).is_err(),
+        "unaligned scope length is rejected"
+    );
+
+    // A reserved template id (< 256) is invalid.
+    let reserved_id = [
+        0x00, 0x64, // template id 100
+        0x00, 0x04, // scope length 4
+        0x00, 0x04, // option length 4
+        0x00, 0x08, 0x00, 0x04, // scope field
+        0x00, 0x22, 0x00, 0x04, // option field
+    ];
+    assert!(
+        parse_v9_options_template_set(&reserved_id).is_err(),
+        "reserved template id is rejected"
+    );
 }
 
 #[test]

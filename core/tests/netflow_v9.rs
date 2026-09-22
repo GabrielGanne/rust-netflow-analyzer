@@ -273,6 +273,163 @@ fn partial_decode_keeps_records_before_a_malformed_set() {
 }
 
 #[test]
+fn resent_template_replaces_the_previous_definition() {
+    // An exporter may redefine a template id with a new layout. Later data
+    // records must be decoded against the new definition, not the old one.
+    let ctx = FlowContext::new();
+
+    // First definition: template 256 = SRC, DST, PROTO (9-byte record).
+    let mut first = Builder::new();
+    first
+        .put(9, 2)
+        .put(2, 2)
+        .put(1000, 4)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(42, 4);
+    first
+        .put(0, 2) // template flowset
+        .put(20, 2) // length
+        .put(256, 2)
+        .put(3, 2)
+        .put(8, 2)
+        .put(4, 2) // IPV4_SRC
+        .put(12, 2)
+        .put(4, 2) // IPV4_DST
+        .put(4, 2)
+        .put(1, 2); // PROTOCOL
+    first
+        .put(256, 2)
+        .put(13, 2) // 4 + 9
+        .put(0xC0A8_0001, 4)
+        .put(0x0808_0808, 4)
+        .put(6, 1);
+    assert_eq!(ctx.process_packet(&first.buf), Ok(1));
+
+    // Redefinition: template 256 = SRC, SRC_PORT (6-byte record). If the old
+    // 9-byte definition were still used, the 6-byte data record would not decode.
+    let mut second = Builder::new();
+    second
+        .put(9, 2)
+        .put(2, 2)
+        .put(1000, 4)
+        .put(1_700_000_001, 4)
+        .put(2, 4)
+        .put(42, 4);
+    second
+        .put(0, 2) // template flowset
+        .put(16, 2) // length = 4 + 2 + 2 + 2*4
+        .put(256, 2)
+        .put(2, 2)
+        .put(8, 2)
+        .put(4, 2) // IPV4_SRC
+        .put(7, 2)
+        .put(2, 2); // SRC_PORT
+    second
+        .put(256, 2)
+        .put(10, 2) // 4 + 6
+        .put(0xC0A8_0002, 4)
+        .put(1234, 2);
+
+    assert_eq!(
+        ctx.process_packet(&second.buf),
+        Ok(1),
+        "the new 6-byte template layout is used after redefinition"
+    );
+}
+
+#[test]
+fn rejected_template_set_stops_decoding_and_keeps_old_template() {
+    // Regression: a template set that validly redefines a cached template but is
+    // followed by an invalid record is rejected wholesale (template parsing is
+    // transactional). Decoding must then STOP for the rest of the packet, or a
+    // following data set gets decoded against the stale cached layout — e.g. an
+    // old 4-byte template splitting one new 8-byte record into two bogus flows.
+    let ctx = FlowContext::new();
+
+    // Packet 1: cache template 256 as a single 4-byte IPV4_SRC field and send
+    // one matching data record.
+    let mut first = Builder::new();
+    first
+        .put(9, 2)
+        .put(1, 2)
+        .put(1000, 4)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(42, 4);
+    first
+        .put(0, 2) // template flowset
+        .put(12, 2) // length = 4 + 2 + 2 + 4
+        .put(256, 2)
+        .put(1, 2)
+        .put(8, 2)
+        .put(4, 2); // IPV4_SRC (4 bytes)
+    first
+        .put(256, 2)
+        .put(8, 2) // length = 4 + 4
+        .put(0xC0A8_0001, 4);
+    assert_eq!(ctx.process_packet(&first.buf), Ok(1));
+    assert_eq!(ctx.flows.len(), 1);
+
+    // Packet 2: a template set validly redefining 256 as an 8-byte layout, then
+    // an invalid record (reserved id 100 defining a field). The whole set is
+    // rejected, so 256 keeps its old 4-byte layout. A data set for 256 with one
+    // new 8-byte record follows; the stale template must NOT decode it as two.
+    let mut second = Builder::new();
+    second
+        .put(9, 2)
+        .put(2, 2)
+        .put(1000, 4)
+        .put(1_700_000_001, 4)
+        .put(2, 4)
+        .put(42, 4);
+    second
+        .put(0, 2) // template flowset
+        .put(24, 2) // length = 4 + 12 + 8
+        .put(256, 2) // valid: redefine 256 with two 4-byte fields
+        .put(2, 2)
+        .put(8, 2)
+        .put(4, 2) // IPV4_SRC
+        .put(12, 2)
+        .put(4, 2) // IPV4_DST
+        .put(100, 2) // invalid: reserved id (< 256) defining a field
+        .put(1, 2)
+        .put(8, 2)
+        .put(4, 2);
+    second
+        .put(256, 2)
+        .put(12, 2) // length = 4 + 8
+        .put(0xC0A8_0002, 4)
+        .put(0x0808_0808, 4);
+    assert_eq!(
+        ctx.process_packet(&second.buf),
+        Ok(0),
+        "decoding stops at the rejected template set; the stale 4-byte template \
+         must not split the following 8-byte record into two"
+    );
+    assert_eq!(
+        ctx.flows.len(),
+        1,
+        "no flow fabricated from the stale layout"
+    );
+    assert_eq!(ctx.stats().malformed_packets, 1);
+
+    // Packet 3: the original 4-byte template is still usable, proving the
+    // rejected set left the cached definition intact.
+    let mut third = Builder::new();
+    third
+        .put(9, 2)
+        .put(1, 2)
+        .put(1000, 4)
+        .put(1_700_000_002, 4)
+        .put(3, 4)
+        .put(42, 4);
+    third.put(256, 2).put(8, 2).put(0xC0A8_0003, 4);
+    assert_eq!(ctx.process_packet(&third.buf), Ok(1));
+    assert_eq!(ctx.flows.len(), 2);
+}
+
+#[test]
 fn trailing_truncated_flowset_header_is_counted_malformed() {
     // A well-formed datagram with 2 stray trailing bytes (an incomplete FlowSet
     // header) still decodes its records, but is flagged malformed rather than

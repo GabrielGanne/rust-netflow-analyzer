@@ -333,26 +333,41 @@ fn parse_field_specifier(input: &[u8]) -> IResult<&[u8], TemplateField> {
     }
 }
 
+/// Builds a recoverable parser error signalling that a record failed semantic
+/// validation (a reserved template id, an impossible options scope, etc.).
+fn validation_error(input: &[u8]) -> nom::Err<nom::error::Error<&[u8]>> {
+    nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+}
+
 /// Parses a single template record (template id, field count, field specifiers).
 fn parse_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
     let (input, template_id) = be_u16(input)?;
     let (input, field_count) = be_u16(input)?;
+    // Template ids 0-255 are reserved for Set ids (RFC 3954 §5.2, RFC 7011
+    // §3.4.1), so a template *definition* must use 256 or above. A record with
+    // field_count 0 is a Template Withdrawal (RFC 7011 §8.1), whose id may be a
+    // reserved value (2 = withdraw all); its lifecycle handling is a separate
+    // concern, so validation only rejects reserved ids that define fields.
+    if field_count != 0 && template_id < FIRST_DATA_SET_ID {
+        return Err(validation_error(input));
+    }
     let (input, fields) = parse_field_specifiers(input, field_count as usize)?;
     Ok((input, TemplateRecord::from_fields(template_id, fields)))
 }
 
 /// Parses every template record contained within a template FlowSet body.
+///
+/// Parsing is **transactional**: if any record fails to parse or validate, the
+/// whole set is rejected and no template is returned (RFC 7011 §9.1 requires a
+/// malformed message to be discarded rather than partially applied). Trailing
+/// padding shorter than a record header (< 4 bytes) is ignored.
 pub fn parse_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
     let mut templates = Vec::new();
-
-    // Template sets may carry several template records back to back. Trailing
-    // padding bytes (fewer than 4) are ignored.
     while body.len() >= 4 {
         let (rest, template) = parse_template_record(body)?;
         body = rest;
         templates.push(template);
     }
-
     Ok((body, templates))
 }
 
@@ -410,6 +425,13 @@ fn parse_v9_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateReco
     let (input, scope_len_bytes) = be_u16(input)?;
     let (input, option_len_bytes) = be_u16(input)?;
 
+    // Validate per RFC 3954 §6.1: a reserved template id, or a length that is
+    // not a whole number of 4-byte field specifiers, is invalid. Unlike IPFIX,
+    // v9 does not require a scope field, so a zero scope length is accepted.
+    if template_id < FIRST_DATA_SET_ID || scope_len_bytes % 4 != 0 || option_len_bytes % 4 != 0 {
+        return Err(validation_error(input));
+    }
+
     let scope_field_count = scope_len_bytes / 4;
     let option_field_count = option_len_bytes / 4;
     let total = scope_field_count as usize + option_field_count as usize;
@@ -422,7 +444,8 @@ fn parse_v9_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateReco
 }
 
 /// Parses every options-template record in a NetFlow v9 Options Template
-/// FlowSet body (set id 1). Trailing alignment padding is ignored.
+/// FlowSet body (set id 1). Transactional: any invalid record rejects the whole
+/// set (see [`parse_template_set`]).
 pub fn parse_v9_options_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
     let mut templates = Vec::new();
     // Minimum record is the 6-byte header (id + two length fields).
@@ -444,6 +467,17 @@ fn parse_ipfix_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateR
     let (input, field_count) = be_u16(input)?;
     let (input, scope_field_count) = be_u16(input)?;
 
+    // Validate per RFC 7011 §3.4.2.2: a definition must use a non-reserved
+    // template id and a scope count in 1..=field_count. A record with
+    // field_count 0 is a Template Withdrawal (§8.1), exempt from these rules.
+    if field_count != 0
+        && (template_id < FIRST_DATA_SET_ID
+            || scope_field_count == 0
+            || scope_field_count > field_count)
+    {
+        return Err(validation_error(input));
+    }
+
     let (input, fields) = parse_field_specifiers(input, field_count as usize)?;
     Ok((
         input,
@@ -452,7 +486,8 @@ fn parse_ipfix_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateR
 }
 
 /// Parses every options-template record in an IPFIX Options Template Set body
-/// (set id 3). Trailing alignment padding is ignored.
+/// (set id 3). Transactional: any invalid record rejects the whole set (see
+/// [`parse_template_set`]).
 pub fn parse_ipfix_options_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
     let mut templates = Vec::new();
     // Minimum record is the 6-byte header (id + two count fields).
