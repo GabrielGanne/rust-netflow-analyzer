@@ -134,6 +134,31 @@ fn template_set_with_two_records() {
 }
 
 #[test]
+fn template_field_count_exceeding_input_is_rejected() {
+    // template 256 declares 10 fields but only one 4-byte specifier follows.
+    // The impossible count must be rejected before any large allocation.
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x01, 0x00, 0x00, 0x0A, 0x00, 0x08, 0x00, 0x04]);
+
+    assert!(parse_template_set(&body).is_err());
+}
+
+#[test]
+fn template_field_count_over_cap_is_rejected() {
+    // A count above MAX_TEMPLATE_FIELDS is rejected even when enough bytes are
+    // present, capping per-template allocation independent of datagram size.
+    let count = (MAX_TEMPLATE_FIELDS + 1) as u16;
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x01, 0x00]); // template id 256
+    body.extend_from_slice(&count.to_be_bytes()); // field count > cap
+    for _ in 0..count {
+        body.extend_from_slice(&[0x00, 0x08, 0x00, 0x04]); // type 8, length 4
+    }
+
+    assert!(parse_template_set(&body).is_err());
+}
+
+#[test]
 fn variable_length_template_has_no_fixed_length() {
     let fields = vec![
         TemplateField {

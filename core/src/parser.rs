@@ -356,9 +356,35 @@ pub fn parse_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>
     Ok((body, templates))
 }
 
-/// Reads `count` field specifiers into a fallibly pre-allocated vector,
-/// refusing an absurd count rather than risking an abort on allocation.
+/// Minimum on-wire size of a field specifier (2-byte type + 2-byte length).
+/// Enterprise specifiers are larger (they add a 4-byte PEN), so this is only a
+/// lower bound, used to reject an impossible `count` before allocating.
+const FIELD_SPECIFIER_MIN_LEN: usize = 4;
+
+/// Conservative upper bound on the number of field specifiers in a single
+/// template. Real templates carry at most a few dozen fields; this caps the
+/// per-template allocation from a hostile `field_count` far below what the
+/// datagram size alone would permit.
+pub const MAX_TEMPLATE_FIELDS: usize = 1024;
+
+/// Reads `count` field specifiers into a fallibly pre-allocated vector.
+///
+/// The declared `count` is validated against a conservative cap *and* against
+/// the bytes that actually remain **before** any allocation, so a hostile
+/// `field_count` cannot drive a large reservation (or a chain of them across
+/// many template records) before the fields are ever read.
 fn parse_field_specifiers(mut input: &[u8], count: usize) -> IResult<&[u8], Vec<TemplateField>> {
+    let too_large = count > MAX_TEMPLATE_FIELDS
+        || count
+            .checked_mul(FIELD_SPECIFIER_MIN_LEN)
+            .is_none_or(|min_bytes| min_bytes > input.len());
+    if too_large {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+
     let mut fields = Vec::new();
     if fields.try_reserve_exact(count).is_err() {
         return Err(nom::Err::Failure(nom::error::Error::new(
