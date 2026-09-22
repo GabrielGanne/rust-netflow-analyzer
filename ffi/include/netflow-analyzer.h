@@ -252,6 +252,33 @@ int32_t netflow_analyzer_process_packet_at(const NetflowAnalyzerContext *ctx,
                                            uint64_t receipt_time_ns);
 
 /**
+ * Like [`netflow_analyzer_process_packet`], but scopes all template, clock, and
+ * flow state to the caller-supplied `exporter_key` and stamps it onto emitted
+ * records, so one context can serve many exporters without their state
+ * colliding. See `docs/exporter-identity.md` for the exporter-key contract.
+ *
+ * # Safety
+ * The pointer requirements are identical to [`netflow_analyzer_process_packet`].
+ */
+int32_t netflow_analyzer_process_packet_from(const NetflowAnalyzerContext *ctx,
+                                             uint64_t exporter_key,
+                                             const uint8_t *packet_bytes,
+                                             uint32_t length);
+
+/**
+ * Like [`netflow_analyzer_process_packet_from`], with an explicit
+ * Unix-nanosecond receipt timestamp.
+ *
+ * # Safety
+ * The pointer requirements are identical to [`netflow_analyzer_process_packet`].
+ */
+int32_t netflow_analyzer_process_packet_from_at(const NetflowAnalyzerContext *ctx,
+                                                uint64_t exporter_key,
+                                                const uint8_t *packet_bytes,
+                                                uint32_t length,
+                                                uint64_t receipt_time_ns);
+
+/**
  * Decode-only entry point: parses a datagram and invokes `callback` once per
  * decoded data record, **without** aggregating into the flow cache. Template
  * state is still updated (it is required to decode). Returns the number of data
@@ -284,6 +311,36 @@ int32_t netflow_analyzer_decode_packet_at(const NetflowAnalyzerContext *ctx,
                                           uint64_t receipt_time_ns,
                                           NetflowAnalyzerRecordCallback callback,
                                           void *user_data);
+
+/**
+ * Like [`netflow_analyzer_decode_packet`], but scopes decoding to the
+ * caller-supplied `exporter_key`, which is stamped onto each emitted record.
+ * See `docs/exporter-identity.md` for the exporter-key contract.
+ *
+ * # Safety
+ * The pointer requirements are identical to [`netflow_analyzer_decode_packet`].
+ */
+int32_t netflow_analyzer_decode_packet_from(const NetflowAnalyzerContext *ctx,
+                                            uint64_t exporter_key,
+                                            const uint8_t *packet_bytes,
+                                            uint32_t length,
+                                            NetflowAnalyzerRecordCallback callback,
+                                            void *user_data);
+
+/**
+ * Like [`netflow_analyzer_decode_packet_from`], with an explicit
+ * Unix-nanosecond receipt timestamp.
+ *
+ * # Safety
+ * The pointer requirements are identical to [`netflow_analyzer_decode_packet`].
+ */
+int32_t netflow_analyzer_decode_packet_from_at(const NetflowAnalyzerContext *ctx,
+                                               uint64_t exporter_key,
+                                               const uint8_t *packet_bytes,
+                                               uint32_t length,
+                                               uint64_t receipt_time_ns,
+                                               NetflowAnalyzerRecordCallback callback,
+                                               void *user_data);
 
 /**
  * Forces every cached flow to be emitted through the callback immediately.

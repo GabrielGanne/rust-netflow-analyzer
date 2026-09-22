@@ -240,6 +240,58 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet_at(
     }
 }
 
+/// Like [`netflow_analyzer_process_packet`], but scopes all template, clock, and
+/// flow state to the caller-supplied `exporter_key` and stamps it onto emitted
+/// records, so one context can serve many exporters without their state
+/// colliding. See `docs/exporter-identity.md` for the exporter-key contract.
+///
+/// # Safety
+/// The pointer requirements are identical to [`netflow_analyzer_process_packet`].
+#[no_mangle]
+pub unsafe extern "C" fn netflow_analyzer_process_packet_from(
+    ctx: *const NetflowAnalyzerContext,
+    exporter_key: u64,
+    packet_bytes: *const u8,
+    length: u32,
+) -> i32 {
+    if ctx.is_null() || packet_bytes.is_null() {
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+    match (*ctx).internal.process_packet_from(exporter_key, data) {
+        Ok(records) => records as i32,
+        Err(CLOCK_SKEW_ERROR) => -3,
+        Err(_) => -2,
+    }
+}
+
+/// Like [`netflow_analyzer_process_packet_from`], with an explicit
+/// Unix-nanosecond receipt timestamp.
+///
+/// # Safety
+/// The pointer requirements are identical to [`netflow_analyzer_process_packet`].
+#[no_mangle]
+pub unsafe extern "C" fn netflow_analyzer_process_packet_from_at(
+    ctx: *const NetflowAnalyzerContext,
+    exporter_key: u64,
+    packet_bytes: *const u8,
+    length: u32,
+    receipt_time_ns: u64,
+) -> i32 {
+    if ctx.is_null() || packet_bytes.is_null() {
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+    match (*ctx)
+        .internal
+        .process_packet_from_at(exporter_key, data, receipt_time_ns)
+    {
+        Ok(records) => records as i32,
+        Err(CLOCK_SKEW_ERROR) => -3,
+        Err(_) => -2,
+    }
+}
+
 /// Decode-only entry point: parses a datagram and invokes `callback` once per
 /// decoded data record, **without** aggregating into the flow cache. Template
 /// state is still updated (it is required to decode). Returns the number of data
@@ -308,6 +360,80 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_at(
     match (*ctx)
         .internal
         .decode_packet_scoped_at(data, receipt_time_ns, &mut sink)
+    {
+        Ok(records) => records as i32,
+        Err(CLOCK_SKEW_ERROR) => -3,
+        Err(_) => -2,
+    }
+}
+
+/// Like [`netflow_analyzer_decode_packet`], but scopes decoding to the
+/// caller-supplied `exporter_key`, which is stamped onto each emitted record.
+/// See `docs/exporter-identity.md` for the exporter-key contract.
+///
+/// # Safety
+/// The pointer requirements are identical to [`netflow_analyzer_decode_packet`].
+#[no_mangle]
+pub unsafe extern "C" fn netflow_analyzer_decode_packet_from(
+    ctx: *const NetflowAnalyzerContext,
+    exporter_key: u64,
+    packet_bytes: *const u8,
+    length: u32,
+    callback: NetflowAnalyzerRecordCallback,
+    user_data: *mut c_void,
+) -> i32 {
+    if ctx.is_null() || packet_bytes.is_null() {
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+    let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
+        let record = fields.to_ffi(exporter, scope);
+        callback(
+            scope.observation_domain(),
+            &record as *const NetflowAnalyzerFlowRecord,
+            user_data,
+        );
+    };
+    match (*ctx)
+        .internal
+        .decode_packet_from(exporter_key, data, &mut sink)
+    {
+        Ok(records) => records as i32,
+        Err(CLOCK_SKEW_ERROR) => -3,
+        Err(_) => -2,
+    }
+}
+
+/// Like [`netflow_analyzer_decode_packet_from`], with an explicit
+/// Unix-nanosecond receipt timestamp.
+///
+/// # Safety
+/// The pointer requirements are identical to [`netflow_analyzer_decode_packet`].
+#[no_mangle]
+pub unsafe extern "C" fn netflow_analyzer_decode_packet_from_at(
+    ctx: *const NetflowAnalyzerContext,
+    exporter_key: u64,
+    packet_bytes: *const u8,
+    length: u32,
+    receipt_time_ns: u64,
+    callback: NetflowAnalyzerRecordCallback,
+    user_data: *mut c_void,
+) -> i32 {
+    if ctx.is_null() || packet_bytes.is_null() {
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+    let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
+        let record = fields.to_ffi(exporter, scope);
+        callback(
+            scope.observation_domain(),
+            &record as *const NetflowAnalyzerFlowRecord,
+            user_data,
+        );
+    };
+    match (*ctx)
+        .internal
+        .decode_packet_from_at(exporter_key, data, receipt_time_ns, &mut sink)
     {
         Ok(records) => records as i32,
         Err(CLOCK_SKEW_ERROR) => -3,
@@ -522,6 +648,50 @@ mod tests {
         assert_eq!(NETFLOW_ANALYZER_SCOPE_V9, scope::SCOPE_PROTOCOL_V9);
         assert_eq!(NETFLOW_ANALYZER_SCOPE_IPFIX, scope::SCOPE_PROTOCOL_IPFIX);
         assert_eq!(NETFLOW_ANALYZER_SCOPE_V5, scope::SCOPE_PROTOCOL_V5);
+    }
+
+    /// Flow callback that records the exporter key of each emitted record.
+    extern "C" fn exporter_cb(record: *const NetflowAnalyzerFlowRecord, user_data: *mut c_void) {
+        unsafe {
+            let keys = &*(user_data as *const std::sync::Mutex<Vec<u64>>);
+            if let Some(rec) = record.as_ref() {
+                keys.lock().unwrap().push(rec.exporter_key);
+            }
+        }
+    }
+
+    #[test]
+    fn process_packet_from_scopes_by_exporter() {
+        let keys: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let ud = &keys as *const std::sync::Mutex<Vec<u64>> as *mut c_void;
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), exporter_cb, ud) };
+
+        // Same datagram under two exporter keys must not aggregate together.
+        let packet = v9_packet();
+        assert_eq!(
+            unsafe {
+                netflow_analyzer_process_packet_from(ctx, 1, packet.as_ptr(), packet.len() as u32)
+            },
+            1
+        );
+        assert_eq!(
+            unsafe {
+                netflow_analyzer_process_packet_from(ctx, 2, packet.as_ptr(), packet.len() as u32)
+            },
+            1
+        );
+        assert_eq!(
+            unsafe { netflow_analyzer_get_stats(ctx) }.active_flows,
+            2,
+            "each exporter keeps its own flow"
+        );
+
+        unsafe { netflow_analyzer_flush(ctx) };
+        let mut seen = keys.lock().unwrap().clone();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 2], "emitted records carry their exporter key");
+
+        unsafe { netflow_analyzer_destroy(ctx) };
     }
 
     #[test]

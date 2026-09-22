@@ -103,16 +103,41 @@ impl FlowContext {
     /// Like [`Self::process_packet`], with an explicit Unix-nanosecond receipt
     /// timestamp. Capture readers should pass the packet's capture timestamp.
     ///
-    /// This is the fused decode + aggregate entry point: it decodes the datagram
-    /// and folds every data record into the flow cache. It is a thin wrapper over
-    /// [`Self::decode_packet_at`], supplying the flow-cache upsert as the sink.
+    /// This is the fused decode + aggregate entry point for the reserved
+    /// single-exporter key. It is a thin wrapper over
+    /// [`Self::process_packet_from_at`].
     pub fn process_packet_at(
         &self,
         raw_bytes: &[u8],
         receipt_time_ns: u64,
     ) -> Result<usize, &'static str> {
+        self.process_packet_from_at(SINGLE_EXPORTER, raw_bytes, receipt_time_ns)
+    }
+
+    /// Fused decode + aggregate for a specific exporter/transport session.
+    ///
+    /// `exporter` scopes all template, clock, and flow state and is stamped onto
+    /// every emitted record, so one [`FlowContext`] can serve many exporters
+    /// without their state colliding. See `docs/exporter-identity.md` for the
+    /// caller contract governing how keys must be allocated and never reused.
+    pub fn process_packet_from(
+        &self,
+        exporter: ExporterKey,
+        raw_bytes: &[u8],
+    ) -> Result<usize, &'static str> {
+        self.process_packet_from_at(exporter, raw_bytes, now_unix_ns())
+    }
+
+    /// Like [`Self::process_packet_from`], with an explicit Unix-nanosecond
+    /// receipt timestamp.
+    pub fn process_packet_from_at(
+        &self,
+        exporter: ExporterKey,
+        raw_bytes: &[u8],
+        receipt_time_ns: u64,
+    ) -> Result<usize, &'static str> {
         self.decode_at(
-            SINGLE_EXPORTER,
+            exporter,
             raw_bytes,
             receipt_time_ns,
             &mut |exporter, scope, fields| {
@@ -164,18 +189,17 @@ impl FlowContext {
         )
     }
 
-    /// Scope-aware decode-only entry point: like [`Self::decode_packet`], but
-    /// each record is delivered as `(exporter_key, scope, &FlowFields)` so a
-    /// consumer can attribute it to its exporter, protocol, and domain. The
-    /// exporter key is the reserved single-exporter value until the key-aware
-    /// entry points land.
+    /// Scope-aware decode-only entry point for the reserved single-exporter key:
+    /// like [`Self::decode_packet`], but each record is delivered as
+    /// `(exporter_key, scope, &FlowFields)` so a consumer can attribute it to its
+    /// exporter, protocol, and domain. Thin wrapper over
+    /// [`Self::decode_packet_from`].
     pub fn decode_packet_scoped(
         &self,
         raw_bytes: &[u8],
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
     ) -> Result<usize, &'static str> {
-        let receipt_time_ns = now_unix_ns();
-        self.decode_packet_scoped_at(raw_bytes, receipt_time_ns, sink)
+        self.decode_packet_from(SINGLE_EXPORTER, raw_bytes, sink)
     }
 
     /// Scope-aware decode-only entry point with an explicit receipt timestamp.
@@ -186,7 +210,31 @@ impl FlowContext {
         receipt_time_ns: u64,
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
     ) -> Result<usize, &'static str> {
-        self.decode_at(SINGLE_EXPORTER, raw_bytes, receipt_time_ns, sink)
+        self.decode_packet_from_at(SINGLE_EXPORTER, raw_bytes, receipt_time_ns, sink)
+    }
+
+    /// Decode-only entry point for a specific exporter/transport session. Each
+    /// record is delivered as `(exporter_key, scope, &FlowFields)` without
+    /// touching the flow cache. See [`Self::process_packet_from`] for the
+    /// exporter-key contract.
+    pub fn decode_packet_from(
+        &self,
+        exporter: ExporterKey,
+        raw_bytes: &[u8],
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
+    ) -> Result<usize, &'static str> {
+        self.decode_packet_from_at(exporter, raw_bytes, now_unix_ns(), sink)
+    }
+
+    /// Like [`Self::decode_packet_from`], with an explicit receipt timestamp.
+    pub fn decode_packet_from_at(
+        &self,
+        exporter: ExporterKey,
+        raw_bytes: &[u8],
+        receipt_time_ns: u64,
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
+    ) -> Result<usize, &'static str> {
+        self.decode_at(exporter, raw_bytes, receipt_time_ns, sink)
     }
 
     /// Core decode routine shared by every entry point. Decodes the datagram

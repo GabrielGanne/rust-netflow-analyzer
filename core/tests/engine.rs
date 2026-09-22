@@ -278,3 +278,33 @@ fn clock_state_is_independent_per_domain() {
         1_700_000_002_000_000_000
     );
 }
+
+#[test]
+fn distinct_exporters_do_not_share_state() {
+    // The very same datagram (same domain, template id, and 5-tuple) fed under
+    // two different exporter keys must not collide: separate templates, clocks,
+    // and flows, and emitted records tagged with their exporter.
+    let ctx = FlowContext::new();
+    let packet = sample_v9_packet();
+
+    assert_eq!(ctx.process_packet_from(1, &packet), Ok(1));
+    assert_eq!(ctx.process_packet_from(2, &packet), Ok(1));
+
+    assert_eq!(ctx.templates.len(), 2, "templates are per-exporter");
+    assert_eq!(ctx.clocks.len(), 2, "clocks are per-exporter");
+    assert_eq!(ctx.flows.len(), 2, "flows are per-exporter");
+    assert!(ctx.clocks.get(1, Scope::V9Domain(42)).is_some());
+    assert!(ctx.clocks.get(2, Scope::V9Domain(42)).is_some());
+
+    let emitted: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = emitted.clone();
+    ctx.flush(move |record| sink.lock().unwrap().push(record.clone()));
+
+    let mut keys: Vec<u64> = emitted.lock().unwrap().iter().map(|r| r.exporter).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![1, 2],
+        "each emitted flow carries its exporter key"
+    );
+}

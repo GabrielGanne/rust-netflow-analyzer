@@ -30,8 +30,10 @@
   observation domain, not observation domain alone.
 - [ ] Scope five-tuple flow keys by the chosen exporter identity and observation
   domain so unrelated exporters or domains cannot be aggregated together.
-- [ ] Update the UDP listener to maintain separate state for each exporter when
-  it receives packets from multiple peers.
+- [ ] Expose key-aware ingestion end to end so callers can drive many exporters
+  from one context: `process_packet_from[_at]` / `decode_packet_from[_at]` in
+  Rust and the matching `netflow_analyzer_*_from[_at]` FFI symbols (header
+  regenerated). Emitted records carry the `(exporter_key, scope)` identity.
 - [ ] Enforce the IPFIX message `total_length` and reject inconsistent/truncated
   message and Set lengths instead of parsing bytes beyond the declared message.
 - [ ] Decide and document strict rejection versus explicit partial decoding for
@@ -41,7 +43,16 @@
   reserving memory, and define conservative per-message/template limits to
   prevent allocation churn from hostile datagrams.
 - [ ] Add template lifetime/expiry and transport-session reset semantics so the
-  bounded template cache cannot fill permanently with stale entries.
+  bounded template cache cannot fill permanently with stale entries. Provide a
+  per-key purge (emit-and-drain a key's flows, then drop its templates/clock/
+  sampling state) — this is the prerequisite for safe listener key rotation and
+  expiry below.
+- [ ] Update the UDP listener to maintain separate state for each exporter when
+  it receives packets from multiple peers. Sequenced **after** the per-key purge
+  above: without it the listener cannot rotate keys on exporter restart or
+  reclaim table slots without leaking engine state, and it also needs an
+  admission policy (trusted-exporter allow-list / rate limit) per the hostile-
+  input model. The key-aware ingestion API it builds on is already in place.
 - [ ] Validate template IDs, options scope counts/lengths, and template
   replacement/lifecycle rules against NetFlow v9 and IPFIX requirements.
 
