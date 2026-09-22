@@ -596,6 +596,52 @@ impl FlowContext {
         self.flows.flush_all(&self.counters, &on_emit);
     }
 
+    /// Purges all cached state for one exporter/transport session, reclaiming
+    /// its slots in every cache. Returns the number of flows emitted.
+    ///
+    /// This is the transport-session reset primitive. Its resident flows are
+    /// emitted through `on_emit` **first** (so traffic accumulated since the
+    /// last aging sweep is not lost), then its templates and clock state are
+    /// dropped. Call it before a key is retired — for example when an exporter
+    /// restarts — so the bounded caches do not fill permanently with the stale
+    /// state of gone sessions. See `docs/exporter-identity.md` for the key
+    /// contract and listener key-rotation rules.
+    ///
+    /// Purge reclaims *local* cache capacity; it does not retract a key that
+    /// was already emitted as identity (see the identity model). It also does
+    /// not stop the background aging thread, so a concurrent sweep of the same
+    /// exporter's flows may interleave; callers needing a strict boundary must
+    /// coordinate with the aging worker as the identity model describes.
+    ///
+    /// Purge is **not** atomic against other cache access for `exporter`. While
+    /// it runs, the caller must ensure nothing else ingests or decodes packets
+    /// for this key — this covers `process_packet[_from][_at]`, the decode-only
+    /// `decode_packet*` entry points (which still update template and clock
+    /// state), and the key-`0` convenience wrappers — whether from another
+    /// thread or re-entrantly from within `on_emit`. The flow cache is drained
+    /// *before* the templates and clock state are dropped, so state added for
+    /// this key mid-purge can be left behind inconsistently (a flow with no
+    /// matching template, say) and could contaminate a reused session. This is
+    /// the same dispatch fencing the identity model requires for listener key
+    /// rotation.
+    ///
+    /// Like [`Self::flush`], purge acquires cache locks, so it must not be
+    /// called from within an emission callback (a background aging sweep, a
+    /// `flush`, or another purge) that is still holding those locks, or it will
+    /// deadlock. Moving emission callbacks outside the cache locks is tracked
+    /// separately as FFI-safety work.
+    pub fn purge_exporter<F>(&self, exporter: ExporterKey, on_emit: F) -> usize
+    where
+        F: Fn(&FlowRecord),
+    {
+        let emitted = self
+            .flows
+            .purge_exporter(exporter, &self.counters, &on_emit);
+        self.templates.purge_exporter(exporter);
+        self.clocks.purge_exporter(exporter);
+        emitted
+    }
+
     /// Non-blocking telemetry snapshot, including the live active-flow gauge.
     pub fn stats(&self) -> NetflowAnalyzerStats {
         self.counters.get_ffi_snapshot(self.flows.len() as u64)

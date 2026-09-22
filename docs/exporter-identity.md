@@ -92,12 +92,15 @@ domain/engine it came from.
   **distinct between concurrent exporters**. Reusing one key for two different
   exporters re-introduces exactly the collisions described above.
 - A key **must not be reused for a new session until the previous session's
-  cached state has been purged.** Templates and clock state currently have no
-  per-session teardown, and flows persist until they age out, so a recycled key
-  would let a new session inherit stale template layouts, clock baselines, or
-  flow counters. Until the reset/expiry API below exists, treat keys as
-  **allocated for the lifetime of the process** (or scoped to a value, such as a
-  monotonically increasing session id, that is never reused). A **new** transport
+  cached state has been purged.** A recycled key would otherwise let a new
+  session inherit stale template layouts, clock baselines, or flow counters. The
+  explicit per-key purge (`FlowContext::purge_exporter` /
+  `netflow_analyzer_purge_exporter`) now provides that teardown: it emits and
+  drains the key's flows, then drops its templates and clock state (step 4
+  below). Time-based template expiry is still pending, so absent a purge or an
+  external restart signal a key should be treated as **allocated for the
+  lifetime of the process** (or scoped to a value, such as a monotonically
+  increasing session id, that is never reused). A **new** transport
   session — for example an exporter that restarts or reconnects — must be given a
   fresh, never-before-used key, or the previous key's state must be purged first.
   A restarted exporter may reuse template ids and `flowId`s with entirely
@@ -252,6 +255,15 @@ step's stated prerequisites are also in place.
    it does **not** authorize re-emitting a key that was already emitted as
    identity (see the caller contract) — that still requires a fresh session id or
    an emitted generation with a downstream reset contract.
+
+   *Status: the explicit per-key purge is implemented as
+   `FlowContext::purge_exporter` (and the `netflow_analyzer_purge_exporter` FFI
+   symbol). It emits and drains the key's flows first, then drops its templates
+   and clock state, and reclaims the freed slots in every cache. It does not
+   stop the aging worker, so a strict rotation boundary (step 5) must still
+   serialize purge with that worker. Time-based template lifetime/expiry — the
+   other half of this step — is not yet implemented; options-derived sampling
+   state does not exist yet and will be purged here once it does.*
 5. Update the reference UDP listener to key state per exporter *session*, keying
    on step 4's purge. A key derived only from the peer address and port is
    **not** sufficient: a UDP exporter that restarts keeps the same address and

@@ -84,6 +84,24 @@ impl ClockTracker {
         self.states.is_empty()
     }
 
+    /// Drops every clock state belonging to `exporter`, across all of its
+    /// scopes, releasing each reserved capacity slot. Returns the number of
+    /// scopes removed. Part of the per-key purge that retires a transport
+    /// session (e.g. an exporter restart) without leaking bounded slots.
+    pub fn purge_exporter(&self, exporter: ExporterKey) -> usize {
+        let mut removed = 0usize;
+        let count = &self.scope_count;
+        self.states.retain(|key, _state| {
+            if key.0 == exporter {
+                count.fetch_sub(1, Ordering::Relaxed);
+                removed += 1;
+                return false;
+            }
+            true
+        });
+        removed
+    }
+
     pub(crate) fn observe(
         &self,
         exporter: ExporterKey,
@@ -242,5 +260,25 @@ mod tests {
             30
         );
         assert!(tracker.get(2, Scope::IpfixDomain(7)).is_none());
+    }
+
+    #[test]
+    fn purge_drops_only_the_exporter_and_reclaims_slots() {
+        // Cap of 2 so the reclaimed slot's reuse is observable.
+        let tracker = ClockTracker::new(2);
+        let cfg = ClockConfig::default();
+        tracker.observe(1, Scope::V9Domain(7), 10, 10, cfg);
+        tracker.observe(2, Scope::V9Domain(7), 20, 20, cfg);
+        assert_eq!(tracker.len(), 2);
+
+        assert_eq!(tracker.purge_exporter(1), 1);
+        assert!(tracker.get(1, Scope::V9Domain(7)).is_none());
+        assert!(tracker.get(2, Scope::V9Domain(7)).is_some());
+        assert_eq!(tracker.len(), 1);
+
+        // The freed slot admits a new scope rather than being rejected by the cap.
+        tracker.observe(3, Scope::V9Domain(7), 30, 30, cfg);
+        assert_eq!(tracker.len(), 2);
+        assert!(tracker.get(3, Scope::V9Domain(7)).is_some());
     }
 }

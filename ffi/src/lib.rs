@@ -460,6 +460,46 @@ pub unsafe extern "C" fn netflow_analyzer_flush(ctx: *const NetflowAnalyzerConte
         .flush(move |record| emit_record(callback, user_data, record));
 }
 
+/// Purges all cached state for one exporter/transport session, reclaiming its
+/// slots in every cache. Returns the number of flows emitted, or `-1` if `ctx`
+/// is null.
+///
+/// The exporter's resident flows are emitted through the registered flow
+/// callback **first** (so traffic accumulated since the last aging sweep is not
+/// lost), then its templates and clock state are dropped. Call this before
+/// retiring an exporter key — for example after detecting that the exporter
+/// restarted — so the bounded caches do not fill with stale sessions. See
+/// `docs/exporter-identity.md` for the key contract and rotation rules.
+///
+/// Purge is **not** atomic against other use of the same key: the caller must
+/// ensure that, while the purge runs, no other call ingests or decodes packets
+/// for `exporter_key`. That covers every `netflow_analyzer_process_packet*` and
+/// `netflow_analyzer_decode_packet*` entry point (the decode variants still
+/// update template and clock state), including the key-`0` functions that map
+/// to the reserved single-exporter key; otherwise state added mid-purge can be
+/// orphaned. Do not call this from inside the flow callback while an aging
+/// sweep or `netflow_analyzer_flush` is in progress, as that would deadlock.
+///
+/// # Safety
+/// `ctx` must be null or a valid context pointer.
+#[no_mangle]
+pub unsafe extern "C" fn netflow_analyzer_purge_exporter(
+    ctx: *const NetflowAnalyzerContext,
+    exporter_key: u64,
+) -> i32 {
+    if ctx.is_null() {
+        return -1;
+    }
+    let context = &*ctx;
+    let callback = context.callback;
+    let user_data = context.user_data;
+    context
+        .internal
+        .purge_exporter(exporter_key, move |record| {
+            emit_record(callback, user_data, record)
+        }) as i32
+}
+
 /// Destructor exposed to C. Stops the aging thread and releases all memory.
 ///
 /// # Safety
@@ -691,6 +731,45 @@ mod tests {
         let mut seen = keys.lock().unwrap().clone();
         seen.sort_unstable();
         assert_eq!(seen, vec![1, 2], "emitted records carry their exporter key");
+
+        unsafe { netflow_analyzer_destroy(ctx) };
+    }
+
+    #[test]
+    fn purge_exporter_emits_flows_and_resets_state() {
+        let keys: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let ud = &keys as *const std::sync::Mutex<Vec<u64>> as *mut c_void;
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), exporter_cb, ud) };
+
+        let packet = v9_packet();
+        for key in [1u64, 2] {
+            assert_eq!(
+                unsafe {
+                    netflow_analyzer_process_packet_from(
+                        ctx,
+                        key,
+                        packet.as_ptr(),
+                        packet.len() as u32,
+                    )
+                },
+                1
+            );
+        }
+        assert_eq!(unsafe { netflow_analyzer_get_stats(ctx) }.active_flows, 2);
+
+        // Purging exporter 1 emits its one flow through the registered callback
+        // and reclaims its slot; exporter 2 is untouched.
+        let drained = unsafe { netflow_analyzer_purge_exporter(ctx, 1) };
+        assert_eq!(drained, 1);
+        assert_eq!(keys.lock().unwrap().as_slice(), &[1]);
+        assert_eq!(unsafe { netflow_analyzer_get_stats(ctx) }.active_flows, 1);
+
+        // Null context is rejected; purging an unknown key emits nothing.
+        assert_eq!(
+            unsafe { netflow_analyzer_purge_exporter(ptr::null(), 1) },
+            -1
+        );
+        assert_eq!(unsafe { netflow_analyzer_purge_exporter(ctx, 99) }, 0);
 
         unsafe { netflow_analyzer_destroy(ctx) };
     }

@@ -308,3 +308,47 @@ fn distinct_exporters_do_not_share_state() {
         "each emitted flow carries its exporter key"
     );
 }
+
+#[test]
+fn purge_exporter_emits_flows_then_drops_template_and_clock_state() {
+    // A per-key purge is the transport-session reset primitive: it must emit the
+    // key's cached flows first, then remove its templates and clock state, while
+    // leaving every other exporter's state intact.
+    let ctx = FlowContext::new();
+    let packet = sample_v9_packet();
+
+    assert_eq!(ctx.process_packet_from(1, &packet), Ok(1));
+    assert_eq!(ctx.process_packet_from(2, &packet), Ok(1));
+    assert_eq!(ctx.flows.len(), 2);
+    assert_eq!(ctx.templates.len(), 2);
+    assert_eq!(ctx.clocks.len(), 2);
+
+    let emitted: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = emitted.clone();
+    let drained = ctx.purge_exporter(1, move |record| sink.lock().unwrap().push(record.clone()));
+
+    // Exporter 1's single flow was emitted through the callback...
+    assert_eq!(drained, 1);
+    let records = emitted.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].exporter, 1);
+    assert_eq!(ctx.stats().flows_output, 1);
+
+    // ...and all of exporter 1's state is gone, while exporter 2's is untouched.
+    assert_eq!(ctx.flows.len(), 1);
+    assert_eq!(ctx.templates.len(), 1);
+    assert_eq!(ctx.clocks.len(), 1);
+    assert!(ctx.templates.get(1, Scope::V9Domain(42), 256).is_none());
+    assert!(ctx.templates.get(2, Scope::V9Domain(42), 256).is_some());
+    assert!(ctx.clocks.get(1, Scope::V9Domain(42)).is_none());
+    assert!(ctx.clocks.get(2, Scope::V9Domain(42)).is_some());
+
+    // Purging an unknown key is a no-op that emits nothing.
+    assert_eq!(ctx.purge_exporter(99, |_| panic!("no flows to emit")), 0);
+
+    // The purged key starts fresh: its template must be resent before its data
+    // decodes again (proving the old cached template really was dropped).
+    assert_eq!(ctx.process_packet_from(1, &packet), Ok(1));
+    assert_eq!(ctx.templates.len(), 2);
+    assert_eq!(ctx.clocks.len(), 2);
+}

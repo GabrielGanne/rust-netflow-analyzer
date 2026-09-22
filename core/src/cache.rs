@@ -98,6 +98,24 @@ impl TemplateCache {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// Drops every template belonging to `exporter`, across all of its scopes
+    /// and template ids, releasing each reserved capacity slot. Returns the
+    /// number of templates removed. Part of the per-key purge that lets a
+    /// transport session be retired without leaking bounded cache slots.
+    pub fn purge_exporter(&self, exporter: ExporterKey) -> usize {
+        let mut removed = 0usize;
+        let count = &self.count;
+        self.map.retain(|key, _template| {
+            if key.0 == exporter {
+                count.fetch_sub(1, Ordering::Relaxed);
+                removed += 1;
+                return false;
+            }
+            true
+        });
+        removed
+    }
 }
 
 /// Concurrent, size-bounded cache of active flow state.
@@ -246,6 +264,60 @@ impl FlowCache {
             count.fetch_sub(1, Ordering::Relaxed);
             false
         });
+    }
+
+    /// Emits and removes every flow belonging to `exporter`, across all of its
+    /// scopes, releasing each reserved capacity slot. Returns the number of
+    /// flows emitted.
+    ///
+    /// This drains a single transport session's flows through the normal
+    /// emission path (so traffic accumulated since the last sweep is not lost)
+    /// as the first half of a per-key purge; the caller then drops that key's
+    /// templates and clock state.
+    ///
+    /// Each record is removed with a brief per-shard lock and only then handed
+    /// to `on_emit`, so a slow or re-entrant callback cannot block ingestion or
+    /// deadlock on a still-held shard write lock. Records are removed and
+    /// emitted one at a time, so the larger `FlowRecord`s are never duplicated
+    /// and the flows not yet reached stay in the cache if a callback unwinds.
+    /// The purge first snapshots the matching keys: a transient allocation
+    /// proportional to the number of flows this exporter owns, but of the small
+    /// [`FlowKey`]s rather than the records. This guarantees only
+    /// deadlock-freedom: purge is **not** atomic against concurrent or
+    /// re-entrant ingestion for the same exporter, which the caller must fence
+    /// (see [`crate::FlowContext::purge_exporter`]).
+    pub fn purge_exporter<F>(
+        &self,
+        exporter: ExporterKey,
+        counters: &InternalCounters,
+        on_emit: &F,
+    ) -> usize
+    where
+        F: Fn(&FlowRecord),
+    {
+        // Snapshot the matching keys under brief read locks (dropped with the
+        // iterator), then remove and emit them one at a time so no user
+        // callback ever runs while a shard lock is held.
+        let keys: Vec<FlowKey> = self
+            .map
+            .iter()
+            .filter(|entry| entry.key().exporter == exporter)
+            .map(|entry| *entry.key())
+            .collect();
+
+        let mut emitted = 0usize;
+        for key in keys {
+            // `remove` takes the shard write lock only for the removal and
+            // returns the owned record; the lock is released before `on_emit`.
+            if let Some((_key, record)) = self.map.remove(&key) {
+                // Release the reserved capacity slot as the entry leaves.
+                self.count.fetch_sub(1, Ordering::Relaxed);
+                on_emit(&record);
+                counters.flows_output.fetch_add(1, Ordering::Relaxed);
+                emitted += 1;
+            }
+        }
+        emitted
     }
 }
 
@@ -415,6 +487,75 @@ mod tests {
         assert!(!cache.insert(SINGLE_EXPORTER, d1, sample_template(257)));
         // Re-defining an existing key is always allowed.
         assert!(cache.insert(SINGLE_EXPORTER, d1, sample_template(256)));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn template_cache_purge_drops_only_the_exporter() {
+        let cache = TemplateCache::new(10);
+        let d = Scope::V9Domain(1);
+        assert!(cache.insert(1, d, sample_template(256)));
+        assert!(cache.insert(1, Scope::IpfixDomain(2), sample_template(300)));
+        assert!(cache.insert(2, d, sample_template(256)));
+        assert_eq!(cache.len(), 3);
+
+        assert_eq!(cache.purge_exporter(1), 2, "both of exporter 1's templates");
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(1, d, 256).is_none());
+        assert!(cache.get(2, d, 256).is_some(), "other exporter untouched");
+
+        // The freed slots are reusable: re-adding under the purged key succeeds
+        // even in a cache that would otherwise be near a low cap.
+        assert!(cache.insert(1, d, sample_template(256)));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn flow_cache_purge_emits_drains_and_reclaims_slots() {
+        let counters = InternalCounters::default();
+        // Cap of 2 so we can prove the freed slot becomes reusable afterwards.
+        let cache = FlowCache::new(2);
+        cache.upsert(1, TEST_SCOPE, &fields(6), &counters);
+        cache.upsert(2, TEST_SCOPE, &fields(6), &counters);
+        assert_eq!(cache.len(), 2);
+
+        let emitted = AtomicUsize::new(0);
+        let drained = cache.purge_exporter(1, &counters, &|record| {
+            assert_eq!(record.exporter, 1, "only exporter 1's flows are emitted");
+            emitted.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(drained, 1);
+        assert_eq!(emitted.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.flows_output.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.len(), 1, "exporter 2's flow survives");
+
+        // The reclaimed slot is available again: a new flow is admitted rather
+        // than dropped, proving the capacity counter was released.
+        cache.upsert(3, TEST_SCOPE, &fields(6), &counters);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(counters.flows_dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn purge_callback_can_reenter_the_cache_without_deadlock() {
+        // Regression: on_emit runs after the shard locks are released, so a
+        // re-entrant call that locks the same shard (here, re-inserting the
+        // purged flow key) completes instead of deadlocking on a held write
+        // lock. Under the old lock-held-during-emit code this would hang.
+        let counters = InternalCounters::default();
+        let cache = FlowCache::new(10);
+        cache.upsert(1, TEST_SCOPE, &fields(6), &counters);
+
+        let reentered = AtomicUsize::new(0);
+        let drained = cache.purge_exporter(1, &counters, &|_record| {
+            cache.upsert(1, TEST_SCOPE, &fields(6), &counters);
+            reentered.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(drained, 1);
+        assert_eq!(reentered.load(Ordering::Relaxed), 1);
+        // The re-entrant upsert re-admitted the flow after purge drained it.
         assert_eq!(cache.len(), 1);
     }
 

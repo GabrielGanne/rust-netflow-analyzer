@@ -361,6 +361,32 @@ int32_t netflow_analyzer_decode_packet_from_at(const NetflowAnalyzerContext *ctx
 void netflow_analyzer_flush(const NetflowAnalyzerContext *ctx);
 
 /**
+ * Purges all cached state for one exporter/transport session, reclaiming its
+ * slots in every cache. Returns the number of flows emitted, or `-1` if `ctx`
+ * is null.
+ *
+ * The exporter's resident flows are emitted through the registered flow
+ * callback **first** (so traffic accumulated since the last aging sweep is not
+ * lost), then its templates and clock state are dropped. Call this before
+ * retiring an exporter key — for example after detecting that the exporter
+ * restarted — so the bounded caches do not fill with stale sessions. See
+ * `docs/exporter-identity.md` for the key contract and rotation rules.
+ *
+ * Purge is **not** atomic against other use of the same key: the caller must
+ * ensure that, while the purge runs, no other call ingests or decodes packets
+ * for `exporter_key`. That covers every `netflow_analyzer_process_packet*` and
+ * `netflow_analyzer_decode_packet*` entry point (the decode variants still
+ * update template and clock state), including the key-`0` functions that map
+ * to the reserved single-exporter key; otherwise state added mid-purge can be
+ * orphaned. Do not call this from inside the flow callback while an aging
+ * sweep or `netflow_analyzer_flush` is in progress, as that would deadlock.
+ *
+ * # Safety
+ * `ctx` must be null or a valid context pointer.
+ */
+int32_t netflow_analyzer_purge_exporter(const NetflowAnalyzerContext *ctx, uint64_t exporter_key);
+
+/**
  * Destructor exposed to C. Stops the aging thread and releases all memory.
  *
  * # Safety
