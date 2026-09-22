@@ -217,6 +217,11 @@ pub const FIRST_DATA_SET_ID: u16 = 256;
 /// Fixed length, in bytes, of a single NetFlow v5 flow record.
 pub const V5_RECORD_LEN: usize = 48;
 
+/// Total IPFIX message header length in bytes (version, length, export time,
+/// sequence number, observation domain id), per RFC 7011 §3.1. The message's
+/// declared `total_length` includes this header.
+pub const IPFIX_HEADER_LEN: usize = 16;
+
 /// Sentinel field length signalling an IPFIX variable-length element.
 pub const VARIABLE_LENGTH: u16 = 0xffff;
 

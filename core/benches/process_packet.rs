@@ -86,7 +86,7 @@ fn ipfix_packet() -> Vec<u8> {
 
     // IPFIX header (16 bytes).
     b.put(10, 2) // version
-        .put(0, 2) // total length (ignored by the parser)
+        .put(0, 2) // total length (patched below)
         .put(1_700_000_000, 4) // export time
         .put(5, 4) // sequence
         .put(7, 4); // observation domain id
@@ -110,6 +110,9 @@ fn ipfix_packet() -> Vec<u8> {
         .put(0x0808_0808, 4) // 8.8.8.8
         .put(17, 1); // proto = UDP
 
+    // Patch the IPFIX header's total_length (bytes 2..4) to the real length.
+    let total = b.buf.len() as u16;
+    b.buf[2..4].copy_from_slice(&total.to_be_bytes());
     b.buf
 }
 

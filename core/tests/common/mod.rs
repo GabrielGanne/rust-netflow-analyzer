@@ -32,6 +32,13 @@ impl Default for Builder {
     }
 }
 
+/// Patches an IPFIX datagram's `total_length` header field (bytes 2..4) to the
+/// buffer's actual length, as a real exporter would set it.
+pub fn set_ipfix_total_length(buf: &mut [u8]) {
+    let len = buf.len() as u16;
+    buf[2..4].copy_from_slice(&len.to_be_bytes());
+}
+
 /// A NetFlow v9 packet with a 7-field template (id 256) and one data record.
 pub fn sample_v9_packet() -> Vec<u8> {
     let mut b = Builder::new();
@@ -84,7 +91,7 @@ pub fn sample_ipfix_packet() -> Vec<u8> {
 
     // IPFIX header (16 bytes).
     b.put(10, 2) // version
-        .put(0, 2) // total length (ignored by the parser)
+        .put(0, 2) // total length (patched below)
         .put(1_700_000_000, 4) // export time
         .put(5, 4) // sequence
         .put(7, 4); // observation domain id
@@ -108,6 +115,7 @@ pub fn sample_ipfix_packet() -> Vec<u8> {
         .put(0x08080808, 4) // 8.8.8.8
         .put(17, 1); // proto = UDP
 
+    set_ipfix_total_length(&mut b.buf);
     b.buf
 }
 

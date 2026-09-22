@@ -9,7 +9,7 @@ mod common;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use common::{sample_ipfix_packet, Builder};
+use common::{sample_ipfix_packet, set_ipfix_total_length, Builder};
 use netflow_analyzer_core::records::FlowRecord;
 use netflow_analyzer_core::FlowContext;
 
@@ -42,7 +42,7 @@ fn options_template_and_data_are_decoded_but_not_flows() {
     let mut b = Builder::new();
     // IPFIX header (16 bytes).
     b.put(10, 2) // version
-        .put(0, 2) // total length (ignored by the parser)
+        .put(0, 2) // total length (patched below)
         .put(1_700_000_000, 4) // export time
         .put(5, 4) // sequence
         .put(7, 4); // observation domain id
@@ -64,6 +64,7 @@ fn options_template_and_data_are_decoded_but_not_flows() {
         .put(7, 4) // observationDomainId value
         .put(1000, 4); // samplingInterval value
 
+    set_ipfix_total_length(&mut b.buf);
     let ctx = FlowContext::new();
     let processed = ctx.process_packet(&b.buf).expect("parse ok");
 
@@ -86,4 +87,82 @@ fn options_template_and_data_are_decoded_but_not_flows() {
             .load(Ordering::Relaxed),
         1
     );
+}
+
+#[test]
+fn trailing_bytes_beyond_total_length_are_ignored() {
+    // Bytes past the declared message length must not be walked: appending
+    // garbage after `total_length` leaves decoding unchanged.
+    let mut packet = sample_ipfix_packet();
+    packet.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
+
+    let ctx = FlowContext::new();
+    assert_eq!(ctx.process_packet(&packet), Ok(1));
+    assert_eq!(ctx.stats().pkts_parsed, 1);
+    assert_eq!(ctx.stats().pkts_parse_error, 0);
+    assert_eq!(ctx.flows.len(), 1);
+}
+
+#[test]
+fn total_length_claiming_more_than_datagram_is_rejected() {
+    // A message whose declared `total_length` exceeds the received datagram is
+    // truncated/inconsistent and must be rejected, not partially parsed.
+    let mut packet = sample_ipfix_packet();
+    let overstated = (packet.len() as u16) + 8;
+    packet[2..4].copy_from_slice(&overstated.to_be_bytes());
+
+    let ctx = FlowContext::new();
+    assert!(ctx.process_packet(&packet).is_err());
+    assert_eq!(
+        ctx.stats().pkts_parsed,
+        0,
+        "an inconsistent message is not counted as parsed"
+    );
+    assert_eq!(ctx.stats().pkts_parse_error, 1);
+    assert_eq!(ctx.flows.len(), 0);
+}
+
+#[test]
+fn total_length_below_header_is_rejected() {
+    // `total_length` smaller than the 16-byte IPFIX header is impossible.
+    let mut packet = sample_ipfix_packet();
+    packet[2..4].copy_from_slice(&8u16.to_be_bytes());
+
+    let ctx = FlowContext::new();
+    assert!(ctx.process_packet(&packet).is_err());
+    assert_eq!(ctx.stats().pkts_parse_error, 1);
+    assert_eq!(ctx.flows.len(), 0);
+}
+
+#[test]
+fn total_length_that_truncates_a_set_is_rejected() {
+    // total_length = 40 covers the template set (20) plus only the 4-byte data
+    // Set header, cutting off the data Set body. That Set overruns the declared
+    // message, so the whole message is rejected.
+    let mut packet = sample_ipfix_packet();
+    packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+
+    let ctx = FlowContext::new();
+    assert!(ctx.process_packet(&packet).is_err());
+    assert_eq!(ctx.stats().pkts_parsed, 0);
+    assert_eq!(ctx.stats().pkts_parse_error, 1);
+    assert_eq!(ctx.flows.len(), 0);
+}
+
+#[test]
+fn total_length_can_shorten_the_walk() {
+    // A declared length shorter than the datagram must bound the walk: here it
+    // covers only the template set (header 16 + template 20 = 36), so the data
+    // set that follows is not decoded.
+    let mut packet = sample_ipfix_packet();
+    packet[2..4].copy_from_slice(&36u16.to_be_bytes());
+
+    let ctx = FlowContext::new();
+    assert_eq!(
+        ctx.process_packet(&packet),
+        Ok(0),
+        "data set is beyond total_length"
+    );
+    assert_eq!(ctx.stats().pkts_parsed, 1);
+    assert_eq!(ctx.flows.len(), 0);
 }

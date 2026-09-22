@@ -19,7 +19,7 @@ use cache::{
 use clock::{ClockConfig, ClockDecision, ClockTracker};
 use parser::{
     ParsedHeader, FIRST_DATA_SET_ID, FLOWSET_ID_V9_OPTIONS, FLOWSET_ID_V9_TEMPLATE,
-    SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
+    IPFIX_HEADER_LEN, SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
 };
 use records::{FlowFields, FlowRecord, RecordTimeContext};
 use scope::{ExporterKey, Scope, SINGLE_EXPORTER};
@@ -27,6 +27,29 @@ use stats::{InternalCounters, NetflowAnalyzerStats};
 
 /// Error returned when clock validation rejects an otherwise parseable packet.
 pub const CLOCK_SKEW_ERROR: &str = "Packet dropped because exporter clock skew exceeds limit";
+
+/// Error returned when an IPFIX message's declared `total_length` is impossible
+/// or exceeds the received datagram.
+const IPFIX_LENGTH_ERROR: &str = "IPFIX message total_length is inconsistent with the datagram";
+
+/// Returns true if `body` is tiled exactly by IPFIX Sets: every Set has a valid
+/// length (at least the 4-byte Set header) that fits, and the Sets consume the
+/// whole slice with nothing left over. A Set that overruns the declared message,
+/// or stray trailing bytes, means the declared `total_length` is inconsistent.
+fn ipfix_sets_tile_exactly(mut body: &[u8]) -> bool {
+    while !body.is_empty() {
+        // A full 4-byte Set header (set id + length) must be present.
+        if body.len() < 4 {
+            return false;
+        }
+        let set_len = u16::from_be_bytes([body[2], body[3]]) as usize;
+        if set_len < 4 || set_len > body.len() {
+            return false;
+        }
+        body = &body[set_len..];
+    }
+    true
+}
 
 /// Current wall-clock time as Unix nanoseconds, saturating at `u64::MAX`.
 fn now_unix_ns() -> u64 {
@@ -256,6 +279,28 @@ impl FlowContext {
                 return Err("Failed to parse NetFlow header packet structure");
             }
         };
+
+        // Enforce the IPFIX declared message length (RFC 7011 §3.1): the message
+        // is exactly `total_length` bytes including the 16-byte header. Reject a
+        // message whose declared length is impossible or exceeds the datagram,
+        // and never walk trailing bytes beyond it.
+        if let ParsedHeader::Ipfix(ref h) = header {
+            let consistent = match (h.total_length as usize).checked_sub(IPFIX_HEADER_LEN) {
+                // The declared body must fit in the datagram and be tiled exactly
+                // by its Sets (no Set overrunning it, no stray trailing bytes).
+                Some(body_len) if body_len <= payload.len() => {
+                    payload = &payload[..body_len];
+                    ipfix_sets_tile_exactly(payload)
+                }
+                _ => false,
+            };
+            if !consistent {
+                self.counters
+                    .pkts_parse_error
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(IPFIX_LENGTH_ERROR);
+            }
+        }
 
         self.counters.pkts_parsed.fetch_add(1, Ordering::Relaxed);
 
