@@ -328,3 +328,10 @@ step's stated prerequisites are also in place.
    per-datagram evidence, treat every restart-detection scheme described here as
    **best-effort**, and prefer an authenticated, session-bound transport for
    high-assurance deployments.
+
+   *Status: the reference `udp_listener` example now maps each source endpoint
+   to a distinct, monotonically increasing, never-reused exporter key and feeds
+   packets through `process_packet_from`, so distinct senders no longer share
+   engine state. The rest of this step is still pending: the endpoint→key table
+   is unbounded (no hard cap or admission policy), and there is no restart
+   detection, per-key purge-and-rekey, or aging-worker generation barrier yet.*

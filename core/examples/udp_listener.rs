@@ -7,19 +7,46 @@
 //! Binds a UDP socket, feeds every received datagram into the engine, prints
 //! emitted flows from the background aging thread, and reports telemetry.
 //!
+//! Each source endpoint is given a distinct exporter key so the engine keeps
+//! every exporter's templates, clocks, and flows separate rather than folding
+//! unrelated senders together (see `docs/exporter-identity.md`).
+//!
 //! Run with:
 //!     cargo run -p netflow_analyzer_core --example udp_listener -- --address 0.0.0.0 --port 2055
 //!
 //! Then point any NetFlow v9 / IPFIX exporter (or `nfreplay`) at that port.
 //! Pass `--help` for the full list of options.
 
-use std::net::UdpSocket;
+use std::collections::HashMap;
+use std::net::{SocketAddr, UdpSocket};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use netflow_analyzer_core::records::FlowRecord;
+use netflow_analyzer_core::scope::ExporterKey;
 use netflow_analyzer_core::FlowContext;
+
+/// Returns the exporter key for `peer`, allocating a fresh one the first time a
+/// peer is seen. Keys are monotonically increasing and never reused; key `0` is
+/// the reserved single-exporter value, so allocation starts at `1`. Reusing a
+/// key for a genuinely new session would let it inherit stale state, so the
+/// identity model requires never-reused keys (see `docs/exporter-identity.md`).
+///
+/// NOTE: this table is unbounded here. A hard cap, an admission policy
+/// (trusted-peer allow-list / rate limit), and restart-driven key rotation with
+/// a per-key purge are deliberately left as follow-ups.
+fn exporter_key_for(
+    peer_keys: &mut HashMap<SocketAddr, ExporterKey>,
+    next_key: &mut ExporterKey,
+    peer: SocketAddr,
+) -> ExporterKey {
+    *peer_keys.entry(peer).or_insert_with(|| {
+        let key = *next_key;
+        *next_key += 1;
+        key
+    })
+}
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 2055;
@@ -132,7 +159,8 @@ fn format_ip(addr: &[u8; 16]) -> String {
 
 fn print_flow(record: &FlowRecord) {
     println!(
-        "[flow] {}:{} -> {}:{} proto={} bytes={} packets={}",
+        "[flow] exporter={} {}:{} -> {}:{} proto={} bytes={} packets={}",
+        record.exporter,
         format_ip(&record.src_ip),
         record.src_port,
         format_ip(&record.dst_ip),
@@ -151,8 +179,10 @@ fn print_flow_verbose(record: &FlowRecord) {
         .map(|id| id.to_string())
         .unwrap_or_else(|| "-".to_string());
     println!(
-        "[flow] {}:{} -> {}:{} proto={} bytes={} packets={} flow_id={} \
+        "[flow] exporter={} scope={:?} {}:{} -> {}:{} proto={} bytes={} packets={} flow_id={} \
          start_ns={} end_ns={} orig_start_ns={} orig_end_ns={}",
+        record.exporter,
+        record.scope,
         format_ip(&record.src_ip),
         record.src_port,
         format_ip(&record.dst_ip),
@@ -237,18 +267,27 @@ fn run(opts: Options) -> std::io::Result<()> {
     let mut buf = [0u8; 65_535];
     let mut last_report = Instant::now();
 
+    // Per-endpoint exporter keys, so distinct senders never share engine state.
+    let mut peer_keys: HashMap<SocketAddr, ExporterKey> = HashMap::new();
+    let mut next_key: ExporterKey = 1;
+
     while !SHUTDOWN.load(Ordering::SeqCst) {
         match socket.recv_from(&mut buf) {
-            Ok((len, peer)) => match ctx.process_packet(&buf[..len]) {
-                Ok(records) if opts.verbose => {
-                    println!("[packet] {len} bytes from {peer} -> {records} data record(s)");
+            Ok((len, peer)) => {
+                let key = exporter_key_for(&mut peer_keys, &mut next_key, peer);
+                match ctx.process_packet_from(key, &buf[..len]) {
+                    Ok(records) if opts.verbose => {
+                        println!(
+                            "[packet] {len} bytes from {peer} (key {key}) -> {records} data record(s)"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) if opts.verbose => {
+                        println!("[packet] {len} bytes from {peer} (key {key}) -> error: {err}");
+                    }
+                    Err(_) => {}
                 }
-                Ok(_) => {}
-                Err(err) if opts.verbose => {
-                    println!("[packet] {len} bytes from {peer} -> error: {err}");
-                }
-                Err(_) => {}
-            },
+            }
             // WouldBlock/TimedOut are the read-timeout firing; Interrupted is a
             // signal (e.g. Ctrl-C) waking the call. All three loop back to
             // re-check the shutdown flag.
@@ -267,7 +306,10 @@ fn run(opts: Options) -> std::io::Result<()> {
     }
 
     // Ctrl-C: stop aging, then drain and dump every flow still in the cache.
-    println!("\nshutting down: flushing residual flows");
+    println!(
+        "\nshutting down: flushing residual flows ({} exporter(s) tracked)",
+        peer_keys.len()
+    );
     ctx.stop_aging();
     ctx.flush(printer);
     print_stats(&ctx);
@@ -291,5 +333,36 @@ fn main() -> ExitCode {
             eprintln!("error: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peers_get_distinct_stable_never_reused_keys() {
+        let mut keys = HashMap::new();
+        let mut next: ExporterKey = 1;
+        let a: SocketAddr = "10.0.0.1:2055".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:2055".parse().unwrap();
+        // Same address, different source port is a distinct endpoint.
+        let a2: SocketAddr = "10.0.0.1:9999".parse().unwrap();
+
+        let ka = exporter_key_for(&mut keys, &mut next, a);
+        let kb = exporter_key_for(&mut keys, &mut next, b);
+        let ka2 = exporter_key_for(&mut keys, &mut next, a2);
+
+        // Distinct endpoints get distinct keys, and key 0 (the reserved
+        // single-exporter value) is never handed out.
+        assert!(ka != 0 && kb != 0 && ka2 != 0);
+        assert_ne!(ka, kb);
+        assert_ne!(ka, ka2);
+        assert_ne!(kb, ka2);
+
+        // A repeat packet from a known endpoint keeps its key; no new key is
+        // allocated (next only advanced once per distinct endpoint).
+        assert_eq!(exporter_key_for(&mut keys, &mut next, a), ka);
+        assert_eq!(next, 4, "exactly three keys allocated for three endpoints");
     }
 }
