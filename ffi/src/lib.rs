@@ -180,6 +180,7 @@ pub unsafe extern "C" fn netflow_analyzer_get_stats(
         return NetflowAnalyzerStats {
             pkts_parsed: 0,
             pkts_parse_error: 0,
+            malformed_packets: 0,
             clock_dropped_packets: 0,
             clock_fallback_packets: 0,
             templates_received: 0,

@@ -164,9 +164,18 @@ typedef struct {
      */
     uint64_t pkts_parsed;
     /**
-     * Datagrams rejected because their NetFlow/IPFIX header was malformed.
+     * Datagrams rejected because their NetFlow/IPFIX header (or IPFIX
+     * `total_length` framing) was malformed; dropped whole and not counted in
+     * `pkts_parsed`.
      */
     uint64_t pkts_parse_error;
+    /**
+     * Datagrams whose header parsed but whose body was structurally
+     * inconsistent (a FlowSet/Set length that overran or truncated the
+     * message). Records decoded before the inconsistency are kept (partial
+     * decoding); these datagrams are also counted in `pkts_parsed`.
+     */
+    uint64_t malformed_packets;
     /**
      * Packets rejected because exporter clock skew exceeded the configured limit.
      */

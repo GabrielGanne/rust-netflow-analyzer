@@ -354,8 +354,9 @@ impl FlowContext {
 
         let mut data_records = 0usize;
 
-        // Walk each FlowSet/Set in the payload. Any structural inconsistency
-        // stops the walk gracefully rather than panicking.
+        // Walk each FlowSet/Set in the payload. A structural inconsistency stops
+        // the walk without panicking; the unconsumed remainder is detected after
+        // the loop and counted as malformed.
         while payload.len() >= 4 {
             let (rest, fs) = match parser::parse_flowset_header(payload) {
                 Ok(parsed) => parsed,
@@ -403,6 +404,18 @@ impl FlowContext {
                 // Reserved/unknown set ids (e.g. 4..=255) are ignored.
                 _ => {}
             }
+        }
+
+        // Partial decoding: any unconsumed bytes mean a FlowSet/Set length was
+        // inconsistent (overran the message) or a trailing Set header was
+        // truncated. A cleanly framed message ends with the payload fully
+        // consumed. Keep the records decoded so far but flag the datagram as
+        // malformed rather than silently succeeding. (IPFIX messages are already
+        // validated to tile exactly above, so this only fires for NetFlow v9.)
+        if !payload.is_empty() {
+            self.counters
+                .malformed_packets
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         self.counters

@@ -207,7 +207,8 @@ fn unknown_reserved_set_id_is_skipped() {
 #[test]
 fn truncated_flowset_stops_gracefully() {
     // The flowset claims length 100 but only a few body bytes follow; the walk
-    // must stop without panicking or fabricating records.
+    // must stop without panicking or fabricating records, and the datagram must
+    // be counted as malformed rather than silently succeeding.
     let mut b = Builder::new();
     b.put(9, 2)
         .put(1, 2)
@@ -223,6 +224,66 @@ fn truncated_flowset_stops_gracefully() {
     let processed = ctx.process_packet(&b.buf).expect("header parse ok");
     assert_eq!(processed, 0);
     assert_eq!(ctx.stats().templates_received, 0);
+    // Header was valid, so it counts as parsed, but the body was malformed.
+    assert_eq!(ctx.stats().pkts_parsed, 1);
+    assert_eq!(ctx.stats().malformed_packets, 1);
+}
+
+#[test]
+fn partial_decode_keeps_records_before_a_malformed_set() {
+    // A valid template + one valid data record, then a second data FlowSet whose
+    // declared length overruns the datagram. Partial decoding keeps the good
+    // record and flags the datagram as malformed instead of dropping everything.
+    let mut b = Builder::new();
+    b.put(9, 2) // version
+        .put(3, 2) // count
+        .put(1000, 4) // sys uptime
+        .put(1_700_000_000, 4) // unix seconds
+        .put(1, 4) // sequence
+        .put(42, 4); // source id
+
+    // Template FlowSet: template 256 with SRC/DST/PROTO. Set length =
+    // 4 (header) + 2 (template id) + 2 (field count) + 3 * 4 (field specs) = 20.
+    b.put(0, 2) // template flowset id
+        .put(20, 2) // length
+        .put(256, 2) // template id
+        .put(3, 2) // field count
+        .put(8, 2)
+        .put(4, 2) // IPV4_SRC
+        .put(12, 2)
+        .put(4, 2) // IPV4_DST
+        .put(4, 2)
+        .put(1, 2); // PROTOCOL (1 byte)
+
+    // Valid data FlowSet: one 9-byte record (4 + 9 = 13).
+    b.put(256, 2)
+        .put(13, 2)
+        .put(0xC0A8_0001, 4) // 192.168.0.1
+        .put(0x0808_0808, 4) // 8.8.8.8
+        .put(6, 1); // proto = TCP
+
+    // Second data FlowSet claims length 40 but only its 4-byte header follows.
+    b.put(256, 2).put(40, 2);
+
+    let ctx = FlowContext::new();
+    let processed = ctx.process_packet(&b.buf).expect("header parse ok");
+    assert_eq!(processed, 1, "the record before the bad set is kept");
+    assert_eq!(ctx.flows.len(), 1);
+    assert_eq!(ctx.stats().malformed_packets, 1);
+}
+
+#[test]
+fn trailing_truncated_flowset_header_is_counted_malformed() {
+    // A well-formed datagram with 2 stray trailing bytes (an incomplete FlowSet
+    // header) still decodes its records, but is flagged malformed rather than
+    // silently succeeding.
+    let mut packet = sample_v9_packet();
+    packet.extend_from_slice(&[0x00, 0x01]);
+
+    let ctx = FlowContext::new();
+    assert_eq!(ctx.process_packet(&packet), Ok(1));
+    assert_eq!(ctx.stats().pkts_parsed, 1);
+    assert_eq!(ctx.stats().malformed_packets, 1);
 }
 
 /// A v9 packet whose template (id 256) carries L2/QoS/ICMP metadata plus the
