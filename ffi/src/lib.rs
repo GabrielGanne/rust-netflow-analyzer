@@ -21,6 +21,13 @@ pub const NETFLOW_ANALYZER_SCOPE_V9: u8 = 0;
 pub const NETFLOW_ANALYZER_SCOPE_IPFIX: u8 = 1;
 pub const NETFLOW_ANALYZER_SCOPE_V5: u8 = 2;
 
+/// ABI version of this library's C interface. Bumped whenever the public struct
+/// layouts or function signatures change in a way a compiled consumer must be
+/// rebuilt for. A consumer can compare this compile-time value from the header
+/// against [`netflow_analyzer_abi_version`] at runtime to detect a header/library
+/// mismatch before using the API.
+pub const NETFLOW_ANALYZER_ABI_VERSION: u32 = 1;
+
 /// C-compatible callback invoked whenever a flow is emitted: from the
 /// background aging thread on idle eviction or active-timeout rollover, and
 /// synchronously on the thread that calls `netflow_analyzer_flush` or
@@ -134,6 +141,11 @@ pub struct NetflowAnalyzerConfig {
     pub clock_fallback_to_receipt_time: bool,
     /// Maximum accepted clock skew, in nanoseconds. Zero selects the default.
     pub max_clock_skew_ns: u64,
+    /// Reserved for future settings. The caller must zero these (zero-initialize
+    /// the whole struct); the engine ignores them today, so a new field added
+    /// here later defaults to "unset" for callers that only zeroed it. Kept so
+    /// the struct can grow without changing its size or ABI.
+    pub reserved: [u64; 8],
 }
 
 /// Wrapper that lets us move the host's opaque `user_data` pointer onto the
@@ -193,6 +205,16 @@ fn engine_config_from(cfg: &NetflowAnalyzerConfig) -> EngineConfig {
             fallback_to_receipt_time: cfg.clock_fallback_to_receipt_time,
         },
     }
+}
+
+/// Returns the ABI version the linked library was built with
+/// ([`NETFLOW_ANALYZER_ABI_VERSION`]). A consumer should compare it against the
+/// `NETFLOW_ANALYZER_ABI_VERSION` value its header declares and refuse to run on
+/// a mismatch, which signals the header and the linked library disagree on the
+/// public struct layouts or signatures.
+#[no_mangle]
+pub extern "C" fn netflow_analyzer_abi_version() -> u32 {
+    NETFLOW_ANALYZER_ABI_VERSION
 }
 
 /// Constructor exposed to C to initialize the library and start the background
@@ -286,6 +308,7 @@ fn zeroed_stats() -> NetflowAnalyzerStats {
         flows_output: 0,
         flows_dropped: 0,
         active_flows: 0,
+        reserved: [0; 8],
     }
 }
 
@@ -754,6 +777,7 @@ mod tests {
             clock_sync_check_enabled: false,
             clock_fallback_to_receipt_time: false,
             max_clock_skew_ns: 0,
+            reserved: [0; 8],
         };
         let defaults = EngineConfig::default();
         let cfg = engine_config_from(&zero);
@@ -776,6 +800,7 @@ mod tests {
             clock_sync_check_enabled: true,
             clock_fallback_to_receipt_time: true,
             max_clock_skew_ns: 123,
+            reserved: [0; 8],
         };
         let cfg = engine_config_from(&custom);
         assert_eq!(cfg.max_flows, 10);
@@ -1026,6 +1051,7 @@ mod tests {
             clock_sync_check_enabled: true,
             clock_fallback_to_receipt_time: false,
             max_clock_skew_ns: 10,
+            reserved: [0; 8],
         };
         let state = TestState {
             count: AtomicU32::new(0),
@@ -1092,6 +1118,23 @@ mod tests {
     }
 
     #[test]
+    fn abi_version_query_and_reserved_padding() {
+        // The runtime query reports the same version the header declares.
+        assert_eq!(netflow_analyzer_abi_version(), NETFLOW_ANALYZER_ABI_VERSION);
+
+        // Reserved padding is present and zeroed on a real telemetry snapshot.
+        let state = TestState {
+            count: AtomicU32::new(0),
+            last_proto: AtomicU32::new(0),
+        };
+        let ud = &state as *const TestState as *mut c_void;
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), Some(count_cb), ud) };
+        let stats = unsafe { netflow_analyzer_get_stats(ctx) };
+        assert_eq!(stats.reserved, [0u64; 8]);
+        unsafe { netflow_analyzer_destroy(ctx) };
+    }
+
+    #[test]
     fn custom_config_is_applied() {
         let cfg = NetflowAnalyzerConfig {
             max_flows: 1,
@@ -1102,6 +1145,7 @@ mod tests {
             clock_sync_check_enabled: false,
             clock_fallback_to_receipt_time: false,
             max_clock_skew_ns: 0,
+            reserved: [0; 8],
         };
         let state = TestState {
             count: AtomicU32::new(0),

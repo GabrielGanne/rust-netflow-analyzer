@@ -20,6 +20,15 @@
 
 #define NETFLOW_ANALYZER_SCOPE_V5 2
 
+/**
+ * ABI version of this library's C interface. Bumped whenever the public struct
+ * layouts or function signatures change in a way a compiled consumer must be
+ * rebuilt for. A consumer can compare this compile-time value from the header
+ * against [`netflow_analyzer_abi_version`] at runtime to detect a header/library
+ * mismatch before using the API.
+ */
+#define NETFLOW_ANALYZER_ABI_VERSION 1
+
 #define NETFLOW_ANALYZER_PRESENT_FLOW_ID (1 << 0)
 
 #define NETFLOW_ANALYZER_PRESENT_IFACE_IN (1 << 1)
@@ -69,6 +78,13 @@ typedef struct {
      * Maximum accepted clock skew, in nanoseconds. Zero selects the default.
      */
     uint64_t max_clock_skew_ns;
+    /**
+     * Reserved for future settings. The caller must zero these (zero-initialize
+     * the whole struct); the engine ignores them today, so a new field added
+     * here later defaults to "unset" for callers that only zeroed it. Kept so
+     * the struct can grow without changing its size or ABI.
+     */
+    uint64_t reserved[8];
 } NetflowAnalyzerConfig;
 
 typedef struct {
@@ -146,6 +162,12 @@ typedef struct {
      * constants for the individual bit positions.
      */
     uint32_t present;
+    /**
+     * Reserved for future fields. Always zero today; kept so new fields can be
+     * added within this space without changing the struct size or ABI. Which
+     * slots carry meaning is tied to the FFI `netflow_analyzer_abi_version`.
+     */
+    uint64_t reserved[8];
 } NetflowAnalyzerFlowRecord;
 
 /**
@@ -238,6 +260,13 @@ typedef struct {
      * Number of flows currently resident in the state cache.
      */
     uint64_t active_flows;
+    /**
+     * Reserved for future counters. Always zero today; kept so fields can be
+     * added within this space without changing the struct size or ABI. Which
+     * slots carry meaning is tied to the C ABI version reported by the FFI
+     * `netflow_analyzer_abi_version` function.
+     */
+    uint64_t reserved[8];
 } NetflowAnalyzerStats;
 
 /**
@@ -276,6 +305,15 @@ typedef void (*NetflowAnalyzerRecordCallback)(uint32_t observation_domain_id,
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * Returns the ABI version the linked library was built with
+ * ([`NETFLOW_ANALYZER_ABI_VERSION`]). A consumer should compare it against the
+ * `NETFLOW_ANALYZER_ABI_VERSION` value its header declares and refuse to run on
+ * a mismatch, which signals the header and the linked library disagree on the
+ * public struct layouts or signatures.
+ */
+uint32_t netflow_analyzer_abi_version(void);
 
 /**
  * Constructor exposed to C to initialize the library and start the background

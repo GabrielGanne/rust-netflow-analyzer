@@ -544,6 +544,10 @@ pub struct NetflowAnalyzerFlowRecord {
     /// should be rendered as empty rather than a real zero. See the `presence`
     /// constants for the individual bit positions.
     pub present: u32,
+    /// Reserved for future fields. Always zero today; kept so new fields can be
+    /// added within this space without changing the struct size or ABI. Which
+    /// slots carry meaning is tied to the FFI `netflow_analyzer_abi_version`.
+    pub reserved: [u64; 8],
 }
 
 impl FlowFields {
@@ -580,6 +584,7 @@ impl FlowFields {
             original_start_time_ns: self.original_start_time_ns,
             original_end_time_ns: self.original_end_time_ns,
             present: self.present,
+            reserved: [0; 8],
         }
     }
 }

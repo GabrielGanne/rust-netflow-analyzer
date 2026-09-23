@@ -64,6 +64,11 @@ pub struct NetflowAnalyzerStats {
     pub flows_dropped: u64,
     /// Number of flows currently resident in the state cache.
     pub active_flows: u64,
+    /// Reserved for future counters. Always zero today; kept so fields can be
+    /// added within this space without changing the struct size or ABI. Which
+    /// slots carry meaning is tied to the C ABI version reported by the FFI
+    /// `netflow_analyzer_abi_version` function.
+    pub reserved: [u64; 8],
 }
 
 impl InternalCounters {
@@ -81,6 +86,7 @@ impl InternalCounters {
             flows_output: self.flows_output.load(Ordering::Relaxed),
             flows_dropped: self.flows_dropped.load(Ordering::Relaxed),
             active_flows,
+            reserved: [0; 8],
         }
     }
 }
