@@ -204,9 +204,9 @@ fn engine_config_from(cfg: &NetflowAnalyzerConfig) -> EngineConfig {
 /// must remain valid until after `netflow_analyzer_destroy` returns, because
 /// the aging thread can deliver flows at any time until then.
 ///
-/// A **null `callback` is rejected**: the function returns null rather than
-/// storing an invalid function pointer that would later be called. Taking the
-/// parameter as `Option` lets a null pointer from C arrive safely as `None`.
+/// Returns null on failure: a **null `callback`** is rejected (taking the
+/// parameter as `Option` lets a null pointer from C arrive safely as `None`),
+/// and so is a failure to spawn the background aging thread.
 ///
 /// # Safety
 /// `config` must be either null or a valid pointer to a `NetflowAnalyzerConfig`.
@@ -217,37 +217,76 @@ pub unsafe extern "C" fn netflow_analyzer_create(
     callback: NetflowAnalyzerFlowCallback,
     user_data: *mut c_void,
 ) -> *mut NetflowAnalyzerContext {
-    // Reject a null callback instead of accepting an invalid function pointer.
-    let Some(callback) = callback else {
-        return std::ptr::null_mut();
-    };
+    guard_ffi(std::ptr::null_mut(), || unsafe {
+        // Reject a null callback instead of accepting an invalid function pointer.
+        let Some(callback) = callback else {
+            return std::ptr::null_mut();
+        };
 
-    let engine_cfg = if config.is_null() {
-        EngineConfig::default()
-    } else {
-        engine_config_from(&*config)
-    };
+        let engine_cfg = if config.is_null() {
+            EngineConfig::default()
+        } else {
+            engine_config_from(&*config)
+        };
 
-    let internal = Arc::new(FlowContext::with_config(engine_cfg));
-    let user_data = SendUserData(user_data);
+        let internal = Arc::new(FlowContext::with_config(engine_cfg));
+        let user_data = SendUserData(user_data);
 
-    // Bridge the emitted Rust records to the C callback. The user_data pointer
-    // is wrapped so it can cross the thread boundary into the aging worker.
-    internal.start_aging(move |record: &FlowRecord| {
-        emit_record(callback, user_data, record);
-    });
+        // Bridge the emitted Rust records to the C callback. The user_data
+        // pointer is wrapped so it can cross into the aging worker. If the
+        // worker thread cannot be created, hand back null instead of a context.
+        if internal
+            .try_start_aging(move |record: &FlowRecord| {
+                emit_record(callback, user_data, record);
+            })
+            .is_err()
+        {
+            return std::ptr::null_mut();
+        }
 
-    Box::into_raw(Box::new(NetflowAnalyzerContext {
-        internal,
-        callback,
-        user_data,
-    }))
+        Box::into_raw(Box::new(NetflowAnalyzerContext {
+            internal,
+            callback,
+            user_data,
+        }))
+    })
 }
 
 /// Converts a Rust record into its FFI shape and dispatches it to the host.
 fn emit_record(callback: FlowCallbackFn, user_data: SendUserData, record: &FlowRecord) {
     let ffi = record.to_ffi();
     callback(&ffi as *const NetflowAnalyzerFlowRecord, user_data.0);
+}
+
+/// Error code an FFI entry point returns when it catches an internal Rust panic
+/// instead of letting it cross the C ABI boundary.
+const NETFLOW_ANALYZER_INTERNAL_ERROR: i32 = -4;
+
+/// Runs `body`, catching any Rust panic so it never unwinds across the C ABI —
+/// which since Rust 1.81 would otherwise abort the whole host process. A caught
+/// panic yields `on_panic` instead.
+///
+/// `AssertUnwindSafe` is sound here: on a caught panic the only value observed
+/// by C is the fixed `on_panic`, and the engine state lives behind `Arc`/
+/// `DashMap`/atomics, which stay memory-safe across an unwind.
+fn guard_ffi<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(on_panic)
+}
+
+/// A zeroed telemetry snapshot, returned when there is no context to query.
+fn zeroed_stats() -> NetflowAnalyzerStats {
+    NetflowAnalyzerStats {
+        pkts_parsed: 0,
+        pkts_parse_error: 0,
+        malformed_packets: 0,
+        clock_dropped_packets: 0,
+        clock_fallback_packets: 0,
+        templates_received: 0,
+        data_records_processed: 0,
+        flows_output: 0,
+        flows_dropped: 0,
+        active_flows: 0,
+    }
 }
 
 /// Non-blocking telemetry retrieval for a separate monitoring thread.
@@ -258,26 +297,18 @@ fn emit_record(callback: FlowCallbackFn, user_data: SendUserData, record: &FlowR
 pub unsafe extern "C" fn netflow_analyzer_get_stats(
     ctx: *const NetflowAnalyzerContext,
 ) -> NetflowAnalyzerStats {
-    if ctx.is_null() {
-        return NetflowAnalyzerStats {
-            pkts_parsed: 0,
-            pkts_parse_error: 0,
-            malformed_packets: 0,
-            clock_dropped_packets: 0,
-            clock_fallback_packets: 0,
-            templates_received: 0,
-            data_records_processed: 0,
-            flows_output: 0,
-            flows_dropped: 0,
-            active_flows: 0,
-        };
-    }
-    (*ctx).internal.stats()
+    guard_ffi(zeroed_stats(), || unsafe {
+        if ctx.is_null() {
+            return zeroed_stats();
+        }
+        (*ctx).internal.stats()
+    })
 }
 
 /// Core processing entry point called by C worker threads when a datagram
 /// arrives. Returns the number of data records decoded, or a negative error
-/// code (`-1` invalid arguments, `-2` malformed packet, `-3` clock rejection).
+/// code (`-1` invalid arguments, `-2` malformed packet, `-3` clock rejection,
+/// `-4` internal error / caught panic).
 ///
 /// # Safety
 /// `ctx` must be a valid context pointer and `packet_bytes` must point to at
@@ -288,16 +319,17 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet(
     packet_bytes: *const u8,
     length: u32,
 ) -> i32 {
-    if ctx.is_null() || packet_bytes.is_null() {
-        return -1;
-    }
-
-    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    match (*ctx).internal.process_packet(data) {
-        Ok(records) => records as i32,
-        Err(CLOCK_SKEW_ERROR) => -3,
-        Err(_) => -2,
-    }
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() || packet_bytes.is_null() {
+            return -1;
+        }
+        let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+        match (*ctx).internal.process_packet(data) {
+            Ok(records) => records as i32,
+            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(_) => -2,
+        }
+    })
 }
 
 /// Processing entry point with an explicit Unix-nanosecond receipt timestamp.
@@ -312,15 +344,17 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet_at(
     length: u32,
     receipt_time_ns: u64,
 ) -> i32 {
-    if ctx.is_null() || packet_bytes.is_null() {
-        return -1;
-    }
-    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    match (*ctx).internal.process_packet_at(data, receipt_time_ns) {
-        Ok(records) => records as i32,
-        Err(CLOCK_SKEW_ERROR) => -3,
-        Err(_) => -2,
-    }
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() || packet_bytes.is_null() {
+            return -1;
+        }
+        let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+        match (*ctx).internal.process_packet_at(data, receipt_time_ns) {
+            Ok(records) => records as i32,
+            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(_) => -2,
+        }
+    })
 }
 
 /// Like [`netflow_analyzer_process_packet`], but scopes all template, clock, and
@@ -337,15 +371,17 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet_from(
     packet_bytes: *const u8,
     length: u32,
 ) -> i32 {
-    if ctx.is_null() || packet_bytes.is_null() {
-        return -1;
-    }
-    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    match (*ctx).internal.process_packet_from(exporter_key, data) {
-        Ok(records) => records as i32,
-        Err(CLOCK_SKEW_ERROR) => -3,
-        Err(_) => -2,
-    }
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() || packet_bytes.is_null() {
+            return -1;
+        }
+        let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+        match (*ctx).internal.process_packet_from(exporter_key, data) {
+            Ok(records) => records as i32,
+            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(_) => -2,
+        }
+    })
 }
 
 /// Like [`netflow_analyzer_process_packet_from`], with an explicit
@@ -361,25 +397,27 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet_from_at(
     length: u32,
     receipt_time_ns: u64,
 ) -> i32 {
-    if ctx.is_null() || packet_bytes.is_null() {
-        return -1;
-    }
-    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    match (*ctx)
-        .internal
-        .process_packet_from_at(exporter_key, data, receipt_time_ns)
-    {
-        Ok(records) => records as i32,
-        Err(CLOCK_SKEW_ERROR) => -3,
-        Err(_) => -2,
-    }
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() || packet_bytes.is_null() {
+            return -1;
+        }
+        let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+        match (*ctx)
+            .internal
+            .process_packet_from_at(exporter_key, data, receipt_time_ns)
+        {
+            Ok(records) => records as i32,
+            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(_) => -2,
+        }
+    })
 }
 
 /// Decode-only entry point: parses a datagram and invokes `callback` once per
 /// decoded data record, **without** aggregating into the flow cache. Template
 /// state is still updated (it is required to decode). Returns the number of data
 /// records decoded, or a negative error code (`-1` invalid arguments, `-2`
-/// malformed packet, `-3` clock rejection).
+/// malformed packet, `-3` clock rejection, `-4` internal error / caught panic).
 ///
 /// This lets a host run the parser as an independent stage and feed its own
 /// aggregator, mirroring the local `netflow-parser` node.
@@ -395,27 +433,29 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet(
     callback: NetflowAnalyzerRecordCallback,
     user_data: *mut c_void,
 ) -> i32 {
-    if ctx.is_null() || packet_bytes.is_null() {
-        return -1;
-    }
-    // Reject a null callback rather than call an invalid function pointer.
-    let Some(callback) = callback else {
-        return -1;
-    };
-    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
-        let record = fields.to_ffi(exporter, scope);
-        callback(
-            scope.observation_domain(),
-            &record as *const NetflowAnalyzerFlowRecord,
-            user_data,
-        );
-    };
-    match (*ctx).internal.decode_packet_scoped(data, &mut sink) {
-        Ok(records) => records as i32,
-        Err(CLOCK_SKEW_ERROR) => -3,
-        Err(_) => -2,
-    }
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() || packet_bytes.is_null() {
+            return -1;
+        }
+        // Reject a null callback rather than call an invalid function pointer.
+        let Some(callback) = callback else {
+            return -1;
+        };
+        let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+        let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
+            let record = fields.to_ffi(exporter, scope);
+            callback(
+                scope.observation_domain(),
+                &record as *const NetflowAnalyzerFlowRecord,
+                user_data,
+            );
+        };
+        match (*ctx).internal.decode_packet_scoped(data, &mut sink) {
+            Ok(records) => records as i32,
+            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(_) => -2,
+        }
+    })
 }
 
 /// Decode-only entry point with an explicit Unix-nanosecond receipt timestamp.
@@ -432,30 +472,32 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_at(
     callback: NetflowAnalyzerRecordCallback,
     user_data: *mut c_void,
 ) -> i32 {
-    if ctx.is_null() || packet_bytes.is_null() {
-        return -1;
-    }
-    // Reject a null callback rather than call an invalid function pointer.
-    let Some(callback) = callback else {
-        return -1;
-    };
-    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
-        let record = fields.to_ffi(exporter, scope);
-        callback(
-            scope.observation_domain(),
-            &record as *const NetflowAnalyzerFlowRecord,
-            user_data,
-        );
-    };
-    match (*ctx)
-        .internal
-        .decode_packet_scoped_at(data, receipt_time_ns, &mut sink)
-    {
-        Ok(records) => records as i32,
-        Err(CLOCK_SKEW_ERROR) => -3,
-        Err(_) => -2,
-    }
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() || packet_bytes.is_null() {
+            return -1;
+        }
+        // Reject a null callback rather than call an invalid function pointer.
+        let Some(callback) = callback else {
+            return -1;
+        };
+        let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+        let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
+            let record = fields.to_ffi(exporter, scope);
+            callback(
+                scope.observation_domain(),
+                &record as *const NetflowAnalyzerFlowRecord,
+                user_data,
+            );
+        };
+        match (*ctx)
+            .internal
+            .decode_packet_scoped_at(data, receipt_time_ns, &mut sink)
+        {
+            Ok(records) => records as i32,
+            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(_) => -2,
+        }
+    })
 }
 
 /// Like [`netflow_analyzer_decode_packet`], but scopes decoding to the
@@ -473,30 +515,32 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_from(
     callback: NetflowAnalyzerRecordCallback,
     user_data: *mut c_void,
 ) -> i32 {
-    if ctx.is_null() || packet_bytes.is_null() {
-        return -1;
-    }
-    // Reject a null callback rather than call an invalid function pointer.
-    let Some(callback) = callback else {
-        return -1;
-    };
-    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
-        let record = fields.to_ffi(exporter, scope);
-        callback(
-            scope.observation_domain(),
-            &record as *const NetflowAnalyzerFlowRecord,
-            user_data,
-        );
-    };
-    match (*ctx)
-        .internal
-        .decode_packet_from(exporter_key, data, &mut sink)
-    {
-        Ok(records) => records as i32,
-        Err(CLOCK_SKEW_ERROR) => -3,
-        Err(_) => -2,
-    }
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() || packet_bytes.is_null() {
+            return -1;
+        }
+        // Reject a null callback rather than call an invalid function pointer.
+        let Some(callback) = callback else {
+            return -1;
+        };
+        let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+        let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
+            let record = fields.to_ffi(exporter, scope);
+            callback(
+                scope.observation_domain(),
+                &record as *const NetflowAnalyzerFlowRecord,
+                user_data,
+            );
+        };
+        match (*ctx)
+            .internal
+            .decode_packet_from(exporter_key, data, &mut sink)
+        {
+            Ok(records) => records as i32,
+            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(_) => -2,
+        }
+    })
 }
 
 /// Like [`netflow_analyzer_decode_packet_from`], with an explicit
@@ -514,30 +558,32 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_from_at(
     callback: NetflowAnalyzerRecordCallback,
     user_data: *mut c_void,
 ) -> i32 {
-    if ctx.is_null() || packet_bytes.is_null() {
-        return -1;
-    }
-    // Reject a null callback rather than call an invalid function pointer.
-    let Some(callback) = callback else {
-        return -1;
-    };
-    let data = std::slice::from_raw_parts(packet_bytes, length as usize);
-    let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
-        let record = fields.to_ffi(exporter, scope);
-        callback(
-            scope.observation_domain(),
-            &record as *const NetflowAnalyzerFlowRecord,
-            user_data,
-        );
-    };
-    match (*ctx)
-        .internal
-        .decode_packet_from_at(exporter_key, data, receipt_time_ns, &mut sink)
-    {
-        Ok(records) => records as i32,
-        Err(CLOCK_SKEW_ERROR) => -3,
-        Err(_) => -2,
-    }
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() || packet_bytes.is_null() {
+            return -1;
+        }
+        // Reject a null callback rather than call an invalid function pointer.
+        let Some(callback) = callback else {
+            return -1;
+        };
+        let data = std::slice::from_raw_parts(packet_bytes, length as usize);
+        let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
+            let record = fields.to_ffi(exporter, scope);
+            callback(
+                scope.observation_domain(),
+                &record as *const NetflowAnalyzerFlowRecord,
+                user_data,
+            );
+        };
+        match (*ctx)
+            .internal
+            .decode_packet_from_at(exporter_key, data, receipt_time_ns, &mut sink)
+        {
+            Ok(records) => records as i32,
+            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(_) => -2,
+        }
+    })
 }
 
 /// Forces every cached flow to be emitted through the callback immediately.
@@ -547,15 +593,17 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_from_at(
 /// `ctx` must be null or a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn netflow_analyzer_flush(ctx: *const NetflowAnalyzerContext) {
-    if ctx.is_null() {
-        return;
-    }
-    let context = &*ctx;
-    let callback = context.callback;
-    let user_data = context.user_data;
-    context
-        .internal
-        .flush(move |record| emit_record(callback, user_data, record));
+    guard_ffi((), || unsafe {
+        if ctx.is_null() {
+            return;
+        }
+        let context = &*ctx;
+        let callback = context.callback;
+        let user_data = context.user_data;
+        context
+            .internal
+            .flush(move |record| emit_record(callback, user_data, record));
+    })
 }
 
 /// Purges all cached state for one exporter/transport session, reclaiming its
@@ -586,17 +634,19 @@ pub unsafe extern "C" fn netflow_analyzer_purge_exporter(
     ctx: *const NetflowAnalyzerContext,
     exporter_key: u64,
 ) -> i32 {
-    if ctx.is_null() {
-        return -1;
-    }
-    let context = &*ctx;
-    let callback = context.callback;
-    let user_data = context.user_data;
-    context
-        .internal
-        .purge_exporter(exporter_key, move |record| {
-            emit_record(callback, user_data, record)
-        }) as i32
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() {
+            return -1;
+        }
+        let context = &*ctx;
+        let callback = context.callback;
+        let user_data = context.user_data;
+        context
+            .internal
+            .purge_exporter(exporter_key, move |record| {
+                emit_record(callback, user_data, record)
+            }) as i32
+    })
 }
 
 /// Destructor exposed to C. Stops the aging thread and releases all memory.
@@ -626,12 +676,14 @@ pub unsafe extern "C" fn netflow_analyzer_purge_exporter(
 /// concurrently with this one.
 #[no_mangle]
 pub unsafe extern "C" fn netflow_analyzer_destroy(ctx: *mut NetflowAnalyzerContext) {
-    if ctx.is_null() {
-        return;
-    }
-    let context = Box::from_raw(ctx);
-    context.internal.stop_aging();
-    // `context` drops here, releasing the engine and its caches.
+    guard_ffi((), || unsafe {
+        if ctx.is_null() {
+            return;
+        }
+        let context = Box::from_raw(ctx);
+        context.internal.stop_aging();
+        // `context` drops here, releasing the engine and its caches.
+    })
 }
 
 #[cfg(test)]
@@ -1022,6 +1074,21 @@ mod tests {
         // function pointer is stored.
         let ctx = unsafe { netflow_analyzer_create(ptr::null(), None, ptr::null_mut()) };
         assert!(ctx.is_null());
+    }
+
+    #[test]
+    fn guard_ffi_catches_panics() {
+        // A panic inside a guarded body is caught and the default is returned,
+        // so no unwind can cross the C ABI boundary (which would otherwise abort
+        // the process). Silence the panic hook to keep test output clean.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || panic!("boom"));
+        std::panic::set_hook(prev);
+        assert_eq!(caught, NETFLOW_ANALYZER_INTERNAL_ERROR);
+
+        // The happy path returns the body's value unchanged.
+        assert_eq!(guard_ffi(-1, || 5), 5);
     }
 
     #[test]

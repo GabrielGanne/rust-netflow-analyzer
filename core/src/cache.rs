@@ -406,12 +406,15 @@ pub struct AgingHandle {
 
 impl AgingHandle {
     /// Spawns a low-overhead background worker that periodically sweeps `flows`.
+    ///
+    /// Returns the OS error if the worker thread cannot be created, rather than
+    /// panicking, so FFI callers can surface the failure without unwinding.
     pub fn spawn<F>(
         flows: Arc<FlowCache>,
         counters: Arc<InternalCounters>,
         cfg: AgingConfig,
         on_emit: F,
-    ) -> Self
+    ) -> std::io::Result<Self>
     where
         F: Fn(&FlowRecord) + Send + Sync + 'static,
     {
@@ -437,13 +440,12 @@ impl AgingHandle {
 
                     flows.sweep(&cfg, &counters, &on_emit);
                 }
-            })
-            .expect("failed to spawn aging thread");
+            })?;
 
-        Self {
+        Ok(Self {
             running,
             join: Some(join),
-        }
+        })
     }
 
     /// Signals the worker to stop and blocks until it has fully exited.
@@ -855,7 +857,8 @@ mod tests {
         let sink = emitted.clone();
         let mut handle = AgingHandle::spawn(flows.clone(), counters.clone(), cfg, move |_r| {
             sink.fetch_add(1, Ordering::Relaxed);
-        });
+        })
+        .expect("spawn aging thread");
 
         // Give the worker time to perform at least one sweep.
         thread::sleep(Duration::from_millis(300));

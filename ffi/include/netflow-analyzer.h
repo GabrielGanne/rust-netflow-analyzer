@@ -287,9 +287,9 @@ extern "C" {
  * must remain valid until after `netflow_analyzer_destroy` returns, because
  * the aging thread can deliver flows at any time until then.
  *
- * A **null `callback` is rejected**: the function returns null rather than
- * storing an invalid function pointer that would later be called. Taking the
- * parameter as `Option` lets a null pointer from C arrive safely as `None`.
+ * Returns null on failure: a **null `callback`** is rejected (taking the
+ * parameter as `Option` lets a null pointer from C arrive safely as `None`),
+ * and so is a failure to spawn the background aging thread.
  *
  * # Safety
  * `config` must be either null or a valid pointer to a `NetflowAnalyzerConfig`.
@@ -310,7 +310,8 @@ NetflowAnalyzerStats netflow_analyzer_get_stats(const NetflowAnalyzerContext *ct
 /**
  * Core processing entry point called by C worker threads when a datagram
  * arrives. Returns the number of data records decoded, or a negative error
- * code (`-1` invalid arguments, `-2` malformed packet, `-3` clock rejection).
+ * code (`-1` invalid arguments, `-2` malformed packet, `-3` clock rejection,
+ * `-4` internal error / caught panic).
  *
  * # Safety
  * `ctx` must be a valid context pointer and `packet_bytes` must point to at
@@ -364,7 +365,7 @@ int32_t netflow_analyzer_process_packet_from_at(const NetflowAnalyzerContext *ct
  * decoded data record, **without** aggregating into the flow cache. Template
  * state is still updated (it is required to decode). Returns the number of data
  * records decoded, or a negative error code (`-1` invalid arguments, `-2`
- * malformed packet, `-3` clock rejection).
+ * malformed packet, `-3` clock rejection, `-4` internal error / caught panic).
  *
  * This lets a host run the parser as an independent stage and feed its own
  * aggregator, mirroring the local `netflow-parser` node.

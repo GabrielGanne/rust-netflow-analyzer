@@ -571,7 +571,22 @@ impl FlowContext {
     /// (over the FFI) `netflow_analyzer_create` / `netflow_analyzer_destroy` — is
     /// expected to be driven by a **single controlling thread**; these methods
     /// are not designed to be invoked concurrently with one another.
+    ///
+    /// Panics if the background worker thread cannot be spawned. Use
+    /// [`Self::try_start_aging`] to handle that failure instead of unwinding
+    /// (the C ABI does).
     pub fn start_aging<F>(&self, on_emit: F)
+    where
+        F: Fn(&FlowRecord) + Send + Sync + 'static,
+    {
+        self.try_start_aging(on_emit)
+            .expect("failed to spawn the netflow aging thread");
+    }
+
+    /// Fallible form of [`Self::start_aging`]: returns the OS error instead of
+    /// panicking when the background worker thread cannot be created. On success
+    /// any previously running aging thread is stopped.
+    pub fn try_start_aging<F>(&self, on_emit: F) -> std::io::Result<()>
     where
         F: Fn(&FlowRecord) + Send + Sync + 'static,
     {
@@ -580,15 +595,18 @@ impl FlowContext {
             self.counters.clone(),
             self.aging_cfg,
             on_emit,
-        );
+        )?;
         // Swap the new handle in under the lock, then drop the previous one only
         // after the lock is released: dropping it joins its worker, and holding
         // `aging` across that join would deadlock a callback that locks `aging`.
+        // A poisoned lock is recovered rather than propagated as a panic: the
+        // guarded `Option<AgingHandle>` is always in a valid state.
         let previous = {
-            let mut guard = self.aging.lock().expect("aging mutex poisoned");
+            let mut guard = self.aging.lock().unwrap_or_else(|e| e.into_inner());
             guard.replace(handle)
         };
         drop(previous);
+        Ok(())
     }
 
     /// Stops the background aging thread, if running. When called by the single
@@ -607,7 +625,7 @@ impl FlowContext {
         // lock is released. Joining while holding `aging` would deadlock if the
         // worker's callback tries to lock `aging` (e.g. a re-entrant stop_aging).
         let handle = {
-            let mut guard = self.aging.lock().expect("aging mutex poisoned");
+            let mut guard = self.aging.lock().unwrap_or_else(|e| e.into_inner());
             guard.take()
         };
         if let Some(mut handle) = handle {
