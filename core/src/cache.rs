@@ -447,9 +447,21 @@ impl AgingHandle {
     }
 
     /// Signals the worker to stop and blocks until it has fully exited.
+    ///
+    /// If called from the aging thread itself — for example an emission callback
+    /// that tries to tear the engine down — the join is **skipped**: a thread
+    /// cannot join itself (that can deadlock or panic depending on the
+    /// platform). The worker has already been told to stop and will exit after
+    /// the current sweep; the handle is detached instead. Tearing the engine
+    /// down from within its own callback is misuse — see the shutdown-sequence
+    /// documentation on `netflow_analyzer_destroy` / [`crate::FlowContext::stop_aging`].
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.join.take() {
+            if handle.thread().id() == thread::current().id() {
+                // Detach rather than join ourselves; the worker exits on its own.
+                return;
+            }
             let _ = handle.join();
         }
     }

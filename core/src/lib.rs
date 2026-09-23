@@ -566,6 +566,11 @@ impl FlowContext {
     /// flows are rolled over; both events are delivered through `on_emit`.
     ///
     /// Calling this again first stops any previously running aging thread.
+    ///
+    /// Aging lifecycle control — [`Self::start_aging`], [`Self::stop_aging`], and
+    /// (over the FFI) `netflow_analyzer_create` / `netflow_analyzer_destroy` — is
+    /// expected to be driven by a **single controlling thread**; these methods
+    /// are not designed to be invoked concurrently with one another.
     pub fn start_aging<F>(&self, on_emit: F)
     where
         F: Fn(&FlowRecord) + Send + Sync + 'static,
@@ -576,14 +581,36 @@ impl FlowContext {
             self.aging_cfg,
             on_emit,
         );
-        let mut guard = self.aging.lock().expect("aging mutex poisoned");
-        *guard = Some(handle); // dropping the old handle joins its thread
+        // Swap the new handle in under the lock, then drop the previous one only
+        // after the lock is released: dropping it joins its worker, and holding
+        // `aging` across that join would deadlock a callback that locks `aging`.
+        let previous = {
+            let mut guard = self.aging.lock().expect("aging mutex poisoned");
+            guard.replace(handle)
+        };
+        drop(previous);
     }
 
-    /// Stops the background aging thread, if running.
+    /// Stops the background aging thread, if running. When called by the single
+    /// controlling thread (see [`Self::start_aging`]) it blocks until the worker
+    /// has exited.
+    ///
+    /// Calling it re-entrantly from within an emission callback (on the aging
+    /// thread itself) is **unsupported**, but is made non-deadlocking as a safety
+    /// net so a misbehaving callback — or a `netflow_analyzer_destroy` mistakenly
+    /// issued from one — cannot hang the process: a thread cannot join itself, so
+    /// the handle is detached and this returns without waiting. In that case the
+    /// worker is not guaranteed to have stopped when this returns, so do not rely
+    /// on callback-invoked stop for shutdown.
     pub fn stop_aging(&self) {
-        let mut guard = self.aging.lock().expect("aging mutex poisoned");
-        if let Some(mut handle) = guard.take() {
+        // Take the handle out under the lock, then stop/join it only after the
+        // lock is released. Joining while holding `aging` would deadlock if the
+        // worker's callback tries to lock `aging` (e.g. a re-entrant stop_aging).
+        let handle = {
+            let mut guard = self.aging.lock().expect("aging mutex poisoned");
+            guard.take()
+        };
+        if let Some(mut handle) = handle {
             handle.stop();
         }
     }

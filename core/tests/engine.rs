@@ -352,3 +352,43 @@ fn purge_exporter_emits_flows_then_drops_template_and_clock_state() {
     assert_eq!(ctx.templates.len(), 2);
     assert_eq!(ctx.clocks.len(), 2);
 }
+
+#[test]
+fn stop_aging_from_within_callback_does_not_deadlock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    // An emission callback that tears the engine down runs on the aging thread
+    // itself. `stop_aging` must not try to join that thread with itself (which
+    // can deadlock or panic); it detaches instead. This mirrors the misuse of
+    // calling `netflow_analyzer_destroy` from a flow callback.
+    let cfg = EngineConfig {
+        aging: AgingConfig {
+            idle_timeout: Duration::ZERO, // the decoded flow is immediately idle
+            active_timeout: Duration::from_secs(3600),
+            scan_interval: Duration::from_millis(10),
+        },
+        ..EngineConfig::default()
+    };
+    let ctx = Arc::new(FlowContext::with_config(cfg));
+    ctx.process_packet(&sample_v9_packet()).expect("parse ok");
+
+    // Set only *after* the re-entrant stop returns, so a self-join deadlock
+    // would leave this false forever.
+    let completed = Arc::new(AtomicBool::new(false));
+    let ctx_cb = ctx.clone();
+    let completed_cb = completed.clone();
+    ctx.start_aging(move |_rec| {
+        ctx_cb.stop_aging();
+        completed_cb.store(true, Ordering::Relaxed);
+    });
+
+    let start = Instant::now();
+    while !completed.load(Ordering::Relaxed) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "stop_aging from the aging callback never returned (deadlocked)"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

@@ -462,9 +462,29 @@ int32_t netflow_analyzer_purge_exporter(const NetflowAnalyzerContext *ctx, uint6
 /**
  * Destructor exposed to C. Stops the aging thread and releases all memory.
  *
+ * # Required shutdown sequence
+ * `ctx` is freed here, so the caller must quiesce all use of it **first**:
+ *
+ * 1. Stop feeding the context: ensure no thread is in, or will enter, any
+ *    `netflow_analyzer_*` call for this `ctx` (processing, decoding, stats,
+ *    flush, or purge). Destroy is **not** synchronized against concurrent
+ *    calls — one racing an in-flight call is a use-after-free.
+ * 2. Optionally call `netflow_analyzer_flush` once (from that same quiesced
+ *    context) to emit residual flows before teardown.
+ * 3. Call `netflow_analyzer_destroy` exactly once.
+ *
+ * Do **not** call this from inside the flow or record callback: it runs on the
+ * aging thread (or a `flush`/`purge` caller) and would tear down the very
+ * engine that is mid-emit. `stop_aging` detaches rather than joins itself in
+ * that case (so it will not deadlock), but the context is still freed while the
+ * worker may run, so treat destruction-from-callback as unsupported. Calling
+ * `netflow_analyzer_destroy(NULL)` and double-free are the caller's
+ * responsibility to avoid; only a null pointer is handled as a no-op.
+ *
  * # Safety
  * `ctx` must be null or a pointer previously returned by `netflow_analyzer_create`,
- * and must not be used afterwards.
+ * must not be used afterwards, and no other call using `ctx` may run
+ * concurrently with this one.
  */
 void netflow_analyzer_destroy(NetflowAnalyzerContext *ctx);
 
