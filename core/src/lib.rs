@@ -625,11 +625,10 @@ impl FlowContext {
     /// the same dispatch fencing the identity model requires for listener key
     /// rotation.
     ///
-    /// Like [`Self::flush`], purge acquires cache locks, so it must not be
-    /// called from within an emission callback (a background aging sweep, a
-    /// `flush`, or another purge) that is still holding those locks, or it will
-    /// deadlock. Moving emission callbacks outside the cache locks is tracked
-    /// separately as FFI-safety work.
+    /// Emission callbacks (aging sweep, [`Self::flush`], and purge itself) run
+    /// with no cache lock held, so calling purge from within one does not
+    /// deadlock. Be aware it re-enters the emission callback for each flow it
+    /// drains, and the non-atomicity above still applies.
     pub fn purge_exporter<F>(&self, exporter: ExporterKey, on_emit: F) -> usize
     where
         F: Fn(&FlowRecord),

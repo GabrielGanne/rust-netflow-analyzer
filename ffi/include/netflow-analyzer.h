@@ -149,9 +149,49 @@ typedef struct {
 } NetflowAnalyzerFlowRecord;
 
 /**
- * C-compatible callback invoked whenever a flow is emitted (idle eviction,
- * active-timeout rollover, or explicit flush). The `record` pointer is only
- * valid for the duration of the call; copy out anything you need to retain.
+ * C-compatible callback invoked whenever a flow is emitted: from the
+ * background aging thread on idle eviction or active-timeout rollover, and
+ * synchronously on the thread that calls `netflow_analyzer_flush` or
+ * `netflow_analyzer_purge_exporter`.
+ *
+ * Callback contract (the decode-only [`NetflowAnalyzerRecordCallback`] has a
+ * separate, per-call contract documented on that type):
+ *
+ * - Non-null: the callback pointer passed to `netflow_analyzer_create` must be
+ *   a valid, non-null function pointer. Passing null is undefined behaviour;
+ *   the engine calls it unconditionally on every emission. `record` is always
+ *   non-null and points to a valid record for the duration of the call.
+ *   `user_data` is whatever was supplied at creation and may be null if the
+ *   host chose so.
+ * - Thread: this callback may run on the engine's internal aging thread *or*
+ *   on any host thread that calls `netflow_analyzer_flush` /
+ *   `netflow_analyzer_purge_exporter`, so treat it as potentially concurrent
+ *   with the host's own threads.
+ * - `record` lifetime: the pointer is borrowed and valid only for the duration
+ *   of the call. Copy out any fields you need to retain; never store the
+ *   pointer or dereference it after returning.
+ * - `user_data` lifetime and synchronization: the engine stores the pointer
+ *   verbatim and hands it back unchanged on every call. The host owns it and
+ *   must keep whatever it points to valid for as long as the callback can
+ *   still run: the aging thread may deliver flows until
+ *   `netflow_analyzer_destroy` returns, and a `flush`/`purge` call until that
+ *   call returns. `netflow_analyzer_destroy` joins the aging thread but does
+ *   **not** fence concurrent host calls, so quiesce all other API calls before
+ *   destroying. Synchronize any access the callback makes with the host's own
+ *   threads.
+ * - Reentrancy and duration: the engine holds no internal cache lock while
+ *   invoking the callback, so calling back into the engine does not deadlock.
+ *   Read-only calls (for example `netflow_analyzer_get_stats`) are safe.
+ *   Packet ingestion is safe *except* for a key currently being purged: when
+ *   this callback was entered from `netflow_analyzer_purge_exporter`,
+ *   ingesting for that exporter mid-purge can orphan state (see that
+ *   function's contract). `netflow_analyzer_flush` and
+ *   `netflow_analyzer_purge_exporter` re-enter this same callback once per
+ *   flow they emit, so call them only if the callback is re-entrant. It must
+ *   **not** call `netflow_analyzer_destroy`. It runs on the aging thread or on
+ *   the thread that called `flush`/`purge` (packet-processing calls never
+ *   dispatch it), and should return promptly and must not block, since a slow
+ *   callback stalls aging or the `flush`/`purge` call.
  */
 typedef void (*NetflowAnalyzerFlowCallback)(const NetflowAnalyzerFlowRecord *record, void *user_data);
 
@@ -203,9 +243,30 @@ typedef struct {
 /**
  * C-compatible callback invoked once per decoded data record on the decode-only
  * path (`netflow_analyzer_decode_packet[_at]`), before any aggregation. The
- * `observation_domain_id` scopes the record (NetFlow v5 reports `0`). The
- * `record` pointer is only valid for the duration of the call; copy out anything
- * you need to retain.
+ * `observation_domain_id` scopes the record (NetFlow v5 reports `0`).
+ *
+ * Unlike [`NetflowAnalyzerFlowCallback`], this callback is **not** registered
+ * on the context: it is passed to a single `netflow_analyzer_decode_packet*`
+ * call and used only during that call. Contract:
+ *
+ * - Non-null: the callback pointer passed to the decode function must be a
+ *   valid, non-null function pointer (passing null is undefined behaviour).
+ *   `record` is always non-null and valid for the duration of the call;
+ *   `user_data` is whatever was passed to that decode call and may be null.
+ * - Thread: it always runs **synchronously on the thread that called
+ *   `netflow_analyzer_decode_packet*`** — never the aging thread.
+ * - `record` lifetime: the pointer is borrowed and valid only for the duration
+ *   of the call. Copy out any fields you need to retain; never store it.
+ * - `user_data` lifetime: the decode call only needs it to stay valid until
+ *   that call returns; it is not retained afterwards.
+ * - Reentrancy and duration: the engine holds no internal cache lock while
+ *   invoking the callback, so calling back into the engine does not deadlock.
+ *   Do **not** purge the exporter being decoded from within this callback: the
+ *   enclosing `netflow_analyzer_decode_packet*` call keeps walking later Sets
+ *   afterward and can repopulate that key's template/clock state, defeating the
+ *   purge — defer a same-key purge until the decode call returns. It must
+ *   **not** call `netflow_analyzer_destroy`, and it should return promptly and
+ *   must not block.
  */
 typedef void (*NetflowAnalyzerRecordCallback)(uint32_t observation_domain_id,
                                               const NetflowAnalyzerFlowRecord *record,
@@ -219,9 +280,16 @@ extern "C" {
  * Constructor exposed to C to initialize the library and start the background
  * aging thread. Pass a null `config` to use the built-in defaults.
  *
+ * `callback` receives every emitted flow; see [`NetflowAnalyzerFlowCallback`]
+ * for its full contract (non-null requirement, callback thread, `record` and
+ * `user_data` lifetimes, reentrancy). The registered callback and `user_data`
+ * must remain valid until after `netflow_analyzer_destroy` returns, because
+ * the aging thread can deliver flows at any time until then.
+ *
  * # Safety
  * `config` must be either null or a valid pointer to a `NetflowAnalyzerConfig`.
- * `user_data` is stored verbatim and handed back to `callback` unchanged.
+ * `callback` must be a valid, non-null function pointer. `user_data` is stored
+ * verbatim and handed back to `callback` unchanged.
  */
 NetflowAnalyzerContext *netflow_analyzer_create(const NetflowAnalyzerConfig *config,
                                                 NetflowAnalyzerFlowCallback callback,
@@ -378,8 +446,9 @@ void netflow_analyzer_flush(const NetflowAnalyzerContext *ctx);
  * `netflow_analyzer_decode_packet*` entry point (the decode variants still
  * update template and clock state), including the key-`0` functions that map
  * to the reserved single-exporter key; otherwise state added mid-purge can be
- * orphaned. Do not call this from inside the flow callback while an aging
- * sweep or `netflow_analyzer_flush` is in progress, as that would deadlock.
+ * orphaned. Callbacks run with no cache lock held, so calling this from inside
+ * the flow callback does not deadlock; note it re-enters that callback once
+ * per drained flow.
  *
  * # Safety
  * `ctx` must be null or a valid context pointer.
