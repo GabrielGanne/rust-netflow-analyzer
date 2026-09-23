@@ -30,11 +30,11 @@ pub const NETFLOW_ANALYZER_SCOPE_V5: u8 = 2;
 /// separate, per-call contract documented on that type):
 ///
 /// - Non-null: the callback pointer passed to `netflow_analyzer_create` must be
-///   a valid, non-null function pointer. Passing null is undefined behaviour;
-///   the engine calls it unconditionally on every emission. `record` is always
-///   non-null and points to a valid record for the duration of the call.
-///   `user_data` is whatever was supplied at creation and may be null if the
-///   host chose so.
+///   a valid function pointer. A null callback is **rejected** —
+///   `netflow_analyzer_create` returns null rather than registering it — so it
+///   is never stored or called. `record` is always non-null and points to a
+///   valid record for the duration of the call. `user_data` is whatever was
+///   supplied at creation and may be null if the host chose so.
 /// - Thread: this callback may run on the engine's internal aging thread *or*
 ///   on any host thread that calls `netflow_analyzer_flush` /
 ///   `netflow_analyzer_purge_exporter`, so treat it as potentially concurrent
@@ -65,7 +65,7 @@ pub const NETFLOW_ANALYZER_SCOPE_V5: u8 = 2;
 ///   dispatch it), and should return promptly and must not block, since a slow
 ///   callback stalls aging or the `flush`/`purge` call.
 pub type NetflowAnalyzerFlowCallback =
-    extern "C" fn(record: *const NetflowAnalyzerFlowRecord, user_data: *mut c_void);
+    Option<extern "C" fn(record: *const NetflowAnalyzerFlowRecord, user_data: *mut c_void)>;
 
 /// C-compatible callback invoked once per decoded data record on the decode-only
 /// path (`netflow_analyzer_decode_packet[_at]`), before any aggregation. The
@@ -76,9 +76,10 @@ pub type NetflowAnalyzerFlowCallback =
 /// call and used only during that call. Contract:
 ///
 /// - Non-null: the callback pointer passed to the decode function must be a
-///   valid, non-null function pointer (passing null is undefined behaviour).
-///   `record` is always non-null and valid for the duration of the call;
-///   `user_data` is whatever was passed to that decode call and may be null.
+///   valid function pointer. A null callback is **rejected** — the decode
+///   function returns `-1` and decodes nothing. `record` is always non-null and
+///   valid for the duration of the call; `user_data` is whatever was passed to
+///   that decode call and may be null.
 /// - Thread: it always runs **synchronously on the thread that called
 ///   `netflow_analyzer_decode_packet*`** — never the aging thread.
 /// - `record` lifetime: the pointer is borrowed and valid only for the duration
@@ -93,11 +94,13 @@ pub type NetflowAnalyzerFlowCallback =
 ///   purge — defer a same-key purge until the decode call returns. It must
 ///   **not** call `netflow_analyzer_destroy`, and it should return promptly and
 ///   must not block.
-pub type NetflowAnalyzerRecordCallback = extern "C" fn(
-    observation_domain_id: u32,
-    record: *const NetflowAnalyzerFlowRecord,
-    user_data: *mut c_void,
-);
+pub type NetflowAnalyzerRecordCallback = Option<
+    extern "C" fn(
+        observation_domain_id: u32,
+        record: *const NetflowAnalyzerFlowRecord,
+        user_data: *mut c_void,
+    ),
+>;
 
 // Presence bits for `NetflowAnalyzerFlowRecord::present`. A field whose bit is
 // clear was not exported by the source records: its value is `0` and should be
@@ -141,10 +144,17 @@ struct SendUserData(*mut c_void);
 unsafe impl Send for SendUserData {}
 unsafe impl Sync for SendUserData {}
 
+/// Bare function-pointer form of [`NetflowAnalyzerFlowCallback`]. The public
+/// type is `Option<..>` so a null pointer from C is representable and rejected
+/// at the boundary; once validated as non-null it is stored and passed around
+/// as this non-optional pointer.
+type FlowCallbackFn =
+    extern "C" fn(record: *const NetflowAnalyzerFlowRecord, user_data: *mut c_void);
+
 /// Opaque handle handed back to C. Holds the engine plus the emission callback.
 pub struct NetflowAnalyzerContext {
     internal: Arc<FlowContext>,
-    callback: NetflowAnalyzerFlowCallback,
+    callback: FlowCallbackFn,
     user_data: SendUserData,
 }
 
@@ -194,16 +204,24 @@ fn engine_config_from(cfg: &NetflowAnalyzerConfig) -> EngineConfig {
 /// must remain valid until after `netflow_analyzer_destroy` returns, because
 /// the aging thread can deliver flows at any time until then.
 ///
+/// A **null `callback` is rejected**: the function returns null rather than
+/// storing an invalid function pointer that would later be called. Taking the
+/// parameter as `Option` lets a null pointer from C arrive safely as `None`.
+///
 /// # Safety
 /// `config` must be either null or a valid pointer to a `NetflowAnalyzerConfig`.
-/// `callback` must be a valid, non-null function pointer. `user_data` is stored
-/// verbatim and handed back to `callback` unchanged.
+/// `user_data` is stored verbatim and handed back to `callback` unchanged.
 #[no_mangle]
 pub unsafe extern "C" fn netflow_analyzer_create(
     config: *const NetflowAnalyzerConfig,
     callback: NetflowAnalyzerFlowCallback,
     user_data: *mut c_void,
 ) -> *mut NetflowAnalyzerContext {
+    // Reject a null callback instead of accepting an invalid function pointer.
+    let Some(callback) = callback else {
+        return std::ptr::null_mut();
+    };
+
     let engine_cfg = if config.is_null() {
         EngineConfig::default()
     } else {
@@ -227,11 +245,7 @@ pub unsafe extern "C" fn netflow_analyzer_create(
 }
 
 /// Converts a Rust record into its FFI shape and dispatches it to the host.
-fn emit_record(
-    callback: NetflowAnalyzerFlowCallback,
-    user_data: SendUserData,
-    record: &FlowRecord,
-) {
+fn emit_record(callback: FlowCallbackFn, user_data: SendUserData, record: &FlowRecord) {
     let ffi = record.to_ffi();
     callback(&ffi as *const NetflowAnalyzerFlowRecord, user_data.0);
 }
@@ -384,6 +398,10 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet(
     if ctx.is_null() || packet_bytes.is_null() {
         return -1;
     }
+    // Reject a null callback rather than call an invalid function pointer.
+    let Some(callback) = callback else {
+        return -1;
+    };
     let data = std::slice::from_raw_parts(packet_bytes, length as usize);
     let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
         let record = fields.to_ffi(exporter, scope);
@@ -417,6 +435,10 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_at(
     if ctx.is_null() || packet_bytes.is_null() {
         return -1;
     }
+    // Reject a null callback rather than call an invalid function pointer.
+    let Some(callback) = callback else {
+        return -1;
+    };
     let data = std::slice::from_raw_parts(packet_bytes, length as usize);
     let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
         let record = fields.to_ffi(exporter, scope);
@@ -454,6 +476,10 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_from(
     if ctx.is_null() || packet_bytes.is_null() {
         return -1;
     }
+    // Reject a null callback rather than call an invalid function pointer.
+    let Some(callback) = callback else {
+        return -1;
+    };
     let data = std::slice::from_raw_parts(packet_bytes, length as usize);
     let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
         let record = fields.to_ffi(exporter, scope);
@@ -491,6 +517,10 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_from_at(
     if ctx.is_null() || packet_bytes.is_null() {
         return -1;
     }
+    // Reject a null callback rather than call an invalid function pointer.
+    let Some(callback) = callback else {
+        return -1;
+    };
     let data = std::slice::from_raw_parts(packet_bytes, length as usize);
     let mut sink = |exporter: ExporterKey, scope: Scope, fields: &FlowFields| {
         let record = fields.to_ffi(exporter, scope);
@@ -694,7 +724,7 @@ mod tests {
         };
         let ud = &state as *const TestState as *mut c_void;
 
-        let ctx = unsafe { netflow_analyzer_create(ptr::null(), count_cb, ud) };
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), Some(count_cb), ud) };
         assert!(!ctx.is_null());
 
         let packet = v9_packet();
@@ -774,7 +804,7 @@ mod tests {
     fn process_packet_from_scopes_by_exporter() {
         let keys: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
         let ud = &keys as *const std::sync::Mutex<Vec<u64>> as *mut c_void;
-        let ctx = unsafe { netflow_analyzer_create(ptr::null(), exporter_cb, ud) };
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), Some(exporter_cb), ud) };
 
         // Same datagram under two exporter keys must not aggregate together.
         let packet = v9_packet();
@@ -808,7 +838,7 @@ mod tests {
     fn purge_exporter_emits_flows_and_resets_state() {
         let keys: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
         let ud = &keys as *const std::sync::Mutex<Vec<u64>> as *mut c_void;
-        let ctx = unsafe { netflow_analyzer_create(ptr::null(), exporter_cb, ud) };
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), Some(exporter_cb), ud) };
 
         let packet = v9_packet();
         for key in [1u64, 2] {
@@ -850,11 +880,17 @@ mod tests {
             last_proto: AtomicU32::new(0),
         };
         let ud = &state as *const TestState as *mut c_void;
-        let ctx = unsafe { netflow_analyzer_create(ptr::null(), count_cb, ud) };
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), Some(count_cb), ud) };
 
         let packet = v9_packet();
         let n = unsafe {
-            netflow_analyzer_decode_packet(ctx, packet.as_ptr(), packet.len() as u32, record_cb, ud)
+            netflow_analyzer_decode_packet(
+                ctx,
+                packet.as_ptr(),
+                packet.len() as u32,
+                Some(record_cb),
+                ud,
+            )
         };
         assert_eq!(n, 1, "one data record decoded");
         // The decode-only callback fired once, carrying the observation domain (42).
@@ -872,9 +908,15 @@ mod tests {
                 ptr::null(),
                 packet.as_ptr(),
                 packet.len() as u32,
-                record_cb,
+                Some(record_cb),
                 ud,
             )
+        };
+        assert_eq!(rc, -1);
+
+        // A null callback is rejected without decoding.
+        let rc = unsafe {
+            netflow_analyzer_decode_packet(ctx, packet.as_ptr(), packet.len() as u32, None, ud)
         };
         assert_eq!(rc, -1);
 
@@ -888,7 +930,7 @@ mod tests {
             last_proto: AtomicU32::new(0),
         };
         let ud = &state as *const TestState as *mut c_void;
-        let ctx = unsafe { netflow_analyzer_create(ptr::null(), count_cb, ud) };
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), Some(count_cb), ud) };
 
         let bogus = [0xFFu8, 0xFF, 0x00, 0x00];
         let rc =
@@ -918,7 +960,7 @@ mod tests {
             last_proto: AtomicU32::new(0),
         };
         let ud = &state as *const TestState as *mut c_void;
-        let ctx = unsafe { netflow_analyzer_create(&config, count_cb, ud) };
+        let ctx = unsafe { netflow_analyzer_create(&config, Some(count_cb), ud) };
         let packet = v9_packet();
         let export_ns = 1_700_000_000_000_000_000;
 
@@ -955,6 +997,11 @@ mod tests {
             netflow_analyzer_flush(ptr::null());
             netflow_analyzer_destroy(ptr::null_mut());
         }
+
+        // A null flow callback is rejected: no context is created and no invalid
+        // function pointer is stored.
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), None, ptr::null_mut()) };
+        assert!(ctx.is_null());
     }
 
     #[test]
@@ -974,7 +1021,7 @@ mod tests {
             last_proto: AtomicU32::new(0),
         };
         let ud = &state as *const TestState as *mut c_void;
-        let ctx = unsafe { netflow_analyzer_create(&cfg, count_cb, ud) };
+        let ctx = unsafe { netflow_analyzer_create(&cfg, Some(count_cb), ud) };
         assert!(!ctx.is_null());
 
         let packet = v9_packet();

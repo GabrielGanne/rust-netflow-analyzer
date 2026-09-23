@@ -158,11 +158,11 @@ typedef struct {
  * separate, per-call contract documented on that type):
  *
  * - Non-null: the callback pointer passed to `netflow_analyzer_create` must be
- *   a valid, non-null function pointer. Passing null is undefined behaviour;
- *   the engine calls it unconditionally on every emission. `record` is always
- *   non-null and points to a valid record for the duration of the call.
- *   `user_data` is whatever was supplied at creation and may be null if the
- *   host chose so.
+ *   a valid function pointer. A null callback is **rejected** —
+ *   `netflow_analyzer_create` returns null rather than registering it — so it
+ *   is never stored or called. `record` is always non-null and points to a
+ *   valid record for the duration of the call. `user_data` is whatever was
+ *   supplied at creation and may be null if the host chose so.
  * - Thread: this callback may run on the engine's internal aging thread *or*
  *   on any host thread that calls `netflow_analyzer_flush` /
  *   `netflow_analyzer_purge_exporter`, so treat it as potentially concurrent
@@ -250,9 +250,10 @@ typedef struct {
  * call and used only during that call. Contract:
  *
  * - Non-null: the callback pointer passed to the decode function must be a
- *   valid, non-null function pointer (passing null is undefined behaviour).
- *   `record` is always non-null and valid for the duration of the call;
- *   `user_data` is whatever was passed to that decode call and may be null.
+ *   valid function pointer. A null callback is **rejected** — the decode
+ *   function returns `-1` and decodes nothing. `record` is always non-null and
+ *   valid for the duration of the call; `user_data` is whatever was passed to
+ *   that decode call and may be null.
  * - Thread: it always runs **synchronously on the thread that called
  *   `netflow_analyzer_decode_packet*`** — never the aging thread.
  * - `record` lifetime: the pointer is borrowed and valid only for the duration
@@ -286,10 +287,13 @@ extern "C" {
  * must remain valid until after `netflow_analyzer_destroy` returns, because
  * the aging thread can deliver flows at any time until then.
  *
+ * A **null `callback` is rejected**: the function returns null rather than
+ * storing an invalid function pointer that would later be called. Taking the
+ * parameter as `Option` lets a null pointer from C arrive safely as `None`.
+ *
  * # Safety
  * `config` must be either null or a valid pointer to a `NetflowAnalyzerConfig`.
- * `callback` must be a valid, non-null function pointer. `user_data` is stored
- * verbatim and handed back to `callback` unchanged.
+ * `user_data` is stored verbatim and handed back to `callback` unchanged.
  */
 NetflowAnalyzerContext *netflow_analyzer_create(const NetflowAnalyzerConfig *config,
                                                 NetflowAnalyzerFlowCallback callback,
