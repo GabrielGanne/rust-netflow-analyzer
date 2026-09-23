@@ -709,6 +709,68 @@ pub unsafe extern "C" fn netflow_analyzer_destroy(ctx: *mut NetflowAnalyzerConte
     })
 }
 
+// Pin the exact C ABI signature — argument types, return type, and the
+// `extern "C"` calling convention — of every exported function. Coercing each
+// function item to a fixed function-pointer type fails to compile if a
+// signature drifts or an `extern "C"` is dropped, forcing a deliberate change
+// (and a NETFLOW_ANALYZER_ABI_VERSION bump). The generated C header is derived
+// from these same signatures. `abi_checks.c` link-probes every symbol on the C
+// side.
+const _ABI_SIGNATURES: () = {
+    let _: extern "C" fn() -> u32 = netflow_analyzer_abi_version;
+    let _: unsafe extern "C" fn(
+        *const NetflowAnalyzerConfig,
+        NetflowAnalyzerFlowCallback,
+        *mut c_void,
+    ) -> *mut NetflowAnalyzerContext = netflow_analyzer_create;
+    let _: unsafe extern "C" fn(*const NetflowAnalyzerContext) -> NetflowAnalyzerStats =
+        netflow_analyzer_get_stats;
+    let _: unsafe extern "C" fn(*const NetflowAnalyzerContext, *const u8, u32) -> i32 =
+        netflow_analyzer_process_packet;
+    let _: unsafe extern "C" fn(*const NetflowAnalyzerContext, *const u8, u32, u64) -> i32 =
+        netflow_analyzer_process_packet_at;
+    let _: unsafe extern "C" fn(*const NetflowAnalyzerContext, u64, *const u8, u32) -> i32 =
+        netflow_analyzer_process_packet_from;
+    let _: unsafe extern "C" fn(*const NetflowAnalyzerContext, u64, *const u8, u32, u64) -> i32 =
+        netflow_analyzer_process_packet_from_at;
+    let _: unsafe extern "C" fn(
+        *const NetflowAnalyzerContext,
+        *const u8,
+        u32,
+        NetflowAnalyzerRecordCallback,
+        *mut c_void,
+    ) -> i32 = netflow_analyzer_decode_packet;
+    let _: unsafe extern "C" fn(
+        *const NetflowAnalyzerContext,
+        *const u8,
+        u32,
+        u64,
+        NetflowAnalyzerRecordCallback,
+        *mut c_void,
+    ) -> i32 = netflow_analyzer_decode_packet_at;
+    let _: unsafe extern "C" fn(
+        *const NetflowAnalyzerContext,
+        u64,
+        *const u8,
+        u32,
+        NetflowAnalyzerRecordCallback,
+        *mut c_void,
+    ) -> i32 = netflow_analyzer_decode_packet_from;
+    let _: unsafe extern "C" fn(
+        *const NetflowAnalyzerContext,
+        u64,
+        *const u8,
+        u32,
+        u64,
+        NetflowAnalyzerRecordCallback,
+        *mut c_void,
+    ) -> i32 = netflow_analyzer_decode_packet_from_at;
+    let _: unsafe extern "C" fn(*const NetflowAnalyzerContext) = netflow_analyzer_flush;
+    let _: unsafe extern "C" fn(*const NetflowAnalyzerContext, u64) -> i32 =
+        netflow_analyzer_purge_exporter;
+    let _: unsafe extern "C" fn(*mut NetflowAnalyzerContext) = netflow_analyzer_destroy;
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,6 +1177,90 @@ mod tests {
 
         // The happy path returns the body's value unchanged.
         assert_eq!(guard_ffi(-1, || 5), 5);
+    }
+
+    #[test]
+    fn public_struct_layout_is_pinned() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        // Pin the size, alignment, AND every field offset of each public
+        // `#[repr(C)]` struct, so even a reorder of equal-width fields (which
+        // keeps the size unchanged) is caught here. The generated C header's
+        // `static_assert`s (examples/c_integration/abi_checks.c) pin the same
+        // numbers on the C side, so both languages must agree. Any deliberate
+        // change is an ABI break and must bump NETFLOW_ANALYZER_ABI_VERSION.
+        assert_eq!(size_of::<NetflowAnalyzerConfig>(), 120);
+        assert_eq!(align_of::<NetflowAnalyzerConfig>(), 8);
+        assert_eq!(offset_of!(NetflowAnalyzerConfig, max_flows), 0);
+        assert_eq!(offset_of!(NetflowAnalyzerConfig, max_templates), 8);
+        assert_eq!(offset_of!(NetflowAnalyzerConfig, idle_timeout_secs), 16);
+        assert_eq!(offset_of!(NetflowAnalyzerConfig, active_timeout_secs), 24);
+        assert_eq!(offset_of!(NetflowAnalyzerConfig, scan_interval_secs), 32);
+        assert_eq!(
+            offset_of!(NetflowAnalyzerConfig, clock_sync_check_enabled),
+            40
+        );
+        assert_eq!(
+            offset_of!(NetflowAnalyzerConfig, clock_fallback_to_receipt_time),
+            41
+        );
+        assert_eq!(offset_of!(NetflowAnalyzerConfig, max_clock_skew_ns), 48);
+        assert_eq!(offset_of!(NetflowAnalyzerConfig, reserved), 56);
+
+        assert_eq!(size_of::<NetflowAnalyzerStats>(), 144);
+        assert_eq!(align_of::<NetflowAnalyzerStats>(), 8);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, pkts_parsed), 0);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, pkts_parse_error), 8);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, malformed_packets), 16);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, clock_dropped_packets), 24);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, clock_fallback_packets), 32);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, templates_received), 40);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, data_records_processed), 48);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, flows_output), 56);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, flows_dropped), 64);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, active_flows), 72);
+        assert_eq!(offset_of!(NetflowAnalyzerStats, reserved), 80);
+
+        assert_eq!(size_of::<NetflowAnalyzerFlowRecord>(), 216);
+        assert_eq!(align_of::<NetflowAnalyzerFlowRecord>(), 8);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, src_ip), 0);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, dst_ip), 16);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, src_mac), 32);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, dst_mac), 38);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, src_port), 44);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, dst_port), 46);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, vlan_tag), 48);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, tcp_flags), 50);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, proto), 52);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, dscp), 53);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, icmp_type), 54);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, icmp_code), 55);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, ip_version), 56);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, scope_protocol), 57);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, scope_engine_type), 58);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, scope_engine_id), 59);
+        assert_eq!(
+            offset_of!(NetflowAnalyzerFlowRecord, observation_domain),
+            60
+        );
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, bytes), 64);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, packets), 72);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, iface_in), 80);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, iface_out), 88);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, flow_id), 96);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, exporter_key), 104);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, start_time_ns), 112);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, end_time_ns), 120);
+        assert_eq!(
+            offset_of!(NetflowAnalyzerFlowRecord, original_start_time_ns),
+            128
+        );
+        assert_eq!(
+            offset_of!(NetflowAnalyzerFlowRecord, original_end_time_ns),
+            136
+        );
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, present), 144);
+        assert_eq!(offset_of!(NetflowAnalyzerFlowRecord, reserved), 152);
     }
 
     #[test]

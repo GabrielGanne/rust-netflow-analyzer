@@ -1,10 +1,11 @@
-# cargo generated files
+# generated files
+*.o
 target
 examples/c_integration/demo
 
-# external tool files          
-*.swp          
-*.swo                                              
-tags                                 
-/cscope.*                        
+# external tool files
+*.swp
+*.swo
+tags
+/cscope.*
 
