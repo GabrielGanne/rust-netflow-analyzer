@@ -4,18 +4,18 @@
 
 ### Cargo packages and release contents
 
-- [ ] Add shared package metadata for both crates: `license = "MPL-2.0"`,
+- [x] Add shared package metadata for both crates: `license = "MPL-2.0"`,
   descriptions, repository, readme, keywords/categories, and the supported
   `rust-version`.
-- [ ] Add a registry version to the FFI crate's `netflow_analyzer_core` path
+- [x] Add a registry version to the FFI crate's `netflow_analyzer_core` path
   dependency, then document and verify the publication order (core before FFI).
-- [ ] Ensure each `.crate` archive contains its license and README.
-- [ ] Move the UDP listener under the core package root, or explicitly stop
+- [x] Ensure each `.crate` archive contains its license and README.
+- [x] Move the UDP listener under the core package root, or explicitly stop
   advertising it as a published example; Cargo currently omits the
   `../examples/udp_listener.rs` target from the core archive.
-- [ ] Package the generated C header with the FFI crate instead of leaving it
+- [x] Package the generated C header with the FFI crate instead of leaving it
   outside the crate root. Keep the packaged header synchronized with cbindgen.
-- [ ] Make `cargo package -p netflow_analyzer_core` and
+- [x] Make `cargo package -p netflow_analyzer_core` and
   `cargo package -p netflow_analyzer_ffi` complete without errors or warnings,
   and inspect both archives with `cargo package --list`.
 - [ ] Recheck and reserve the intended crates.io names immediately before the
@@ -23,23 +23,23 @@
 
 ### Exporter identity and protocol correctness
 
-- [ ] Decide the exporter/session identity model before publishing the API.
+- [x] Decide the exporter/session identity model before publishing the API.
   Prefer accepting an explicit transport-session/exporter key; the smaller
   alternative is to require and document one `FlowContext` per exporter.
-- [ ] Scope template and clock state by exporter/transport session plus
+- [x] Scope template and clock state by exporter/transport session plus
   observation domain, not observation domain alone.
-- [ ] Scope five-tuple flow keys by the chosen exporter identity and observation
+- [x] Scope five-tuple flow keys by the chosen exporter identity and observation
   domain so unrelated exporters or domains cannot be aggregated together.
-- [ ] Expose key-aware ingestion end to end so callers can drive many exporters
+- [x] Expose key-aware ingestion end to end so callers can drive many exporters
   from one context: `process_packet_from[_at]` / `decode_packet_from[_at]` in
   Rust and the matching `netflow_analyzer_*_from[_at]` FFI symbols (header
   regenerated). Emitted records carry the `(exporter_key, scope)` identity.
-- [ ] Enforce the IPFIX message `total_length` and reject inconsistent/truncated
+- [x] Enforce the IPFIX message `total_length` and reject inconsistent/truncated
   message and Set lengths instead of parsing bytes beyond the declared message.
-- [ ] Decide and document strict rejection versus explicit partial decoding for
+- [x] Decide and document strict rejection versus explicit partial decoding for
   malformed packet bodies. In either mode, return useful diagnostics and update
   malformed-packet counters instead of silently returning success.
-- [ ] Validate template field counts against the remaining input before
+- [x] Validate template field counts against the remaining input before
   reserving memory, and define conservative per-message/template limits to
   prevent allocation churn from hostile datagrams.
 - [ ] Add template lifetime/expiry and transport-session reset semantics so the
@@ -47,18 +47,22 @@
   per-key purge (emit-and-drain a key's flows, then drop its templates/clock/
   sampling state) — this is the prerequisite for safe listener key rotation and
   expiry below.
+  (Partly done: per-key purge + transport-session reset delivered; automatic
+  time-based template lifetime/expiry still pending.)
 - [ ] Update the UDP listener to maintain separate state for each exporter when
   it receives packets from multiple peers. Sequenced **after** the per-key purge
   above: without it the listener cannot rotate keys on exporter restart or
   reclaim table slots without leaking engine state, and it also needs an
   admission policy (trusted-exporter allow-list / rate limit) per the hostile-
   input model. The key-aware ingestion API it builds on is already in place.
-- [ ] Validate template IDs, options scope counts/lengths, and template
+  (Partly done: per-endpoint exporter keying delivered; hard table cap,
+  admission policy, and restart-driven key rotation still pending.)
+- [x] Validate template IDs, options scope counts/lengths, and template
   replacement/lifecycle rules against NetFlow v9 and IPFIX requirements.
 
 ### FFI safety and ABI stability
 
-- [ ] Invoke flow callbacks only after releasing `DashMap` shard locks so a slow
+- [x] Invoke flow callbacks only after releasing `DashMap` shard locks so a slow
   or reentrant callback cannot block ingestion or deadlock on flush/process.
 - [ ] Define the callback contract in Rust and in the generated C header:
   non-null requirements, callback thread, reentrancy, record-pointer lifetime,
@@ -116,7 +120,7 @@
 
 ## Testing and local verification
 
-- [ ] Fix the existing rustfmt drift so `./tools/test.sh` is a passing local gate.
+- [x] Fix the existing rustfmt drift so `./tools/test.sh` is a passing local gate.
 - [ ] Keep the local gate as the documented correctness command: locked debug and
   release tests, documentation tests, Clippy with warnings denied, and the C
   ABI smoke test.
