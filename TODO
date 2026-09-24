@@ -151,6 +151,7 @@
 
 ## Pending actions
 
+- [ ] Reject unmatched scoped rates instead of treating them as domain-wide
 - [ ] Options semantics: options templates + data records are now decoded and
   counted, but their scoped values are not interpreted. Extract the sampling
   interval (samplingInterval IE 34, samplerRandomInterval IE 305) per

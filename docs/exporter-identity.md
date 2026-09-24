@@ -30,16 +30,43 @@ protocol-tagged scope defined below (**not** a bare `observation_domain_id`
 - template cache,
 - exporter clock tracker,
 - flow cache keys (both the five-tuple and `flowId` variants),
-- any options-derived, per-domain state added later — notably the sampling
-  interval extracted from options records (the pending sampling-normalization
-  work). It scales flow counters, so exporters sharing domain `0` must not share
-  a sampling factor; scope and purge it by `(exporter_key, Scope)`
-  like everything else. Note that a single domain can export several options
-  records with **different scopes** (per interface or per sampler), each with its
-  own interval, so the sampling state must additionally be keyed by the decoded
-  option scope / sampler identity and each flow associated with the matching
-  scope — a single per-domain value would let the last record overwrite the rest
-  and apply the wrong multiplier.
+- options-derived sampling state, extracted from options records and used to
+  scale flow byte/packet counters. It is scoped and purged by `(exporter_key,
+  Scope)` like everything else, so exporters sharing domain `0` never share a
+  sampling factor. A single domain can export several options records with
+  **different scopes** (per interface or per sampler), each with its own rate, so
+  the sampling state is additionally keyed by a sampler identity and each flow is
+  associated with the matching sampler.
+
+### Implemented sampling model (and its limits)
+
+The sampler identity is a [`SamplerSelector`]: the `selectorId` (IE 302) or
+`flowSamplerId` (IE 48) a record carries — the same identifier that appears on
+both an options record and a flow record — or `Domain` when it carries neither.
+The rate is decoded from `samplingInterval` (IE 34), `samplerRandomInterval`
+(IE 50), or the `samplingPacketInterval` / `samplingPacketSpace` pair (IE
+305/306) and stored as an exact `numerator/denominator` ratio. Each flow record
+is normalized by its own sampler's ratio **before** aggregation, so records
+sampled at different rates are correct even once stitching or deduplication is
+added later.
+
+This matches the common cases — one global sampler per domain, or per-sampler
+rates tagged with `flowSamplerId`/`selectorId` — precisely. Two paths are
+**out of scope for the first release**, and in both the flow is left **unscaled**
+(factor 1) rather than mis-scaled:
+
+- Samplers scoped only by a key a flow cannot carry (per interface or line card
+  with no `flowSamplerId`/`selectorId`). Such options records all fall into the
+  `Domain` bucket; if they advertise **conflicting** rates the bucket is marked
+  ambiguous and untagged flows in that domain are left unscaled. A genuine
+  reconfiguration of a single domain-wide sampler to a new rate is
+  indistinguishable from this case and likewise stops scaling that domain until
+  its state is purged (`purge_exporter`).
+- The full PSAMP selection-sequence indirection (RFC 5476/5477): data records
+  that identify the applied selection with `selectionSequenceId` (IE 301) and a
+  separate selection-sequence report mapping it to primitive `selectorId`s. Only
+  a direct `selectorId`/`flowSamplerId` on the flow is matched today; a flow
+  carrying only `selectionSequenceId` stays `Domain`.
 
 A single `FlowContext` can therefore safely serve many exporters at once.
 

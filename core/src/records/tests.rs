@@ -285,6 +285,7 @@ fn flow_record_round_trips_to_ffi() {
         vlan_tag: 100,
         ip_version: 4,
         present: presence::FLOW_ID | presence::IFACE_IN | presence::DSCP,
+        sampler: SamplerSelector::Domain,
     };
     let record = FlowRecord::from_fields(
         &fields,
@@ -514,17 +515,6 @@ fn options_template(options: &[TemplateField]) -> TemplateRecord {
     TemplateRecord::from_options_fields(260, 1, fields)
 }
 
-/// Rebuilds the framed sampler identity for one field, matching
-/// [`push_identity_field`].
-fn identity_field(enterprise: Option<u32>, type_id: u16, raw: &[u8]) -> Vec<u8> {
-    let mut buf = vec![enterprise.is_some() as u8];
-    buf.extend_from_slice(&enterprise.unwrap_or(0).to_be_bytes());
-    buf.extend_from_slice(&type_id.to_be_bytes());
-    buf.extend_from_slice(&(raw.len() as u32).to_be_bytes());
-    buf.extend_from_slice(raw);
-    buf
-}
-
 fn ratio(numerator: u64, denominator: u64) -> SamplingRatio {
     SamplingRatio {
         numerator,
@@ -543,7 +533,7 @@ fn sampling_prefers_ie34_over_ie50_and_305() {
         field(IE_SAMPLING_INTERVAL, 4),
     ]);
     let mut record = Vec::new();
-    record.extend_from_slice(&7u32.to_be_bytes()); // scope value
+    record.extend_from_slice(&7u32.to_be_bytes()); // scope value (observationDomainId)
     record.extend_from_slice(&1u32.to_be_bytes()); // samplingPacketInterval
     record.extend_from_slice(&99u32.to_be_bytes()); // samplingPacketSpace
     record.extend_from_slice(&512u32.to_be_bytes()); // samplerRandomInterval
@@ -551,11 +541,8 @@ fn sampling_prefers_ie34_over_ie50_and_305() {
 
     let observation = sampling_from_options_record(&template, &record).unwrap();
     assert_eq!(observation.ratio, ratio(1000, 1));
-    // The sampler identity is just the framed observationDomainId scope field.
-    assert_eq!(
-        observation.sampler.as_ref(),
-        identity_field(None, 149, &7u32.to_be_bytes()).as_slice()
-    );
+    // The record carries no flowSamplerId/selectorId, so it is the domain sampler.
+    assert_eq!(observation.selector, SamplerSelector::Domain);
 }
 
 #[test]
@@ -611,7 +598,7 @@ fn count_based_sampling_requires_both_interval_and_space() {
 #[test]
 fn sampler_id_option_field_disambiguates_a_shared_scope() {
     // Two records under the same (observationDomainId) scope but different
-    // flowSamplerId (IE 48) values must produce distinct sampler identities.
+    // flowSamplerId (IE 48) values must select distinct samplers.
     let template =
         options_template(&[field(IE_FLOW_SAMPLER_ID, 1), field(IE_SAMPLING_INTERVAL, 4)]);
     let build = |sampler_id: u8, interval: u32| {
@@ -623,13 +610,49 @@ fn sampler_id_option_field_disambiguates_a_shared_scope() {
 
     let first = build(1, 100);
     let second = build(2, 200);
-    assert_ne!(first.sampler, second.sampler);
+    assert_eq!(first.selector, SamplerSelector::FlowSampler(1));
+    assert_eq!(second.selector, SamplerSelector::FlowSampler(2));
+    assert_ne!(first.selector, second.selector);
     assert_eq!(first.ratio, ratio(100, 1));
     assert_eq!(second.ratio, ratio(200, 1));
+}
 
-    let mut expected = identity_field(None, 149, &7u32.to_be_bytes());
-    expected.extend_from_slice(&identity_field(None, IE_FLOW_SAMPLER_ID, &[1]));
-    assert_eq!(first.sampler.as_ref(), expected.as_slice());
+#[test]
+fn selector_id_takes_precedence_over_flow_sampler_id() {
+    // A record carrying both IE 302 and IE 48 resolves to the selectorId, and a
+    // flow decoded the same way (below) agrees, so the two match.
+    let template = options_template(&[
+        field(IE_FLOW_SAMPLER_ID, 4),
+        field(IE_SELECTOR_ID, 4),
+        field(IE_SAMPLING_INTERVAL, 4),
+    ]);
+    let mut record = 7u32.to_be_bytes().to_vec();
+    record.extend_from_slice(&5u32.to_be_bytes()); // flowSamplerId
+    record.extend_from_slice(&9u32.to_be_bytes()); // selectorId
+    record.extend_from_slice(&1000u32.to_be_bytes());
+    let observation = sampling_from_options_record(&template, &record).unwrap();
+    assert_eq!(observation.selector, SamplerSelector::Selector(9));
+}
+
+#[test]
+fn flow_record_decodes_its_sampler_selector() {
+    // A flow record's flowSamplerId (IE 48) is captured so it can be matched to
+    // its sampler; selectorId (IE 302) wins when both are present.
+    let sampled = TemplateRecord::from_fields(
+        256,
+        vec![field(IE_OCTET_DELTA_COUNT, 4), field(IE_FLOW_SAMPLER_ID, 1)],
+    );
+    let mut record = 1500u32.to_be_bytes().to_vec();
+    record.push(3);
+    let (fields, _) = FlowFields::from_record_sized(&sampled, &record).unwrap();
+    assert_eq!(fields.sampler, SamplerSelector::FlowSampler(3));
+
+    let both = TemplateRecord::from_fields(
+        256,
+        vec![field(IE_FLOW_SAMPLER_ID, 1), field(IE_SELECTOR_ID, 2)],
+    );
+    let (fields, _) = FlowFields::from_record_sized(&both, &[3, 0, 9]).unwrap();
+    assert_eq!(fields.sampler, SamplerSelector::Selector(9));
 }
 
 #[test]

@@ -530,12 +530,13 @@ impl FlowContext {
         match template.fixed_length {
             Some(record_len) if record_len > 0 => {
                 for record in parser::split_fixed_records(body, record_len) {
-                    if let Some((fields, _)) =
+                    if let Some((mut fields, _)) =
                         FlowFields::from_record_sized_at(&template, record, Some(time_context))
                     {
                         if is_options {
                             self.consume_options_record(exporter, scope, &template, record);
                         } else {
+                            self.apply_sampling(exporter, scope, &mut fields);
                             sink(exporter, scope, &fields);
                             count += 1;
                         }
@@ -547,7 +548,9 @@ impl FlowContext {
                 let mut cursor = body;
                 while !cursor.is_empty() {
                     match FlowFields::from_record_sized_at(&template, cursor, Some(time_context)) {
-                        Some((fields, consumed)) if consumed > 0 && consumed <= cursor.len() => {
+                        Some((mut fields, consumed))
+                            if consumed > 0 && consumed <= cursor.len() =>
+                        {
                             if is_options {
                                 self.consume_options_record(
                                     exporter,
@@ -556,6 +559,7 @@ impl FlowContext {
                                     &cursor[..consumed],
                                 );
                             } else {
+                                self.apply_sampling(exporter, scope, &mut fields);
                                 sink(exporter, scope, &fields);
                                 count += 1;
                             }
@@ -590,8 +594,26 @@ impl FlowContext {
             .fetch_add(1, Ordering::Relaxed);
         if let Some(observation) = records::sampling_from_options_record(template, record) {
             self.sampling
-                .observe(exporter, scope, observation.sampler, observation.ratio);
+                .observe(exporter, scope, observation.selector, observation.ratio);
         }
+    }
+
+    /// Scales a decoded flow record's byte and packet counters up to their
+    /// estimated real values using the sampling ratio advertised for the
+    /// record's sampler, matching it by the same `(exporter, scope, selector)`
+    /// the options record was stored under. This runs per record, **before**
+    /// aggregation, so records sampled at different rates are each normalized
+    /// before they are summed or (later) stitched/deduplicated.
+    ///
+    /// The common unsampled case is free: when no sampling has been advertised
+    /// at all, the whole cache is empty and the lookup is skipped.
+    fn apply_sampling(&self, exporter: ExporterKey, scope: Scope, fields: &mut FlowFields) {
+        if self.sampling.is_empty() {
+            return;
+        }
+        let ratio = self.sampling.ratio(exporter, scope, fields.sampler);
+        fields.bytes = ratio.expand(fields.bytes);
+        fields.packets = ratio.expand(fields.packets);
     }
 
     /// Starts the background aging thread. Idle flows are evicted and long-lived

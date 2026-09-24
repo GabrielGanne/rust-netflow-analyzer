@@ -10,9 +10,9 @@ mod common;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use common::{sample_v9_packet, sampler_identity, Builder};
+use common::{sample_v9_packet, Builder};
 use netflow_analyzer_core::records::FlowRecord;
-use netflow_analyzer_core::sampling::SamplingRatio;
+use netflow_analyzer_core::sampling::{SamplerSelector, SamplingRatio};
 use netflow_analyzer_core::scope::{Scope, SINGLE_EXPORTER};
 use netflow_analyzer_core::FlowContext;
 
@@ -187,18 +187,135 @@ fn options_template_and_data_are_decoded_but_not_flows() {
         1
     );
     // The samplingInterval (IE 34) carried by the options record is learned as a
-    // 1000/1 ratio for this exporter, observation domain (source id 42), and
-    // sampler. The sampler identity is the framed scope field (IE 1).
-    let sampler = sampler_identity(&[(None, 1, &1u32.to_be_bytes())]);
+    // 1000/1 ratio for this exporter and observation domain (source id 42). The
+    // record carries no flowSamplerId/selectorId, so it is the domain sampler.
     assert_eq!(ctx.sampling.len(), 1);
     assert_eq!(
-        ctx.sampling
-            .get(SINGLE_EXPORTER, Scope::V9Domain(42), &sampler),
+        ctx.sampling.get(
+            SINGLE_EXPORTER,
+            Scope::V9Domain(42),
+            SamplerSelector::Domain
+        ),
         Some(SamplingRatio {
             numerator: 1000,
             denominator: 1
         })
     );
+}
+
+#[test]
+fn domain_wide_sampling_scales_flow_counters() {
+    let ctx = FlowContext::new();
+
+    // 1) Learn a domain-wide 1-in-1000 sampler for domain 42 via an options
+    //    record with no flowSamplerId/selectorId.
+    let mut opts = Builder::new();
+    opts.put(9, 2) // version
+        .put(1, 2) // count (ignored for v9)
+        .put(1000, 4)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(42, 4); // source id / domain
+    opts.put(1, 2) // options template flowset
+        .put(18, 2) // length
+        .put(260, 2) // template id
+        .put(4, 2) // scope length (bytes)
+        .put(4, 2) // option length (bytes)
+        .put(1, 2) // scope: SYSTEM (IE 1)
+        .put(4, 2)
+        .put(34, 2) // option: samplingInterval
+        .put(4, 2);
+    opts.put(260, 2) // options data set
+        .put(12, 2)
+        .put(0x0000_0001, 4) // scope value
+        .put(1000, 4); // samplingInterval
+    assert_eq!(ctx.process_packet(&opts.buf).expect("parse ok"), 0);
+
+    // 2) A normal data record (1500 bytes / 10 packets, domain 42, no selector)
+    //    is scaled by the learned 1000x ratio before it is cached.
+    assert_eq!(
+        ctx.process_packet(&sample_v9_packet()).expect("parse ok"),
+        1
+    );
+
+    let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = collected.clone();
+    ctx.flush(move |rec| sink.lock().unwrap().push(rec.clone()));
+    let flows = collected.lock().unwrap();
+    assert_eq!(flows.len(), 1);
+    assert_eq!(flows[0].bytes, 1_500_000);
+    assert_eq!(flows[0].packets, 10_000);
+}
+
+#[test]
+fn per_sampler_ratio_scales_by_the_flows_own_selector() {
+    // One packet that advertises a sampler keyed by flowSamplerId=7 (1-in-100)
+    // and carries a data record tagged with that same flowSamplerId.
+    let mut b = Builder::new();
+    b.put(9, 2)
+        .put(1, 2)
+        .put(1000, 4)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(100, 4); // domain 100
+
+    // Options template 260: scope observationDomainId (IE 149), options
+    // flowSamplerId (IE 48) + samplingInterval (IE 34).
+    b.put(1, 2) // options template flowset
+        .put(22, 2) // length = 4 + 6 + 3*4
+        .put(260, 2) // template id
+        .put(4, 2) // scope length (one 4-byte specifier)
+        .put(8, 2) // option length (two 4-byte specifiers)
+        .put(149, 2) // scope: observationDomainId
+        .put(4, 2)
+        .put(48, 2) // option: flowSamplerId
+        .put(1, 2)
+        .put(34, 2) // option: samplingInterval
+        .put(4, 2);
+    b.put(260, 2) // options data set
+        .put(13, 2) // length = 4 + 9
+        .put(100, 4) // observationDomainId value
+        .put(7, 1) // flowSamplerId
+        .put(100, 4); // samplingInterval
+
+    // Flow template 300: octets, packets, flowSamplerId.
+    b.put(0, 2) // template flowset
+        .put(20, 2) // length = 4 + 4 + 3*4
+        .put(300, 2)
+        .put(3, 2)
+        .put(1, 2) // IN_BYTES
+        .put(4, 2)
+        .put(2, 2) // IN_PKTS
+        .put(4, 2)
+        .put(48, 2) // flowSamplerId
+        .put(1, 2);
+    b.put(300, 2) // data set
+        .put(13, 2) // length = 4 + 9
+        .put(50, 4) // bytes
+        .put(2, 4) // packets
+        .put(7, 1); // flowSamplerId = 7
+
+    let ctx = FlowContext::new();
+    assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
+    assert_eq!(
+        ctx.sampling.get(
+            SINGLE_EXPORTER,
+            Scope::V9Domain(100),
+            SamplerSelector::FlowSampler(7)
+        ),
+        Some(SamplingRatio {
+            numerator: 100,
+            denominator: 1
+        })
+    );
+
+    let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = collected.clone();
+    ctx.flush(move |rec| sink.lock().unwrap().push(rec.clone()));
+    let flows = collected.lock().unwrap();
+    assert_eq!(flows.len(), 1);
+    assert_eq!(flows[0].bytes, 5_000); // 50 * 100
+    assert_eq!(flows[0].packets, 200); // 2 * 100
 }
 
 #[test]

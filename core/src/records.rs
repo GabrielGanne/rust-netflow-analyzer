@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::Instant;
 
 use crate::parser::{TemplateRecord, V5_RECORD_LEN, VARIABLE_LENGTH};
-use crate::sampling::SamplingRatio;
+use crate::sampling::{SamplerSelector, SamplingRatio};
 use crate::scope::{ExporterKey, Scope};
 
 // --- IANA Information Element identifiers we normalize into the FlowRecord ---
@@ -192,6 +192,13 @@ pub struct FlowFields {
     /// Bitmask of the metadata fields above that were actually decoded. See
     /// [`presence`] for the individual bits.
     pub present: u32,
+    /// Which sampler *this record* was produced by (`flowSamplerId` IE 48 /
+    /// `selectorId` IE 302), used only during decoding to look up the sampling
+    /// ratio to scale the counters by. It is internal and transient: after a
+    /// record is folded into an aggregate flow it is not meaningful (records
+    /// with the same key but different selectors are summed), so it is not part
+    /// of the emitted `FlowRecord`/FFI identity.
+    pub(crate) sampler: SamplerSelector,
 }
 
 impl FlowFields {
@@ -386,6 +393,13 @@ impl FlowFields {
             IE_ICMP_CODE_IPV4 | IE_ICMP_CODE_IPV6 => {
                 self.icmp_code = raw.first().copied().unwrap_or(0);
                 self.present |= presence::ICMP_CODE;
+            }
+            // Sampler selector: `selectorId` (302) takes precedence over
+            // `flowSamplerId` (48), matching the sampling cache's resolution, so
+            // this flow is scaled by the sampler that produced it.
+            IE_SELECTOR_ID => self.sampler = SamplerSelector::Selector(read_be_uint(raw)),
+            IE_FLOW_SAMPLER_ID if self.sampler == SamplerSelector::Domain => {
+                self.sampler = SamplerSelector::FlowSampler(read_be_uint(raw));
             }
             _ => {}
         }
@@ -756,31 +770,17 @@ fn walk_record_fields(
 /// A packet-sampling configuration interpreted from one options data record.
 ///
 /// A single observation domain can advertise several samplers (one per
-/// interface, per `flowSamplerId`, etc.), each in its own options record.
-/// `sampler` is the opaque identity of that sampler — the framed concatenation
-/// of the record's scope fields plus any `flowSamplerId` (IE 48) or `selectorId`
-/// (IE 302) option field — so the caller can key sampling state per sampler
-/// instead of collapsing every record onto the domain (see
-/// `docs/exporter-identity.md`). `ratio` is the fraction of real traffic that
-/// was captured, kept exact so a fractional rate is not truncated early.
+/// interface, per `flowSamplerId`, etc.). `selector` identifies which one — the
+/// `selectorId` (IE 302) or `flowSamplerId` (IE 48) the record carries, whether
+/// as a scope or an option field, or [`SamplerSelector::Domain`] when it carries
+/// neither. It is derived exactly as a flow record's selector, so decoded flows
+/// match the sampler that produced them (see `docs/exporter-identity.md`).
+/// `ratio` is the fraction of real traffic that was captured, kept exact so a
+/// fractional rate is not truncated early.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SamplingObservation {
-    pub sampler: Box<[u8]>,
+    pub selector: SamplerSelector,
     pub ratio: SamplingRatio,
-}
-
-/// Appends one field to a sampler-identity buffer in an unambiguous, collision-
-/// free framing: a 1-byte enterprise flag, the 4-byte Private Enterprise Number
-/// (0 for IANA elements), the 2-byte element id, the 4-byte value length, and
-/// the raw value. The length prefix keeps differently shaped values from
-/// serializing to the same bytes, and the enterprise discriminator stops an
-/// enterprise element from aliasing a standard one with the same id.
-fn push_identity_field(buf: &mut Vec<u8>, enterprise: Option<u32>, type_id: u16, raw: &[u8]) {
-    buf.push(enterprise.is_some() as u8);
-    buf.extend_from_slice(&enterprise.unwrap_or(0).to_be_bytes());
-    buf.extend_from_slice(&type_id.to_be_bytes());
-    buf.extend_from_slice(&(raw.len() as u32).to_be_bytes());
-    buf.extend_from_slice(raw);
 }
 
 /// Interprets the packet-sampling configuration carried by a single options
@@ -791,7 +791,7 @@ fn push_identity_field(buf: &mut Vec<u8>, enterprise: Option<u32>, type_id: u16,
 /// each a direct "1 in N" value, or the modern `samplingPacketInterval` (IE
 /// 305) with `samplingPacketSpace` (IE 306), whose rate is
 /// `(interval + space) / interval`. IE 34 is preferred over IE 50 over the
-/// 305/306 pair when more than one is present. Sampling and identifier elements
+/// 305/306 pair when more than one is present. Sampling and selector elements
 /// are read only from the IANA registry (enterprise-specific elements merely
 /// reuse the numeric ids), and a record shorter than its template requires
 /// yields `None`.
@@ -800,7 +800,7 @@ pub fn sampling_from_options_record(
     record: &[u8],
 ) -> Option<SamplingObservation> {
     let scope_field_count = template.scope_field_count as usize;
-    let mut sampler: Vec<u8> = Vec::new();
+    let mut selector = SamplerSelector::Domain;
     let mut sampling_interval: Option<u64> = None;
     let mut random_interval: Option<u64> = None;
     let mut packet_interval: Option<u64> = None;
@@ -810,26 +810,32 @@ pub fn sampling_from_options_record(
     walk_record_fields(template, record, |type_id, enterprise_number, raw| {
         let field_index = index;
         index += 1;
-
-        // Scope fields always identify the sampler; so do the IANA sampler-id
-        // elements even when they appear as ordinary option fields.
-        let is_scope = field_index < scope_field_count;
-        let is_sampler_id =
-            enterprise_number.is_none() && matches!(type_id, IE_FLOW_SAMPLER_ID | IE_SELECTOR_ID);
-        if is_scope || is_sampler_id {
-            push_identity_field(&mut sampler, enterprise_number, type_id, raw);
-        }
-        if is_scope || enterprise_number.is_some() {
+        if enterprise_number.is_some() {
             return;
         }
-        let slot = match type_id {
-            IE_SAMPLING_INTERVAL => &mut sampling_interval,
-            IE_SAMPLER_RANDOM_INTERVAL => &mut random_interval,
-            IE_SAMPLING_PACKET_INTERVAL => &mut packet_interval,
-            IE_SAMPLING_PACKET_SPACE => &mut packet_space,
-            _ => return,
-        };
-        *slot = Some(read_be_uint(raw));
+        // A selector identifies which sampler the record configures whether it
+        // sits in the scope or the option fields. The *rate* elements are only
+        // meaningful as option fields — as a scope field their value identifies
+        // what the options apply to, not an advertised rate — so they are read
+        // only past the scope fields.
+        let is_option_field = field_index >= scope_field_count;
+        match type_id {
+            // `selectorId` (302) wins over `flowSamplerId` (48); this must match
+            // the precedence in `FlowFields::apply_element` so the two agree.
+            IE_SELECTOR_ID => selector = SamplerSelector::Selector(read_be_uint(raw)),
+            IE_FLOW_SAMPLER_ID if selector == SamplerSelector::Domain => {
+                selector = SamplerSelector::FlowSampler(read_be_uint(raw));
+            }
+            IE_SAMPLING_INTERVAL if is_option_field => sampling_interval = Some(read_be_uint(raw)),
+            IE_SAMPLER_RANDOM_INTERVAL if is_option_field => {
+                random_interval = Some(read_be_uint(raw))
+            }
+            IE_SAMPLING_PACKET_INTERVAL if is_option_field => {
+                packet_interval = Some(read_be_uint(raw))
+            }
+            IE_SAMPLING_PACKET_SPACE if is_option_field => packet_space = Some(read_be_uint(raw)),
+            _ => {}
+        }
     })?;
 
     let ratio = resolve_sampling_ratio(
@@ -838,10 +844,7 @@ pub fn sampling_from_options_record(
         packet_interval,
         packet_space,
     )?;
-    Some(SamplingObservation {
-        sampler: sampler.into_boxed_slice(),
-        ratio,
-    })
+    Some(SamplingObservation { selector, ratio })
 }
 
 /// Resolves the decoded sampling elements into an exact [`SamplingRatio`], or
