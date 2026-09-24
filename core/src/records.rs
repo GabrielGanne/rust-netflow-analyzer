@@ -6,6 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::Instant;
 
 use crate::parser::{TemplateRecord, V5_RECORD_LEN, VARIABLE_LENGTH};
+use crate::sampling::SamplingRatio;
 use crate::scope::{ExporterKey, Scope};
 
 // --- IANA Information Element identifiers we normalize into the FlowRecord ---
@@ -46,6 +47,26 @@ const IE_FLOW_START_MICROSECONDS: u16 = 154;
 const IE_FLOW_END_MICROSECONDS: u16 = 155;
 const IE_FLOW_START_NANOSECONDS: u16 = 156;
 const IE_FLOW_END_NANOSECONDS: u16 = 157;
+
+// --- Sampling information elements carried by options data records ---
+// Interpreted from options records rather than flow records (see
+// `crate::sampling`). Reference: RFC 7270 (34/50) and RFC 5477/PSAMP (305/306).
+//
+// The deprecated `samplingInterval` (IE 34) and `samplerRandomInterval` (IE 50)
+// each express "1 packet in N was sampled" directly, so the value *is* the
+// rate. The modern count-based pair `samplingPacketInterval` (IE 305, packets
+// selected per cycle) and `samplingPacketSpace` (IE 306, packets skipped per
+// cycle) yield the rate `(interval + space) / interval`.
+//
+// `flowSamplerId` (IE 48) and `selectorId` (IE 302) identify *which* sampler an
+// options record configures when the option scope itself is shared (e.g. a
+// system- or domain-wide scope); they are folded into the sampler identity.
+const IE_SAMPLING_INTERVAL: u16 = 34;
+const IE_FLOW_SAMPLER_ID: u16 = 48;
+const IE_SAMPLER_RANDOM_INTERVAL: u16 = 50;
+const IE_SAMPLING_PACKET_INTERVAL: u16 = 305;
+const IE_SAMPLING_PACKET_SPACE: u16 = 306;
+const IE_SELECTOR_ID: u16 = 302;
 
 const NS_PER_SECOND: u64 = 1_000_000_000;
 const NS_PER_MILLISECOND: u64 = 1_000_000;
@@ -221,35 +242,14 @@ impl FlowFields {
     ) -> Option<(Self, usize)> {
         let mut fields = FlowFields::default();
         let mut timestamps = DecodedTimestamps::default();
-        let mut offset: usize = 0;
 
-        for field in &template.fields {
-            // Resolve the on-wire length, honouring IPFIX variable-length encoding.
-            let (value_offset, value_len) = if field.length == VARIABLE_LENGTH {
-                let first = *record.get(offset)? as usize;
-                if first < 255 {
-                    (offset + 1, first)
-                } else {
-                    // 3-byte length form: 0xFF followed by a u16 length.
-                    let hi = *record.get(offset + 1)? as usize;
-                    let lo = *record.get(offset + 2)? as usize;
-                    (offset + 3, (hi << 8) | lo)
-                }
-            } else {
-                (offset, field.length as usize)
-            };
-
-            let end = value_offset.checked_add(value_len)?;
-            let raw = record.get(value_offset..end)?;
-
+        let offset = walk_record_fields(template, record, |type_id, enterprise_number, raw| {
             // Enterprise-specific elements share numeric ids with IANA ones, so
             // only interpret elements from the standard registry.
-            if field.enterprise_number.is_none() && !timestamps.apply_element(field.type_id, raw) {
-                fields.apply_element(field.type_id, raw);
+            if enterprise_number.is_none() && !timestamps.apply_element(type_id, raw) {
+                fields.apply_element(type_id, raw);
             }
-
-            offset = end;
-        }
+        })?;
 
         let fallback = time_context
             .map(|ctx| ctx.original_export_time_ns)
@@ -712,6 +712,174 @@ fn ntp_to_unix_ns(value: u64, context: Option<RecordTimeContext>) -> u64 {
     unix_seconds
         .saturating_mul(NS_PER_SECOND)
         .saturating_add(nanos)
+}
+
+/// Walks every field of `template` across `record`, invoking `visit` with each
+/// element's `(type_id, enterprise_number, raw_bytes)`. Honours IPFIX
+/// variable-length encoding and stays fully bounds-checked: it returns `None`
+/// (visiting no further fields) as soon as the record is shorter than the
+/// template requires, otherwise the total number of bytes consumed.
+///
+/// Both flow decoding ([`FlowFields::from_record_sized_at`]) and options-record
+/// interpretation ([`sampling_interval_from_options_record`]) share this walk so
+/// the on-wire framing is parsed in exactly one place.
+fn walk_record_fields(
+    template: &TemplateRecord,
+    record: &[u8],
+    mut visit: impl FnMut(u16, Option<u32>, &[u8]),
+) -> Option<usize> {
+    let mut offset: usize = 0;
+    for field in &template.fields {
+        // Resolve the on-wire length, honouring IPFIX variable-length encoding.
+        let (value_offset, value_len) = if field.length == VARIABLE_LENGTH {
+            let first = *record.get(offset)? as usize;
+            if first < 255 {
+                (offset + 1, first)
+            } else {
+                // 3-byte length form: 0xFF followed by a u16 length.
+                let hi = *record.get(offset + 1)? as usize;
+                let lo = *record.get(offset + 2)? as usize;
+                (offset + 3, (hi << 8) | lo)
+            }
+        } else {
+            (offset, field.length as usize)
+        };
+
+        let end = value_offset.checked_add(value_len)?;
+        let raw = record.get(value_offset..end)?;
+        visit(field.type_id, field.enterprise_number, raw);
+        offset = end;
+    }
+    Some(offset)
+}
+
+/// A packet-sampling configuration interpreted from one options data record.
+///
+/// A single observation domain can advertise several samplers (one per
+/// interface, per `flowSamplerId`, etc.), each in its own options record.
+/// `sampler` is the opaque identity of that sampler — the framed concatenation
+/// of the record's scope fields plus any `flowSamplerId` (IE 48) or `selectorId`
+/// (IE 302) option field — so the caller can key sampling state per sampler
+/// instead of collapsing every record onto the domain (see
+/// `docs/exporter-identity.md`). `ratio` is the fraction of real traffic that
+/// was captured, kept exact so a fractional rate is not truncated early.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplingObservation {
+    pub sampler: Box<[u8]>,
+    pub ratio: SamplingRatio,
+}
+
+/// Appends one field to a sampler-identity buffer in an unambiguous, collision-
+/// free framing: a 1-byte enterprise flag, the 4-byte Private Enterprise Number
+/// (0 for IANA elements), the 2-byte element id, the 4-byte value length, and
+/// the raw value. The length prefix keeps differently shaped values from
+/// serializing to the same bytes, and the enterprise discriminator stops an
+/// enterprise element from aliasing a standard one with the same id.
+fn push_identity_field(buf: &mut Vec<u8>, enterprise: Option<u32>, type_id: u16, raw: &[u8]) {
+    buf.push(enterprise.is_some() as u8);
+    buf.extend_from_slice(&enterprise.unwrap_or(0).to_be_bytes());
+    buf.extend_from_slice(&type_id.to_be_bytes());
+    buf.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+    buf.extend_from_slice(raw);
+}
+
+/// Interprets the packet-sampling configuration carried by a single options
+/// data record, decoded against its options `template`.
+///
+/// Returns `None` unless the record actually carries a sampling rate: the
+/// deprecated `samplingInterval` (IE 34) or `samplerRandomInterval` (IE 50),
+/// each a direct "1 in N" value, or the modern `samplingPacketInterval` (IE
+/// 305) with `samplingPacketSpace` (IE 306), whose rate is
+/// `(interval + space) / interval`. IE 34 is preferred over IE 50 over the
+/// 305/306 pair when more than one is present. Sampling and identifier elements
+/// are read only from the IANA registry (enterprise-specific elements merely
+/// reuse the numeric ids), and a record shorter than its template requires
+/// yields `None`.
+pub fn sampling_from_options_record(
+    template: &TemplateRecord,
+    record: &[u8],
+) -> Option<SamplingObservation> {
+    let scope_field_count = template.scope_field_count as usize;
+    let mut sampler: Vec<u8> = Vec::new();
+    let mut sampling_interval: Option<u64> = None;
+    let mut random_interval: Option<u64> = None;
+    let mut packet_interval: Option<u64> = None;
+    let mut packet_space: Option<u64> = None;
+    let mut index = 0usize;
+
+    walk_record_fields(template, record, |type_id, enterprise_number, raw| {
+        let field_index = index;
+        index += 1;
+
+        // Scope fields always identify the sampler; so do the IANA sampler-id
+        // elements even when they appear as ordinary option fields.
+        let is_scope = field_index < scope_field_count;
+        let is_sampler_id =
+            enterprise_number.is_none() && matches!(type_id, IE_FLOW_SAMPLER_ID | IE_SELECTOR_ID);
+        if is_scope || is_sampler_id {
+            push_identity_field(&mut sampler, enterprise_number, type_id, raw);
+        }
+        if is_scope || enterprise_number.is_some() {
+            return;
+        }
+        let slot = match type_id {
+            IE_SAMPLING_INTERVAL => &mut sampling_interval,
+            IE_SAMPLER_RANDOM_INTERVAL => &mut random_interval,
+            IE_SAMPLING_PACKET_INTERVAL => &mut packet_interval,
+            IE_SAMPLING_PACKET_SPACE => &mut packet_space,
+            _ => return,
+        };
+        *slot = Some(read_be_uint(raw));
+    })?;
+
+    let ratio = resolve_sampling_ratio(
+        sampling_interval,
+        random_interval,
+        packet_interval,
+        packet_space,
+    )?;
+    Some(SamplingObservation {
+        sampler: sampler.into_boxed_slice(),
+        ratio,
+    })
+}
+
+/// Resolves the decoded sampling elements into an exact [`SamplingRatio`], or
+/// `None` when none of them describe a usable rate. See
+/// [`sampling_from_options_record`] for the element precedence.
+fn resolve_sampling_ratio(
+    sampling_interval: Option<u64>,
+    random_interval: Option<u64>,
+    packet_interval: Option<u64>,
+    packet_space: Option<u64>,
+) -> Option<SamplingRatio> {
+    // IE 34 / IE 50 carry the "1 in N" rate directly: N in the population per
+    // 1 captured, i.e. numerator N over denominator 1.
+    for value in [sampling_interval, random_interval].into_iter().flatten() {
+        if value >= 1 {
+            return Some(SamplingRatio {
+                numerator: value,
+                denominator: 1,
+            });
+        }
+    }
+
+    // IE 305 / IE 306 describe a selection cycle: `interval` packets kept then
+    // `space` skipped, so the rate is `(interval + space) / interval`. Both are
+    // required to determine the cycle — an interval alone is ambiguous, so it is
+    // not treated as an advertisement (which would wrongly manufacture a 1:1
+    // rate and could overwrite a real one). Both terms are kept exact so a
+    // non-integral rate is not truncated here.
+    if let (Some(interval), Some(space)) = (packet_interval, packet_space) {
+        if interval >= 1 {
+            return Some(SamplingRatio {
+                numerator: interval.saturating_add(space),
+                denominator: interval,
+            });
+        }
+    }
+
+    None
 }
 
 // --- Bounds-checked big-endian readers ---

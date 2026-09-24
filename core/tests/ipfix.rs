@@ -9,8 +9,10 @@ mod common;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use common::{sample_ipfix_packet, set_ipfix_total_length, Builder};
+use common::{sample_ipfix_packet, sampler_identity, set_ipfix_total_length, Builder};
 use netflow_analyzer_core::records::FlowRecord;
+use netflow_analyzer_core::sampling::SamplingRatio;
+use netflow_analyzer_core::scope::{Scope, SINGLE_EXPORTER};
 use netflow_analyzer_core::FlowContext;
 
 #[test]
@@ -86,6 +88,19 @@ fn options_template_and_data_are_decoded_but_not_flows() {
             .options_records_processed
             .load(Ordering::Relaxed),
         1
+    );
+    // The samplingInterval (IE 34) carried by the options record is learned as a
+    // 1000/1 ratio for this exporter, observation domain (id 7), and sampler.
+    // The sampler identity is the framed observationDomainId (IE 149) scope field.
+    let sampler = sampler_identity(&[(None, 149, &7u32.to_be_bytes())]);
+    assert_eq!(ctx.sampling.len(), 1);
+    assert_eq!(
+        ctx.sampling
+            .get(SINGLE_EXPORTER, Scope::IpfixDomain(7), &sampler),
+        Some(SamplingRatio {
+            numerator: 1000,
+            denominator: 1
+        })
     );
 }
 

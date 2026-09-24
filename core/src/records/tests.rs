@@ -505,3 +505,158 @@ fn v5_timestamps_preserve_header_nanoseconds() {
     assert_eq!(fields.start_time_ns, 1_699_999_999_987_654_321);
     assert_eq!(fields.end_time_ns, 1_700_000_000_986_654_321);
 }
+
+/// An options template with one 4-byte scope field (`observationDomainId`, IE
+/// 149) followed by `options`.
+fn options_template(options: &[TemplateField]) -> TemplateRecord {
+    let mut fields = vec![field(149, 4)];
+    fields.extend_from_slice(options);
+    TemplateRecord::from_options_fields(260, 1, fields)
+}
+
+/// Rebuilds the framed sampler identity for one field, matching
+/// [`push_identity_field`].
+fn identity_field(enterprise: Option<u32>, type_id: u16, raw: &[u8]) -> Vec<u8> {
+    let mut buf = vec![enterprise.is_some() as u8];
+    buf.extend_from_slice(&enterprise.unwrap_or(0).to_be_bytes());
+    buf.extend_from_slice(&type_id.to_be_bytes());
+    buf.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+    buf.extend_from_slice(raw);
+    buf
+}
+
+fn ratio(numerator: u64, denominator: u64) -> SamplingRatio {
+    SamplingRatio {
+        numerator,
+        denominator,
+    }
+}
+
+#[test]
+fn sampling_prefers_ie34_over_ie50_and_305() {
+    // Scope + samplingPacketInterval/Space (305/306) + samplerRandomInterval (50)
+    // + samplingInterval (34); IE 34 wins.
+    let template = options_template(&[
+        field(IE_SAMPLING_PACKET_INTERVAL, 4),
+        field(IE_SAMPLING_PACKET_SPACE, 4),
+        field(IE_SAMPLER_RANDOM_INTERVAL, 4),
+        field(IE_SAMPLING_INTERVAL, 4),
+    ]);
+    let mut record = Vec::new();
+    record.extend_from_slice(&7u32.to_be_bytes()); // scope value
+    record.extend_from_slice(&1u32.to_be_bytes()); // samplingPacketInterval
+    record.extend_from_slice(&99u32.to_be_bytes()); // samplingPacketSpace
+    record.extend_from_slice(&512u32.to_be_bytes()); // samplerRandomInterval
+    record.extend_from_slice(&1000u32.to_be_bytes()); // samplingInterval
+
+    let observation = sampling_from_options_record(&template, &record).unwrap();
+    assert_eq!(observation.ratio, ratio(1000, 1));
+    // The sampler identity is just the framed observationDomainId scope field.
+    assert_eq!(
+        observation.sampler.as_ref(),
+        identity_field(None, 149, &7u32.to_be_bytes()).as_slice()
+    );
+}
+
+#[test]
+fn sampler_random_interval_is_ie50() {
+    let template = options_template(&[field(IE_SAMPLER_RANDOM_INTERVAL, 2)]);
+    let mut record = Vec::new();
+    record.extend_from_slice(&7u32.to_be_bytes());
+    record.extend_from_slice(&256u16.to_be_bytes());
+    assert_eq!(
+        sampling_from_options_record(&template, &record).map(|o| o.ratio),
+        Some(ratio(256, 1))
+    );
+}
+
+#[test]
+fn count_based_sampling_ratio_keeps_interval_and_space() {
+    // 1 packet kept then 999 skipped per cycle => 1000/1.
+    let template = options_template(&[
+        field(IE_SAMPLING_PACKET_INTERVAL, 4),
+        field(IE_SAMPLING_PACKET_SPACE, 4),
+    ]);
+    let mut record = Vec::new();
+    record.extend_from_slice(&7u32.to_be_bytes());
+    record.extend_from_slice(&1u32.to_be_bytes());
+    record.extend_from_slice(&999u32.to_be_bytes());
+    assert_eq!(
+        sampling_from_options_record(&template, &record).map(|o| o.ratio),
+        Some(ratio(1000, 1))
+    );
+
+    // 2 kept then 9 skipped per cycle => 11/2 (kept exact rather than truncated).
+    let mut record = Vec::new();
+    record.extend_from_slice(&7u32.to_be_bytes());
+    record.extend_from_slice(&2u32.to_be_bytes());
+    record.extend_from_slice(&9u32.to_be_bytes());
+    assert_eq!(
+        sampling_from_options_record(&template, &record).map(|o| o.ratio),
+        Some(ratio(11, 2))
+    );
+}
+
+#[test]
+fn count_based_sampling_requires_both_interval_and_space() {
+    // samplingPacketInterval (IE 305) alone is ambiguous without the space, so
+    // it is not treated as a sampling advertisement.
+    let template = options_template(&[field(IE_SAMPLING_PACKET_INTERVAL, 4)]);
+    let mut record = Vec::new();
+    record.extend_from_slice(&7u32.to_be_bytes());
+    record.extend_from_slice(&2u32.to_be_bytes());
+    assert_eq!(sampling_from_options_record(&template, &record), None);
+}
+
+#[test]
+fn sampler_id_option_field_disambiguates_a_shared_scope() {
+    // Two records under the same (observationDomainId) scope but different
+    // flowSamplerId (IE 48) values must produce distinct sampler identities.
+    let template =
+        options_template(&[field(IE_FLOW_SAMPLER_ID, 1), field(IE_SAMPLING_INTERVAL, 4)]);
+    let build = |sampler_id: u8, interval: u32| {
+        let mut record = 7u32.to_be_bytes().to_vec();
+        record.push(sampler_id);
+        record.extend_from_slice(&interval.to_be_bytes());
+        sampling_from_options_record(&template, &record).unwrap()
+    };
+
+    let first = build(1, 100);
+    let second = build(2, 200);
+    assert_ne!(first.sampler, second.sampler);
+    assert_eq!(first.ratio, ratio(100, 1));
+    assert_eq!(second.ratio, ratio(200, 1));
+
+    let mut expected = identity_field(None, 149, &7u32.to_be_bytes());
+    expected.extend_from_slice(&identity_field(None, IE_FLOW_SAMPLER_ID, &[1]));
+    assert_eq!(first.sampler.as_ref(), expected.as_slice());
+}
+
+#[test]
+fn sampling_ignores_enterprise_zero_and_short_records() {
+    // A zero interval carries no scaling information and is rejected.
+    let zero = options_template(&[field(IE_SAMPLING_INTERVAL, 4)]);
+    let mut record = Vec::new();
+    record.extend_from_slice(&7u32.to_be_bytes());
+    record.extend_from_slice(&0u32.to_be_bytes());
+    assert_eq!(sampling_from_options_record(&zero, &record), None);
+
+    // An enterprise-specific element that merely reuses id 34 is not IANA IE 34.
+    let enterprise_field = TemplateField {
+        type_id: IE_SAMPLING_INTERVAL,
+        length: 4,
+        enterprise_number: Some(9),
+    };
+    let enterprise = options_template(&[enterprise_field]);
+    let mut record = Vec::new();
+    record.extend_from_slice(&7u32.to_be_bytes());
+    record.extend_from_slice(&1000u32.to_be_bytes());
+    assert_eq!(sampling_from_options_record(&enterprise, &record), None);
+
+    // A record shorter than the template requires yields nothing.
+    let template = options_template(&[field(IE_SAMPLING_INTERVAL, 4)]);
+    assert_eq!(
+        sampling_from_options_record(&template, &[0, 0, 0, 7, 0, 0]),
+        None
+    );
+}

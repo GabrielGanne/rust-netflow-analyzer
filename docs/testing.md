@@ -39,9 +39,11 @@ Additional Criterion arguments can be passed after the command, for example
 - Integration tests cover NetFlow v5, NetFlow v9, IPFIX, decode-only mode,
   malformed/truncated input, limits, metadata, and aging behavior.
 - FFI unit tests cover lifecycle, error mapping, configuration, callbacks, and
-  decode-only callbacks.
+  decode-only callbacks, including pinned public structure layouts.
 - `core/examples/udp_listener.rs` is a runnable Rust example.
-- `examples/c_integration/main.c` is a runnable C ABI smoke test.
+- `examples/c_integration/main.c` is a runnable C ABI smoke test; its companion
+  checks compile the header as C11 and C++11, pin every public structure field
+  offset, link-probe each API function, and verify the exported symbol set.
 - `core/benches/process_packet.rs` provides v5, v9, IPFIX, warm-cache, and
   cold-context throughput cases.
 
@@ -58,10 +60,9 @@ Additional Criterion arguments can be passed after the command, for example
    flushing, repeated aging start/stop, bounded cache behavior under load, and
    replace timing sleeps with an injectable or controllable clock where tests
    need deterministic time.
-4. Expand the examples and ABI checks. Add a decode-only C example or extend
-   the current one to assert callback fields, null/empty inputs, explicit
-   timestamps, and public structure sizes/layouts. Keep examples executable by
-   the local gate.
+4. Expand the C example with decode-only coverage, callback-field assertions,
+   null/empty inputs, and explicit timestamps. Keep examples executable by the
+   local gate.
 5. Characterize performance. Keep benchmarks representative and small enough
    to run locally; record packet size, records per packet, template warmness,
    cache hit/miss behavior, and environment details when comparing results.

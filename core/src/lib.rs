@@ -6,6 +6,7 @@ pub mod cache;
 pub mod clock;
 pub mod parser;
 pub mod records;
+pub mod sampling;
 pub mod scope;
 pub mod stats;
 
@@ -22,6 +23,7 @@ use parser::{
     IPFIX_HEADER_LEN, SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
 };
 use records::{FlowFields, FlowRecord, RecordTimeContext};
+use sampling::SamplingTracker;
 use scope::{ExporterKey, Scope, SINGLE_EXPORTER};
 use stats::{InternalCounters, NetflowAnalyzerStats};
 
@@ -90,6 +92,9 @@ pub struct FlowContext {
     pub templates: Arc<TemplateCache>,
     pub flows: Arc<FlowCache>,
     pub clocks: Arc<ClockTracker>,
+    /// Packet-sampling factors learned per `(exporter, scope, sampler)` from
+    /// options data records (see [`sampling::SamplingTracker`]).
+    pub sampling: Arc<SamplingTracker>,
     aging_cfg: AgingConfig,
     clock_cfg: ClockConfig,
     aging: Mutex<Option<AgingHandle>>,
@@ -108,6 +113,7 @@ impl FlowContext {
             templates: Arc::new(TemplateCache::new(cfg.max_templates)),
             flows: Arc::new(FlowCache::new(cfg.max_flows)),
             clocks: Arc::new(ClockTracker::new(cfg.max_templates)),
+            sampling: Arc::new(SamplingTracker::new(cfg.max_templates)),
             aging_cfg: cfg.aging,
             clock_cfg: cfg.clock,
             aging: Mutex::new(None),
@@ -516,21 +522,10 @@ impl FlowContext {
         };
 
         // Options data records carry exporter metadata, not observed flows, so
-        // they are decoded and counted separately without polluting the flow
+        // they are decoded and interpreted separately without polluting the flow
         // cache. `count` therefore tracks only flow records for the return value.
         let is_options = template.is_options;
         let mut count = 0usize;
-
-        let mut consume = |fields: &FlowFields| {
-            if is_options {
-                self.counters
-                    .options_records_processed
-                    .fetch_add(1, Ordering::Relaxed);
-            } else {
-                sink(exporter, scope, fields);
-                count += 1;
-            }
-        };
 
         match template.fixed_length {
             Some(record_len) if record_len > 0 => {
@@ -538,7 +533,12 @@ impl FlowContext {
                     if let Some((fields, _)) =
                         FlowFields::from_record_sized_at(&template, record, Some(time_context))
                     {
-                        consume(&fields);
+                        if is_options {
+                            self.consume_options_record(exporter, scope, &template, record);
+                        } else {
+                            sink(exporter, scope, &fields);
+                            count += 1;
+                        }
                     }
                 }
             }
@@ -548,7 +548,17 @@ impl FlowContext {
                 while !cursor.is_empty() {
                     match FlowFields::from_record_sized_at(&template, cursor, Some(time_context)) {
                         Some((fields, consumed)) if consumed > 0 && consumed <= cursor.len() => {
-                            consume(&fields);
+                            if is_options {
+                                self.consume_options_record(
+                                    exporter,
+                                    scope,
+                                    &template,
+                                    &cursor[..consumed],
+                                );
+                            } else {
+                                sink(exporter, scope, &fields);
+                                count += 1;
+                            }
                             cursor = &cursor[consumed..];
                         }
                         _ => break,
@@ -560,6 +570,28 @@ impl FlowContext {
         }
 
         count
+    }
+
+    /// Counts one decoded options data record and interprets the exporter
+    /// metadata it carries. Currently that means learning the packet-sampling
+    /// ratio (from `samplingInterval` IE 34, `samplerRandomInterval` IE 50, or
+    /// the `samplingPacketInterval` / `samplingPacketSpace` pair IE 305/306) for
+    /// the sampler this record configures, so flow counters can later be scaled
+    /// by it.
+    fn consume_options_record(
+        &self,
+        exporter: ExporterKey,
+        scope: Scope,
+        template: &parser::TemplateRecord,
+        record: &[u8],
+    ) {
+        self.counters
+            .options_records_processed
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(observation) = records::sampling_from_options_record(template, record) {
+            self.sampling
+                .observe(exporter, scope, observation.sampler, observation.ratio);
+        }
     }
 
     /// Starts the background aging thread. Idle flows are evicted and long-lived
@@ -646,10 +678,10 @@ impl FlowContext {
     ///
     /// This is the transport-session reset primitive. Its resident flows are
     /// emitted through `on_emit` **first** (so traffic accumulated since the
-    /// last aging sweep is not lost), then its templates and clock state are
-    /// dropped. Call it before a key is retired — for example when an exporter
-    /// restarts — so the bounded caches do not fill permanently with the stale
-    /// state of gone sessions. See `docs/exporter-identity.md` for the key
+    /// last aging sweep is not lost), then its templates, clock, and sampling
+    /// state are dropped. Call it before a key is retired — for example when an
+    /// exporter restarts — so the bounded caches do not fill permanently with
+    /// the stale state of gone sessions. See `docs/exporter-identity.md` for the key
     /// contract and listener key-rotation rules.
     ///
     /// Purge reclaims *local* cache capacity; it does not retract a key that
@@ -683,6 +715,7 @@ impl FlowContext {
             .purge_exporter(exporter, &self.counters, &on_emit);
         self.templates.purge_exporter(exporter);
         self.clocks.purge_exporter(exporter);
+        self.sampling.purge_exporter(exporter);
         emitted
     }
 

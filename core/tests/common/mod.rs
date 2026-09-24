@@ -39,6 +39,22 @@ pub fn set_ipfix_total_length(buf: &mut [u8]) {
     buf[2..4].copy_from_slice(&len.to_be_bytes());
 }
 
+/// Rebuilds the opaque sampler identity the engine derives from an options
+/// record's scope (and sampler-id) fields, for asserting learned sampling
+/// state. Each entry is `(enterprise_pen, element_id, raw_value)`; the framing
+/// mirrors `records::sampling_from_options_record`.
+pub fn sampler_identity(fields: &[(Option<u32>, u16, &[u8])]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for &(enterprise, type_id, raw) in fields {
+        buf.push(enterprise.is_some() as u8);
+        buf.extend_from_slice(&enterprise.unwrap_or(0).to_be_bytes());
+        buf.extend_from_slice(&type_id.to_be_bytes());
+        buf.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+        buf.extend_from_slice(raw);
+    }
+    buf
+}
+
 /// A NetFlow v9 packet with a 7-field template (id 256) and one data record.
 pub fn sample_v9_packet() -> Vec<u8> {
     let mut b = Builder::new();
