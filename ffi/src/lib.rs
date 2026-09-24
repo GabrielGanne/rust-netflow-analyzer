@@ -26,7 +26,7 @@ pub const NETFLOW_ANALYZER_SCOPE_V5: u8 = 2;
 /// rebuilt for. A consumer can compare this compile-time value from the header
 /// against [`netflow_analyzer_abi_version`] at runtime to detect a header/library
 /// mismatch before using the API.
-pub const NETFLOW_ANALYZER_ABI_VERSION: u32 = 1;
+pub const NETFLOW_ANALYZER_ABI_VERSION: u32 = 2;
 
 /// C-compatible callback invoked whenever a flow is emitted: from the
 /// background aging thread on idle eviction or active-timeout rollover, and
@@ -308,7 +308,9 @@ fn zeroed_stats() -> NetflowAnalyzerStats {
         flows_output: 0,
         flows_dropped: 0,
         active_flows: 0,
-        reserved: [0; 8],
+        options_templates_received: 0,
+        options_records_processed: 0,
+        reserved: [0; 6],
     }
 }
 
@@ -828,6 +830,67 @@ mod tests {
         buf
     }
 
+    /// NetFlow v9 packet with one options template (id 260) and one options
+    /// data record (a samplingInterval), used to exercise the options metrics.
+    fn v9_options_packet() -> Vec<u8> {
+        let mut buf = Vec::new();
+        let put = |value: u64, width: usize, buf: &mut Vec<u8>| {
+            for i in 0..width {
+                buf.push((value >> (8 * (width - 1 - i))) as u8);
+            }
+        };
+        // Header (domain 42).
+        put(9, 2, &mut buf);
+        put(2, 2, &mut buf);
+        put(1000, 4, &mut buf);
+        put(1_700_000_000, 4, &mut buf);
+        put(1, 4, &mut buf);
+        put(42, 4, &mut buf);
+        // Options template FlowSet (id 1): template 260, one scope field
+        // (SYSTEM) and one option field (samplingInterval).
+        put(1, 2, &mut buf);
+        put(18, 2, &mut buf); // 4 + 14
+        put(260, 2, &mut buf);
+        put(4, 2, &mut buf); // option scope length (bytes)
+        put(4, 2, &mut buf); // option length (bytes)
+        put(1, 2, &mut buf); // scope field: SYSTEM
+        put(4, 2, &mut buf);
+        put(34, 2, &mut buf); // option field: samplingInterval
+        put(4, 2, &mut buf);
+        // Options data FlowSet (id 260): one 8-byte record.
+        put(260, 2, &mut buf);
+        put(12, 2, &mut buf); // 4 + 8
+        put(1, 4, &mut buf); // scope value
+        put(1000, 4, &mut buf); // samplingInterval
+        buf
+    }
+
+    #[test]
+    fn options_metrics_surface_in_stats() {
+        let state = TestState {
+            count: AtomicU32::new(0),
+            last_proto: AtomicU32::new(0),
+        };
+        let ud = &state as *const TestState as *mut c_void;
+        let ctx = unsafe { netflow_analyzer_create(ptr::null(), Some(count_cb), ud) };
+
+        let packet = v9_options_packet();
+        // Options records are not flows, so nothing is returned or cached.
+        let n =
+            unsafe { netflow_analyzer_process_packet(ctx, packet.as_ptr(), packet.len() as u32) };
+        assert_eq!(n, 0);
+
+        let stats = unsafe { netflow_analyzer_get_stats(ctx) };
+        assert_eq!(stats.options_templates_received, 1);
+        assert_eq!(stats.options_records_processed, 1);
+        // They are counted separately from flow templates/records.
+        assert_eq!(stats.templates_received, 0);
+        assert_eq!(stats.data_records_processed, 0);
+        assert_eq!(stats.active_flows, 0);
+
+        unsafe { netflow_analyzer_destroy(ctx) };
+    }
+
     #[test]
     fn config_from_zero_uses_defaults() {
         let zero = NetflowAnalyzerConfig {
@@ -1219,7 +1282,15 @@ mod tests {
         assert_eq!(offset_of!(NetflowAnalyzerStats, flows_output), 56);
         assert_eq!(offset_of!(NetflowAnalyzerStats, flows_dropped), 64);
         assert_eq!(offset_of!(NetflowAnalyzerStats, active_flows), 72);
-        assert_eq!(offset_of!(NetflowAnalyzerStats, reserved), 80);
+        assert_eq!(
+            offset_of!(NetflowAnalyzerStats, options_templates_received),
+            80
+        );
+        assert_eq!(
+            offset_of!(NetflowAnalyzerStats, options_records_processed),
+            88
+        );
+        assert_eq!(offset_of!(NetflowAnalyzerStats, reserved), 96);
 
         assert_eq!(size_of::<NetflowAnalyzerFlowRecord>(), 216);
         assert_eq!(align_of::<NetflowAnalyzerFlowRecord>(), 8);
@@ -1276,7 +1347,7 @@ mod tests {
         let ud = &state as *const TestState as *mut c_void;
         let ctx = unsafe { netflow_analyzer_create(ptr::null(), Some(count_cb), ud) };
         let stats = unsafe { netflow_analyzer_get_stats(ctx) };
-        assert_eq!(stats.reserved, [0u64; 8]);
+        assert_eq!(stats.reserved, [0u64; 6]);
         unsafe { netflow_analyzer_destroy(ctx) };
     }
 

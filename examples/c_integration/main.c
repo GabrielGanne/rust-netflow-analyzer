@@ -100,14 +100,16 @@ int main(void) {
     netflow_analyzer_flush(ctx);
 
     NetflowAnalyzerStats stats = netflow_analyzer_get_stats(ctx);
-    printf("[stats] parsed=%llu parse_errors=%llu templates=%llu records=%llu output=%llu dropped=%llu active=%llu\n",
+    printf("[stats] parsed=%llu parse_errors=%llu templates=%llu records=%llu output=%llu dropped=%llu active=%llu opt_templates=%llu opt_records=%llu\n",
            (unsigned long long)stats.pkts_parsed,
            (unsigned long long)stats.pkts_parse_error,
            (unsigned long long)stats.templates_received,
            (unsigned long long)stats.data_records_processed,
            (unsigned long long)stats.flows_output,
            (unsigned long long)stats.flows_dropped,
-           (unsigned long long)stats.active_flows);
+           (unsigned long long)stats.active_flows,
+           (unsigned long long)stats.options_templates_received,
+           (unsigned long long)stats.options_records_processed);
 
     netflow_analyzer_destroy(ctx);
 

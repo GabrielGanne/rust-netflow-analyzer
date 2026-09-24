@@ -64,11 +64,18 @@ pub struct NetflowAnalyzerStats {
     pub flows_dropped: u64,
     /// Number of flows currently resident in the state cache.
     pub active_flows: u64,
+    /// Options templates decoded and stored (NetFlow v9 set id 1, IPFIX set id
+    /// 3). These describe options data records, not flows.
+    pub options_templates_received: u64,
+    /// Options data records decoded. These carry exporter metadata (such as the
+    /// packet-sampling configuration) rather than observed flows, so they are
+    /// counted here instead of in `data_records_processed`.
+    pub options_records_processed: u64,
     /// Reserved for future counters. Always zero today; kept so fields can be
     /// added within this space without changing the struct size or ABI. Which
     /// slots carry meaning is tied to the C ABI version reported by the FFI
     /// `netflow_analyzer_abi_version` function.
-    pub reserved: [u64; 8],
+    pub reserved: [u64; 6],
 }
 
 impl InternalCounters {
@@ -86,7 +93,9 @@ impl InternalCounters {
             flows_output: self.flows_output.load(Ordering::Relaxed),
             flows_dropped: self.flows_dropped.load(Ordering::Relaxed),
             active_flows,
-            reserved: [0; 8],
+            options_templates_received: self.options_templates_received.load(Ordering::Relaxed),
+            options_records_processed: self.options_records_processed.load(Ordering::Relaxed),
+            reserved: [0; 6],
         }
     }
 }

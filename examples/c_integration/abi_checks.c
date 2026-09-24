@@ -45,7 +45,7 @@ static_assert(offsetof(NetflowAnalyzerConfig, clock_fallback_to_receipt_time) ==
 static_assert(offsetof(NetflowAnalyzerConfig, max_clock_skew_ns) == 48, "Config layout changed");
 static_assert(offsetof(NetflowAnalyzerConfig, reserved) == 56, "Config reserved tail moved");
 
-/* NetflowAnalyzerStats: ten u64 counters/gauges, then [u64;8]. */
+/* NetflowAnalyzerStats: twelve u64 counters/gauges, then [u64;6]. */
 static_assert(sizeof(NetflowAnalyzerStats) == 144, "Stats size changed (ABI break)");
 static_assert(NFA_ALIGNOF(NetflowAnalyzerStats) == 8, "Stats alignment changed (ABI break)");
 static_assert(offsetof(NetflowAnalyzerStats, pkts_parsed) == 0, "Stats layout changed");
@@ -58,7 +58,9 @@ static_assert(offsetof(NetflowAnalyzerStats, data_records_processed) == 48, "Sta
 static_assert(offsetof(NetflowAnalyzerStats, flows_output) == 56, "Stats layout changed");
 static_assert(offsetof(NetflowAnalyzerStats, flows_dropped) == 64, "Stats layout changed");
 static_assert(offsetof(NetflowAnalyzerStats, active_flows) == 72, "Stats layout changed");
-static_assert(offsetof(NetflowAnalyzerStats, reserved) == 80, "Stats reserved tail moved");
+static_assert(offsetof(NetflowAnalyzerStats, options_templates_received) == 80, "Stats layout changed");
+static_assert(offsetof(NetflowAnalyzerStats, options_records_processed) == 88, "Stats layout changed");
+static_assert(offsetof(NetflowAnalyzerStats, reserved) == 96, "Stats reserved tail moved");
 
 /* NetflowAnalyzerFlowRecord: addresses, ports, scope, counters, times, [u64;8]. */
 static_assert(sizeof(NetflowAnalyzerFlowRecord) == 216, "FlowRecord size changed (ABI break)");

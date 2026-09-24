@@ -27,7 +27,7 @@
  * against [`netflow_analyzer_abi_version`] at runtime to detect a header/library
  * mismatch before using the API.
  */
-#define NETFLOW_ANALYZER_ABI_VERSION 1
+#define NETFLOW_ANALYZER_ABI_VERSION 2
 
 #define NETFLOW_ANALYZER_PRESENT_FLOW_ID (1 << 0)
 
@@ -261,12 +261,23 @@ typedef struct {
      */
     uint64_t active_flows;
     /**
+     * Options templates decoded and stored (NetFlow v9 set id 1, IPFIX set id
+     * 3). These describe options data records, not flows.
+     */
+    uint64_t options_templates_received;
+    /**
+     * Options data records decoded. These carry exporter metadata (such as the
+     * packet-sampling configuration) rather than observed flows, so they are
+     * counted here instead of in `data_records_processed`.
+     */
+    uint64_t options_records_processed;
+    /**
      * Reserved for future counters. Always zero today; kept so fields can be
      * added within this space without changing the struct size or ABI. Which
      * slots carry meaning is tied to the C ABI version reported by the FFI
      * `netflow_analyzer_abi_version` function.
      */
-    uint64_t reserved[8];
+    uint64_t reserved[6];
 } NetflowAnalyzerStats;
 
 /**
@@ -301,6 +312,8 @@ typedef struct {
 typedef void (*NetflowAnalyzerRecordCallback)(uint32_t observation_domain_id,
                                               const NetflowAnalyzerFlowRecord *record,
                                               void *user_data);
+
+
 
 #ifdef __cplusplus
 extern "C" {

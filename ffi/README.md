@@ -32,8 +32,11 @@ The C interface is versioned:
   `netflow_analyzer_abi_version()` let a consumer detect a header/library
   mismatch and refuse to run on disagreement.
 - Every public struct (`NetflowAnalyzerConfig`, `NetflowAnalyzerStats`,
-  `NetflowAnalyzerFlowRecord`) carries a trailing `reserved[8]` so new fields
-  can be added within that space without changing its size or layout.
+  `NetflowAnalyzerFlowRecord`) carries a trailing `reserved[…]` array so new
+  fields can be added within that space without changing its size or layout. A
+  field consumes reserved slots and bumps the ABI version (for example
+  `NetflowAnalyzerStats` added `options_templates_received` /
+  `options_records_processed` in ABI version 2, leaving `reserved[6]`).
 - Any change that alters a public struct's size/layout or a function signature
   is an **ABI break** and bumps `NETFLOW_ANALYZER_ABI_VERSION`.
 

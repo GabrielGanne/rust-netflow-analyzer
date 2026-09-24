@@ -26,6 +26,13 @@ include = [
     "NetflowAnalyzerFlowRecord",
     "NetflowAnalyzerStats",
 ]
+# Internal core types that are reachable through the parsed dependency but are
+# not part of the C ABI (they never appear in an exported function signature).
+exclude = [
+    "SamplingRatio",
+    "SamplerSelector",
+    "SamplingObservation",
+]
 prefix = ""
 
 [enum]
