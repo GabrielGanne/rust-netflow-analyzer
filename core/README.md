@@ -23,6 +23,20 @@ let stats = ctx.stats();
 Use `decode_packet`/`decode_packet_at` for a decode-only path that delivers each
 record to a sink without touching the flow cache.
 
+## Aggregation semantics
+
+The engine performs additive flow aggregation keyed by
+`(exporter_key, Scope, identity)`, with idle-timeout eviction and active-timeout
+rollover (periodic intermediate dumps), and normalizes counters by the sampling
+rate advertised in NetFlow v9 / IPFIX options records. Flow deduplication
+(max-instead-of-sum and cross-observation-point), bidirectional (biflow)
+aggregation, and empty-record dropping are **out of scope** for this release;
+NetFlow v5 header sampling is not yet applied. Timeout-based emission runs on the
+background aging worker, which a Rust caller must start with `start_aging`. See
+the [aggregation semantics doc][agg] for the full model and its limitations.
+
+[agg]: https://github.com/GabrielGanne/rust-netflow-analyzer/blob/main/docs/aggregation.md
+
 ## License
 
 Licensed under the Mozilla Public License 2.0 (MPL-2.0). See the workspace

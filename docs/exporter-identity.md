@@ -52,21 +52,22 @@ added later.
 
 This matches the common cases — one global sampler per domain, or per-sampler
 rates tagged with `flowSamplerId`/`selectorId` — precisely. Two paths are
-**out of scope for the first release**, and in both the flow is left **unscaled**
-(factor 1) rather than mis-scaled:
+**out of scope for the first release**:
 
 - Samplers scoped only by a key a flow cannot carry (per interface or line card
   with no `flowSamplerId`/`selectorId`). Such options records all fall into the
   `Domain` bucket; if they advertise **conflicting** rates the bucket is marked
-  ambiguous and untagged flows in that domain are left unscaled. A genuine
-  reconfiguration of a single domain-wide sampler to a new rate is
-  indistinguishable from this case and likewise stops scaling that domain until
-  its state is purged (`purge_exporter`).
+  ambiguous and untagged flows in that domain are left **unscaled** (factor 1)
+  rather than mis-scaled. A genuine reconfiguration of a single domain-wide
+  sampler to a new rate is indistinguishable from this case and likewise stops
+  scaling that domain until its state is purged (`purge_exporter`).
 - The full PSAMP selection-sequence indirection (RFC 5476/5477): data records
   that identify the applied selection with `selectionSequenceId` (IE 301) and a
   separate selection-sequence report mapping it to primitive `selectorId`s. Only
   a direct `selectorId`/`flowSamplerId` on the flow is matched today; a flow
-  carrying only `selectionSequenceId` stays `Domain`.
+  carrying only `selectionSequenceId` is not associated with its selector and
+  falls back to the `Domain` sampler — so it is scaled by a domain-wide rate if
+  one is configured (which may not be its true rate), and unscaled otherwise.
 
 A single `FlowContext` can therefore safely serve many exporters at once.
 
