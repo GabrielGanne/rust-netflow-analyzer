@@ -107,6 +107,75 @@ fn options_template_and_data_are_decoded_but_not_flows() {
 }
 
 #[test]
+fn options_sampling_scales_ipfix_flow_counters() {
+    // One IPFIX message that advertises a domain-wide 1-in-100 sampler (via an
+    // options record) and then a flow whose byte/packet counters must be scaled
+    // by that rate before it is cached.
+    let mut b = Builder::new();
+    b.put(10, 2) // version
+        .put(0, 2) // total length (patched below)
+        .put(1_700_000_000, 4) // export time
+        .put(5, 4) // sequence
+        .put(7, 4); // observation domain id
+
+    // Options Template Set (set id 3): template 260, scope observationDomainId
+    // (IE 149), option samplingInterval (IE 34).
+    b.put(3, 2)
+        .put(18, 2) // set length = 4 + 14
+        .put(260, 2) // template id
+        .put(2, 2) // total field count
+        .put(1, 2) // scope field count
+        .put(149, 2) // scope: observationDomainId
+        .put(4, 2)
+        .put(34, 2) // option: samplingInterval
+        .put(4, 2);
+    // Options Data Set (set id 260): domain 7, samplingInterval 100.
+    b.put(260, 2).put(12, 2).put(7, 4).put(100, 4);
+
+    // Flow Template Set (set id 2): template 300 with IN_BYTES, IN_PKTS, PROTOCOL.
+    b.put(2, 2)
+        .put(20, 2) // set length = 4 + 16
+        .put(300, 2)
+        .put(3, 2)
+        .put(1, 2) // IN_BYTES
+        .put(4, 2)
+        .put(2, 2) // IN_PKTS
+        .put(4, 2)
+        .put(4, 2) // PROTOCOL
+        .put(1, 2);
+    // Flow Data Set (set id 300): 1500 bytes / 10 packets, proto 6.
+    b.put(300, 2)
+        .put(13, 2) // set length = 4 + 9
+        .put(1500, 4)
+        .put(10, 4)
+        .put(6, 1);
+
+    set_ipfix_total_length(&mut b.buf);
+    let ctx = FlowContext::new();
+    assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
+    assert_eq!(
+        ctx.sampling.get(
+            SINGLE_EXPORTER,
+            Scope::IpfixDomain(7),
+            SamplerSelector::Domain
+        ),
+        Some(SamplingRatio {
+            numerator: 100,
+            denominator: 1
+        })
+    );
+
+    let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = collected.clone();
+    ctx.flush(move |rec| sink.lock().unwrap().push(rec.clone()));
+    let flows = collected.lock().unwrap();
+    assert_eq!(flows.len(), 1);
+    assert_eq!(flows[0].bytes, 150_000); // 1500 * 100
+    assert_eq!(flows[0].packets, 1_000); // 10 * 100
+    assert_eq!(flows[0].proto, 6);
+}
+
+#[test]
 fn trailing_bytes_beyond_total_length_are_ignored() {
     // Bytes past the declared message length must not be walked: appending
     // garbage after `total_length` leaves decoding unchanged.

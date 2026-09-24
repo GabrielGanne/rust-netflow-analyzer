@@ -319,6 +319,195 @@ fn per_sampler_ratio_scales_by_the_flows_own_selector() {
 }
 
 #[test]
+fn count_based_options_sampling_scales_flow_counters() {
+    // A sampler advertised with the count-based pair samplingPacketInterval (IE
+    // 305) = 1 and samplingPacketSpace (IE 306) = 99 is a 1-in-100 rate.
+    let mut b = Builder::new();
+    b.put(9, 2)
+        .put(1, 2)
+        .put(1000, 4)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(42, 4);
+
+    // Options template 260: scope SYSTEM (IE 1), options IE 305 + IE 306.
+    b.put(1, 2)
+        .put(22, 2) // length = 4 + 6 + 3*4
+        .put(260, 2)
+        .put(4, 2) // scope length (one specifier)
+        .put(8, 2) // option length (two specifiers)
+        .put(1, 2) // scope: SYSTEM
+        .put(4, 2)
+        .put(305, 2) // samplingPacketInterval
+        .put(4, 2)
+        .put(306, 2) // samplingPacketSpace
+        .put(4, 2);
+    b.put(260, 2)
+        .put(16, 2) // length = 4 + 12
+        .put(1, 4) // scope value
+        .put(1, 4) // samplingPacketInterval
+        .put(99, 4); // samplingPacketSpace
+
+    // Flow template 300 + one data record (50 bytes / 2 packets).
+    b.put(0, 2)
+        .put(16, 2) // length = 4 + 4 + 2*4
+        .put(300, 2)
+        .put(2, 2)
+        .put(1, 2) // IN_BYTES
+        .put(4, 2)
+        .put(2, 2) // IN_PKTS
+        .put(4, 2);
+    b.put(300, 2).put(12, 2).put(50, 4).put(2, 4);
+
+    let ctx = FlowContext::new();
+    assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
+    assert_eq!(
+        ctx.sampling.get(
+            SINGLE_EXPORTER,
+            Scope::V9Domain(42),
+            SamplerSelector::Domain
+        ),
+        Some(SamplingRatio {
+            numerator: 100,
+            denominator: 1
+        })
+    );
+
+    let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = collected.clone();
+    ctx.flush(move |rec| sink.lock().unwrap().push(rec.clone()));
+    let flows = collected.lock().unwrap();
+    assert_eq!(flows.len(), 1);
+    assert_eq!(flows[0].bytes, 5_000); // 50 * 100
+    assert_eq!(flows[0].packets, 200); // 2 * 100
+}
+
+#[test]
+fn conflicting_domain_sampling_leaves_the_flow_unscaled() {
+    // Two options records for the same domain with no selector advertise
+    // different rates, so the domain sampler is ambiguous and the flow is left
+    // unscaled rather than mis-scaled.
+    let mut b = Builder::new();
+    b.put(9, 2)
+        .put(1, 2)
+        .put(1000, 4)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(42, 4);
+
+    // Options template 260: scope SYSTEM (IE 1), option samplingInterval (IE 34).
+    b.put(1, 2)
+        .put(18, 2)
+        .put(260, 2)
+        .put(4, 2)
+        .put(4, 2)
+        .put(1, 2)
+        .put(4, 2)
+        .put(34, 2)
+        .put(4, 2);
+    // Options data set 260: two 8-byte records with conflicting rates.
+    b.put(260, 2)
+        .put(20, 2) // length = 4 + 2*8
+        .put(1, 4) // scope value
+        .put(100, 4) // samplingInterval
+        .put(1, 4) // scope value
+        .put(200, 4); // samplingInterval (conflict)
+
+    // Flow template 300 + one data record.
+    b.put(0, 2)
+        .put(16, 2)
+        .put(300, 2)
+        .put(2, 2)
+        .put(1, 2)
+        .put(4, 2)
+        .put(2, 2)
+        .put(4, 2);
+    b.put(300, 2).put(12, 2).put(50, 4).put(2, 4);
+
+    let ctx = FlowContext::new();
+    assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
+    // The conflicting advertisements poisoned the domain bucket.
+    assert_eq!(
+        ctx.sampling.get(
+            SINGLE_EXPORTER,
+            Scope::V9Domain(42),
+            SamplerSelector::Domain
+        ),
+        None
+    );
+
+    let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = collected.clone();
+    ctx.flush(move |rec| sink.lock().unwrap().push(rec.clone()));
+    let flows = collected.lock().unwrap();
+    assert_eq!(flows.len(), 1);
+    // Left unscaled (factor 1), not mis-scaled by either rate.
+    assert_eq!(flows[0].bytes, 50);
+    assert_eq!(flows[0].packets, 2);
+}
+
+#[test]
+fn flow_with_an_unadvertised_sampler_is_not_scaled() {
+    // A sampler is advertised for flowSamplerId 7, but the flow tags itself with
+    // flowSamplerId 9, which has no known rate, so its counters are unscaled.
+    let mut b = Builder::new();
+    b.put(9, 2)
+        .put(1, 2)
+        .put(1000, 4)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(42, 4);
+
+    // Options template 260: scope observationDomainId (IE 149), options
+    // flowSamplerId (IE 48) + samplingInterval (IE 34).
+    b.put(1, 2)
+        .put(22, 2)
+        .put(260, 2)
+        .put(4, 2)
+        .put(8, 2)
+        .put(149, 2)
+        .put(4, 2)
+        .put(48, 2)
+        .put(1, 2)
+        .put(34, 2)
+        .put(4, 2);
+    b.put(260, 2).put(13, 2).put(42, 4).put(7, 1).put(100, 4);
+
+    // Flow template 300: IN_BYTES, IN_PKTS, flowSamplerId.
+    b.put(0, 2)
+        .put(20, 2)
+        .put(300, 2)
+        .put(3, 2)
+        .put(1, 2)
+        .put(4, 2)
+        .put(2, 2)
+        .put(4, 2)
+        .put(48, 2)
+        .put(1, 2);
+    // Data record tagged with the *unadvertised* flowSamplerId 9.
+    b.put(300, 2).put(13, 2).put(50, 4).put(2, 4).put(9, 1);
+
+    let ctx = FlowContext::new();
+    assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
+    assert_eq!(
+        ctx.sampling.get(
+            SINGLE_EXPORTER,
+            Scope::V9Domain(42),
+            SamplerSelector::FlowSampler(9)
+        ),
+        None
+    );
+
+    let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = collected.clone();
+    ctx.flush(move |rec| sink.lock().unwrap().push(rec.clone()));
+    let flows = collected.lock().unwrap();
+    assert_eq!(flows.len(), 1);
+    assert_eq!(flows[0].bytes, 50);
+    assert_eq!(flows[0].packets, 2);
+}
+
+#[test]
 fn unknown_reserved_set_id_is_skipped() {
     // Set id 100 (reserved, < 256, not a template/options id) is ignored.
     let mut b = Builder::new();
