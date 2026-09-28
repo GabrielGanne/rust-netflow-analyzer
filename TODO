@@ -113,7 +113,7 @@
 - [x] Add and review a `deny.toml` policy for advisories, allowed licenses,
   dependency sources, duplicate versions, and banned crates; make
   `cargo deny check` a release gate.
-- [ ] Document deployment hardening for the public UDP listener: trusted exporter
+- [x] Document deployment hardening for the public UDP listener: trusted exporter
   allow-lists, rate limiting, conservative cache caps, observability, and the
   memory/CPU consequences of hostile high-cardinality traffic.
 - [ ] Add recurring secret/certificate scans and dependency/license checks to CI.

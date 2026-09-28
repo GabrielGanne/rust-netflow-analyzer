@@ -240,8 +240,8 @@ high-cardinality traffic, and — until the per-key purge exists — cannot safe
 evict entries. Any caller that allocates keys must therefore give that table its
 own **hard cap, an admission policy** (for example a trusted-exporter allow-list
 or rate limit), **and an expiry tied to the per-key purge**, so a flood of
-distinct or spoofed peers cannot exhaust memory. This ties into the deployment
-hardening guidance for the public UDP listener.
+distinct or spoofed peers cannot exhaust memory. This ties into the [deployment
+hardening guidance](deployment-hardening.md) for the public UDP listener.
 
 ## Follow-up implementation
 

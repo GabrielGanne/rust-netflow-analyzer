@@ -86,6 +86,7 @@ To defend against Denial of Service (DoS) attacks and hostile input:
 - **Hostile Input Hardening**:
   - Structural validation stops corrupted FlowSet chains gracefully.
   - Clock skew validation drops or rebases wildly drifted exporter timestamps before they can poison time bounds.
+  - For guidance on securing public or multi-tenant listeners, trusted exporter allow-lists, rate limiting, conservative cache sizing, and mitigating hostile high-cardinality traffic, see the [Deployment Hardening Guide](docs/deployment-hardening.md).
 
 ---
 
