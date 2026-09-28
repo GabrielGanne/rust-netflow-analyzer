@@ -8,4 +8,4 @@ examples/c_integration/demo
 *.swo
 tags
 /cscope.*
-
+.code-review-graph/
