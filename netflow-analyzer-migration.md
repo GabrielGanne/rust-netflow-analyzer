@@ -1,182 +1,116 @@
-# Migration analysis: replacing the local NetFlow parser with `libnetflow_analyzer_ffi`
+# Migration and C API Comparison Guide
 
-Reference header: `~/.local/include/netflow-analyzer.h`
-Reference library: `~/.local/lib/libnetflow_analyzer_ffi.so` (exports all 6 documented symbols)
-
-This document tracks (1) the feature/output gaps that would need to be added to the
-external project before it can replace the local implementation, and (2) an analysis
-of the fact that the external library merges *parsing* and *flowtable/aggregation*
-into a single engine.
+This document compares the C interface exposed by `libnetflow_analyzer_ffi` (`include/netflow-analyzer.h`) with traditional C NetFlow/IPFIX parser implementations (such as `netflow.h`), and details intentional architectural differences and migration considerations.
 
 ---
 
-## 1. Missing features TODO (to be added to the external `netflow-analyzer` project)
+## 1. Architectural Comparison
 
-The external `NetflowAnalyzerFlowRecord` only exposes:
-`src_ip`, `dst_ip`, `src_port`, `dst_port`, `proto`, `bytes`, `packets`,
-`start_time_ns`, `end_time_ns`, `original_start_time_ns`, `original_end_time_ns`.
-
-The local `struct flow_record` (`src/flow-record.h`) extracts more, and the CSV/JSON
-formatters (`src/formatter-csv.c`, `src/formatter-json.c`) emit all of it. The
-following fields/features are therefore **lost** in a straight migration and would
-need to be added upstream.
-
-### 1.1 Emitted flow fields missing from `NetflowAnalyzerFlowRecord`
-
-- [x] **`flow_id`** — exporter-provided flow identifier. Used as the primary flow key
-      when present (see `flow_key_from_record()` in `src/flowtable.c`), takes precedence
-      over the 5-tuple. **Done:** decoded (IE 148) and now exposed as `flow_id` on
-      `NetflowAnalyzerFlowRecord` (`0` + clear presence bit when absent).
-- [x] **`iface_in` / `iface_out`** — ingress/egress interface indices
-      (NetFlow `ingressInterface` / `egressInterface`). 64-bit in local model.
-      **Done:** IE 10 / 14 (v5 `input`/`output`), stored as `u64`.
-- [x] **`src_mac` / `dst_mac`** — L2 source/destination MAC
-      (`sourceMacAddress` / `destinationMacAddress`), 6 bytes each.
-      **Done:** IE 56 / 80.
-- [x] **`icmp_type` / `icmp_code`** — from `icmpTypeCodeIPv4/6`, `icmpTypeIPv4/6`,
-      `icmpCodeIPv4/6`. Local model splits type/code into two `uint8_t`.
-      **Done:** IE 32 / 139 (combined, split into type/code) and IE 176-179 (separate).
-- [x] **`tcp_flags`** — `tcpControlBits` (1 byte in v5, 2 bytes in v9/IPFIX).
-      **Done:** IE 6 (any width) and v5 offset 37; stored as `u16`.
-- [x] **`dscp`** — derived from `ipClassOfService` (>>2), `ipDiffServCodePoint`,
-      or `postIpDiffServCodePoint` with the priority rules in
-      `netflow_v9_decode_flow()` (`src/netflow-parser/netflow.c`).
-      **Done:** `ipClassOfService` (IE 5, `>>2`) with `postIpClassOfService`
-      (IE 98) as a fallback; `ipClassOfService` wins regardless of field order.
-      Note: base IANA has no `ipDiffServCodePoint`; the standard
-      `post`-variant carries the same information.
-- [x] **`vlan_tag`** — `vlanId` (source VLAN only; `postVlanId` is intentionally dropped).
-      **Done:** IE 58 only.
-- [x] **`ip_version`** — 0/4/6 marker. Derivable if IPs are always 16-byte mapped,
-      but the local code uses it to reject mixed v4/v6 flowsets; confirm behavior.
-      **Done:** set to 4/6 from the decoded address family (first family wins);
-      `0` when unknown. Mixed-flowset *rejection* is not replicated (out of scope).
-
-### 1.2 "field present / not set" semantics
-
-- [x] **`set_values` bitmask equivalent.** The local model distinguishes
-      "field absent" from "field == 0" via per-field flags (`FLOW_*` in
-      `src/flow-record.h`), and the formatters emit an **empty** column for unset
-      fields vs. `0` for a real zero. **Done:** `NetflowAnalyzerFlowRecord.present`
-      is a `u32` bitmask set only for fields actually decoded. Bit values are
-      exported as `NETFLOW_ANALYZER_PRESENT_*` in the C header (see the `presence`
-      module in `core/src/records.rs`).
-
-### 1.3 Aggregation modes missing from the engine
-
-These are implemented by the local `flowtable` (`src/flowtable.c`,
-`src/flowtable-node.c`) and have no equivalent in the external engine:
-
-- [ ] **Flow stitching** (`flow-stitching`, default **on**) — additive accumulation of
-      `pkt_num`/`bytes` across records of the same key, saturating at `UINT32_MAX`
-      (`flow_record_accumulate()`).
-- [ ] **Flow dedup** (`flow-dedup`) — take the max of `pkt_num`/`bytes` instead of sum.
-- [ ] **Bidirectional aggregation** (`bidir-aggregation`) — currently a stub locally,
-      but part of the intended config surface.
-- [ ] **Periodic intermediate dumps.** The local flowtable re-arms a timer and emits an
-      intermediate record every TTL while resetting counters, so long flows are dumped
-      periodically (see `timer_expiration_cb()`). The external engine only emits on
-      idle/active-timeout/flush — confirm whether the active-timeout behavior matches.
-- [ ] **Empty-record dropping.** Local drops records where `pkt_num == 0 || bytes == 0`
-      (`flow_record_is_empty()`). Confirm/replicate in the engine or downstream.
-
-### 1.4 Option-template / enrichment behavior to verify
-
-- [ ] **IPFIX/v9 option data merge.** Local parser stores option-template data per
-      (sender, observation_domain_id) and merges it into subsequent data records
-      (`netflow_v9_option_data_store` / `_lookup`, `netflow_v9_merge_flows`). Verify the
-      external engine performs equivalent enrichment, otherwise option-carried fields
-      (interfaces, sampling, etc.) will be missing.
-
-### 1.5 Stats parity (nice-to-have, not blocking)
-
-The external `NetflowAnalyzerStats` is actually **richer** than the local
-`netflow_parser_stats` (adds `clock_dropped_packets`, `clock_fallback_packets`,
-`templates_received`, `data_records_processed`, `active_flows`). No gap here —
-if anything, the node's `get_stats` can expose more once migrated.
-
-### 1.6 Fields NOT needed from the library
-
-- `src_hostname` / `dst_hostname` are added **downstream** by the `reverse-dns` node,
-  not by the parser. The library only needs to expose the IPs (it does). No action.
-
----
-
-## 2. The parsing + flowtable "mix" — can the library split its concerns?
-
-### 2.1 Current local architecture (two separate stages)
+Traditional C NetFlow architectures typically decouple packet decoding and flow aggregation into discrete pipeline stages connected by lockless ring buffers or queues:
 
 ```
-udp-input → netflow-parser → flowtable → reverse-dns → json-formatter → file-dumper
+[Input / NIC] -> [netflow-parser] -> [flow-table / aggregator] -> [formatters / sinks]
 ```
 
-- **`netflow-parser`** is *stateless per flow*: it decodes NetFlow v5 / v9 / IPFIX
-  datagrams into one `flow_record` **per data record** and pushes them to the next
-  ring. It keeps state only for **templates** and **option data** (needed to decode).
-  It performs **no** aggregation, no timeouts, no eviction.
-- **`flowtable`** is the *stateful aggregation stage*: hashtable keyed by flow_id or
-  5-tuple + timer wheel. It accumulates/dedups counters, dumps periodically, and
-  expires flows to the output ring.
+- **Traditional Parser Stage (`netflow.h`)**:
+  - Stateless per flow: parses NetFlow v5/v9/IPFIX datagrams and emits raw, unaggregated records directly into an output ring buffer.
+  - Maintains state only for template definitions and options records needed to decode subsequent data sets.
+  - Does not manage timeouts, active rollover, or eviction.
+  - Often relies on thread-local state (`__thread`), limiting cross-thread reentrancy.
 
-This separation is deliberate and already called out as a design goal in `TODO.md`
-("move netflow parser and flowtable to a 'netflow' plugin"). It gives:
-- independent tuning/testing of decode vs. aggregation,
-- the ability to run decode-only or aggregation-only pipelines,
-- clean insertion points for enrichment nodes between the two stages.
-
-### 2.2 What the external library does
-
-The external engine **fuses both stages**. A single context
-(`netflow_analyzer_create`) owns the template cache **and** the flow cache; you feed
-it raw datagrams (`netflow_analyzer_process_packet[_at]`) and it calls your
-`NetflowAnalyzerFlowCallback` only when an **aggregated** flow is evicted (idle /
-active timeout / `netflow_analyzer_flush`). There is no API to obtain the raw,
-per-record parse output before aggregation.
-
-Config knobs confirm the fusion: `max_flows`, `max_templates`, `idle_timeout_secs`,
-`active_timeout_secs`, `scan_interval_secs` are all flowtable concerns living inside
-the "analyzer".
-
-### 2.3 Consequence
-
-- A drop-in replacement of **only** `netflow-parser` is **not possible**: the library
-  cannot emit un-aggregated per-record output. Using it means it replaces **both**
-  `netflow-parser` **and** `flowtable`, and the local `flowtable` aggregation modes
-  (stitching/dedup/bidir, intermediate periodic dumps) are bypassed.
-- The reduced `NetflowAnalyzerFlowRecord` is a direct result of this fusion: after
-  aggregation the engine only keeps the aggregation key (5-tuple) + counters +
-  timestamps, discarding the per-record L2/QoS/ICMP metadata the local pipeline emits.
-
-### 2.4 Suggested split for the external project (to discuss upstream)
-
-To make the library composable with this pipeline, consider exposing the two layers
-separately:
-
-- [ ] **A decode-only API.** A `parse`/decoder entry point that emits one *full*
-      record per data record (with all fields from §1.1 + presence bits from §1.2)
-      via a callback, **without** touching the flow cache. This is what would map to
-      the local `netflow-parser` node.
-- [ ] **A separate aggregator API.** The existing flow-cache/timeout/eviction engine,
-      fed by decoded records rather than raw datagrams — mapping to the local
-      `flowtable` node. Should carry the full record through aggregation (not just the
-      5-tuple) so no fields are lost on eviction.
-- [ ] **Keep the fused `process_packet` API** as a convenience wrapper over the two,
-      for consumers that want the all-in-one behavior.
-
-If the library exposes the decode-only layer with the full field set, migrating the
-local `netflow-parser` alone (keeping our `flowtable`) becomes feasible and preserves
-every current output field and aggregation mode.
+- **`libnetflow_analyzer_ffi` (`include/netflow-analyzer.h`)**:
+  - Provides a **flexible dual-pipeline architecture**:
+    1. **Fused Engine (`netflow_analyzer_process_packet*`)**: Integrates zero-copy parsing, sampling scaling, sharded flow aggregation, and a background aging worker in a single context (`NetflowAnalyzerContext`). Emits aggregated flows on idle eviction, active timeout rollover, or explicit flush.
+    2. **Decode-Only Pipeline (`netflow_analyzer_decode_packet*`)**: A stateless entry point that updates template state and delivers each decoded record immediately to a caller-supplied callback (`NetflowAnalyzerRecordCallback`) without touching the flow cache. This directly mirrors the decoupled parser model.
+  - Thread-safe and reentrant: the underlying Rust engine uses fine-grained concurrent sharding (`DashMap`) and releases all shard locks before invoking callbacks.
 
 ---
 
-## 3. Config mapping (for reference)
+## 2. Intentional Differences from `netflow.h`
 
-| Local config | External `NetflowAnalyzerConfig` | Notes |
-|---|---|---|
-| `netflow-parser.clock-sync-check` | `clock_sync_check_enabled` | direct |
-| `netflow-parser.clock-max-skew-sec` | `max_clock_skew_ns` | ×1e9 |
-| (n/a) | `clock_fallback_to_receipt_time` | new capability |
-| `flowtable` size | `max_flows` | |
-| (implicit template TTL) | `max_templates` | |
-| `flowtable` TTL / tick | `idle_timeout_secs` / `active_timeout_secs` / `scan_interval_secs` | |
-| `flow-stitching` / `flow-dedup` / `bidir-aggregation` | **no equivalent** | see §1.3 |
+### 2.1 Exporter and Session Identity
+
+- **`netflow.h`**:
+  - Scopes state by sender IP address (`ip46_address_t const *sender`) and observation domain.
+  - Observation domains are bare integers (`uint32_t`), which can collide across protocol versions or multiple exporters sharing domain `0`.
+- **`netflow-analyzer.h`**:
+  - Uses an explicit, opaque 64-bit key (`uint64_t exporter_key`) supplied by the caller on ingest (`_from` and `_from_at` symbols).
+  - State is keyed by `(exporter_key, Scope)`, where `Scope` discriminator tags (`NETFLOW_ANALYZER_SCOPE_V9`, `IPFIX`, `V5`) ensure protocol namespaces never collide.
+  - Allows callers to map arbitrary network dimensions (source IP, port, VLAN, router ID) into stable session keys.
+  - Provides `netflow_analyzer_purge_exporter` to flush a retired exporter's resident flows and reclaim all template, clock, and sampling capacity without memory leaks.
+
+### 2.2 Record Format and Field Representation
+
+- **`netflow.h`**:
+  - Output records use platform-specific structs with separate IPv4 and IPv6 fields, and lack presence flags to distinguish "field absent from template" from "field value is zero".
+- **`netflow-analyzer.h` (`NetflowAnalyzerFlowRecord`)**:
+  - **Unified Addresses**: IPv4 and IPv6 addresses are unified into 16-byte IPv4-mapped IPv6 buffers (`src_ip[16]`, `dst_ip[16]`).
+  - **Presence Bitmask**: Includes a 32-bit bitmask (`present`) with `NETFLOW_ANALYZER_PRESENT_*` constants. A bit is set only if the field was present in the decoded template, allowing downstream formatters to preserve empty vs. zero semantics.
+  - **Comprehensive Metadata**: Extracts and retains `flow_id`, ingress/egress interfaces (`iface_in`, `iface_out`), L2 MAC addresses (`src_mac`, `dst_mac`), ICMP type/code (`icmp_type`, `icmp_code`), TCP flags (`tcp_flags`), DSCP (`dscp`), VLAN tag (`vlan_tag`), and IP version (`ip_version`).
+  - **ABI Stability**: The struct is `#[non_exhaustive]` with trailing `reserved` fields. New fields can be added within reserved space without breaking binary layout or recompiling callers.
+
+### 2.3 Clock Drift, Skew Tolerance, and Fallback
+
+- **`netflow.h`**:
+  - Validates exporter timestamp against system clock with second-level granularity (`clock_max_skew_sec`).
+  - Skewed packets are dropped unconditionally.
+- **`netflow-analyzer.h`**:
+  - Nanosecond-precision skew tracking (`max_clock_skew_ns`).
+  - Supports optional **timestamp fallback** (`clock_fallback_to_receipt_time`): instead of dropping traffic from slightly misconfigured exporters, timestamps are rebased to receipt time while preserving relative durations.
+  - Skew rejections and fallback events are tracked in dedicated counters (`clock_dropped_packets`, `clock_fallback_packets`).
+
+### 2.4 Diagnostic Telemetry and Observability
+
+- **`netflow.h`**:
+  - Reports basic counters: `pkts_parsed`, `pkts_parse_error`, `flows_output`, `flows_dropped`.
+- **`netflow-analyzer.h` (`NetflowAnalyzerStats`)**:
+  - Provides a non-blocking snapshot including:
+    - Packet framing health (`pkts_parsed`, `pkts_parse_error`, `malformed_packets`).
+    - Clock diagnostics (`clock_dropped_packets`, `clock_fallback_packets`).
+    - Cache residency and throughput (`templates_received`, `data_records_processed`, `active_flows`, `flows_output`, `flows_dropped`).
+    - Options metadata activity (`options_templates_received`, `options_records_processed`).
+
+### 2.5 Error Codes and Safety
+
+- **`netflow.h`**:
+  - Returns `0` on success, `-1` on generic error.
+- **`netflow-analyzer.h`**:
+  - Returns non-negative record count (`>= 0`) on success.
+  - Returns specific negative error codes:
+    - `-1`: Null pointer or invalid argument.
+    - `-2`: Packet framing or parse error (malformed header or invalid Set length).
+    - `-3`: Clock skew exceeded configured limit (packet dropped).
+  - All C API entry points are wrapped in panic catch guards (`catch_unwind`), ensuring that no Rust panic can unwind into C stack frames.
+
+---
+
+## 3. Configuration Mapping
+
+| `netflow.h` / Traditional Config | `NetflowAnalyzerConfig` Field | Notes |
+| :--- | :--- | :--- |
+| `clock_sync_check` | `clock_sync_check_enabled` | Boolean flag |
+| `clock_max_skew_sec` | `max_clock_skew_ns` | Converted to nanoseconds (seconds × 10^9) |
+| *(no equivalent)* | `clock_fallback_to_receipt_time` | Rebase timestamps to receipt time on skew |
+| Flowtable capacity | `max_flows` | Hard limit on concurrent active flows (default: 1,000,000) |
+| Template cache limit | `max_templates` | Hard limit on concurrent cached templates (default: 65,536) |
+| Inactivity timeout | `idle_timeout_secs` | Evict flow after inactivity |
+| Active rollover TTL | `active_timeout_secs` | Emit interim record for long-lived flows |
+| Aging scan frequency | `scan_interval_secs` | Background worker sweep interval |
+
+---
+
+## 4. Migration Paths
+
+### Option A: Direct Fused Ingestion (Recommended for New Projects)
+
+Use `netflow_analyzer_create` and `netflow_analyzer_process_packet_from`:
+- Replaces custom hash tables, timer wheels, and aging loops.
+- Flow aggregation, sampling scaling, and timeout emission are handled internally.
+- Emitted records are delivered to `NetflowAnalyzerFlowCallback` on idle timeout, rollover, or shutdown.
+
+### Option B: Decode-Only Pipeline (For Existing Pipeline Integration)
+
+Use `netflow_analyzer_decode_packet_from`:
+- Functions as a pure parser stage.
+- Decodes datagrams and invokes `NetflowAnalyzerRecordCallback` per data record with full field extraction.
+- Completely bypasses the internal flow cache, allowing output to feed into external ring buffers, custom aggregation nodes, or Kafka/enrichment pipelines.
