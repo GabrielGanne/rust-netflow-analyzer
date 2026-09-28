@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// All updates use `Relaxed` ordering: the values are pure telemetry and never
 /// gate any program logic, so cross-thread ordering guarantees are unnecessary.
 #[derive(Default)]
-pub struct InternalCounters {
+pub(crate) struct InternalCounters {
     /// Datagrams whose NetFlow/IPFIX header was parsed successfully.
-    pub pkts_parsed: AtomicU64,
+    pub(crate) pkts_parsed: AtomicU64,
     /// Datagrams rejected because their NetFlow/IPFIX header (or IPFIX
     /// `total_length` framing) was malformed. These are dropped whole and are
     /// *not* counted in `pkts_parsed`.
-    pub pkts_parse_error: AtomicU64,
+    pub(crate) pkts_parse_error: AtomicU64,
     /// Datagrams whose header parsed but whose body was structurally
     /// inconsistent (a FlowSet/Set length that overruns or underflows the
     /// message). The engine uses **partial decoding**: records decoded before
@@ -23,19 +23,19 @@ pub struct InternalCounters {
     /// silently returning success. Such a datagram is still counted in
     /// `pkts_parsed` (its header was valid); this counter marks that its body
     /// could not be fully walked.
-    pub malformed_packets: AtomicU64,
-    pub clock_dropped_packets: AtomicU64,
-    pub clock_fallback_packets: AtomicU64,
-    pub templates_received: AtomicU64,
+    pub(crate) malformed_packets: AtomicU64,
+    pub(crate) clock_dropped_packets: AtomicU64,
+    pub(crate) clock_fallback_packets: AtomicU64,
+    pub(crate) templates_received: AtomicU64,
     /// Options templates decoded and stored (NetFlow v9 set id 1, IPFIX set id 3).
-    pub options_templates_received: AtomicU64,
-    pub data_records_processed: AtomicU64,
+    pub(crate) options_templates_received: AtomicU64,
+    pub(crate) data_records_processed: AtomicU64,
     /// Options data records decoded. These carry exporter metadata rather than
     /// observed flows, so they are counted here instead of the flow cache.
-    pub options_records_processed: AtomicU64,
+    pub(crate) options_records_processed: AtomicU64,
     /// Flow records delivered to the configured output callback.
-    pub flows_output: AtomicU64,
-    pub flows_dropped: AtomicU64,
+    pub(crate) flows_output: AtomicU64,
+    pub(crate) flows_dropped: AtomicU64,
 }
 
 /// C-compatible, point-in-time snapshot of the engine telemetry.
@@ -56,7 +56,9 @@ pub struct NetflowAnalyzerStats {
     pub clock_dropped_packets: u64,
     /// Skewed packets accepted after rebasing timestamps onto receipt time.
     pub clock_fallback_packets: u64,
+    /// Total number of template records received.
     pub templates_received: u64,
+    /// Total number of flow data records processed.
     pub data_records_processed: u64,
     /// Flow records delivered to the configured output callback.
     pub flows_output: u64,
@@ -81,7 +83,7 @@ pub struct NetflowAnalyzerStats {
 impl InternalCounters {
     /// Builds a non-blocking snapshot. `active_flows` is supplied by the caller
     /// because it is a live gauge owned by the flow cache rather than a counter.
-    pub fn get_ffi_snapshot(&self, active_flows: u64) -> NetflowAnalyzerStats {
+    pub(crate) fn get_ffi_snapshot(&self, active_flows: u64) -> NetflowAnalyzerStats {
         NetflowAnalyzerStats {
             pkts_parsed: self.pkts_parsed.load(Ordering::Relaxed),
             pkts_parse_error: self.pkts_parse_error.load(Ordering::Relaxed),

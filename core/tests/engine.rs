@@ -15,7 +15,7 @@ use netflow_analyzer_core::cache::AgingConfig;
 use netflow_analyzer_core::clock::ClockConfig;
 use netflow_analyzer_core::records::FlowRecord;
 use netflow_analyzer_core::scope::{Scope, SINGLE_EXPORTER};
-use netflow_analyzer_core::{EngineConfig, FlowContext};
+use netflow_analyzer_core::{EngineConfig, FlowContext, PacketError};
 
 #[test]
 fn rejects_unknown_version() {
@@ -23,7 +23,7 @@ fn rejects_unknown_version() {
     let mut bogus = vec![0xFF, 0xFF];
     bogus.extend_from_slice(&[0u8; 20]);
 
-    assert!(ctx.process_packet(&bogus).is_err());
+    assert_eq!(ctx.process_packet(&bogus), Err(PacketError::InvalidHeader));
     assert_eq!(ctx.stats().pkts_parse_error, 1);
     assert_eq!(ctx.stats().pkts_parsed, 0);
 }
@@ -31,7 +31,7 @@ fn rejects_unknown_version() {
 #[test]
 fn empty_input_is_malformed() {
     let ctx = FlowContext::new();
-    assert!(ctx.process_packet(&[]).is_err());
+    assert_eq!(ctx.process_packet(&[]), Err(PacketError::InvalidHeader));
     assert_eq!(ctx.stats().pkts_parse_error, 1);
     assert_eq!(ctx.stats().pkts_parsed, 0);
 }
@@ -39,8 +39,8 @@ fn empty_input_is_malformed() {
 #[test]
 fn default_context_matches_new() {
     let ctx = FlowContext::default();
-    assert_eq!(ctx.flows.len(), 0);
-    assert_eq!(ctx.templates.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
+    assert_eq!(ctx.active_templates(), 0);
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn cache_cap_drops_excess_flows() {
 
     let processed = ctx.process_packet(&b.buf).expect("parse ok");
     assert_eq!(processed, 2, "both records decoded");
-    assert_eq!(ctx.flows.len(), 1, "cap keeps only one flow");
+    assert_eq!(ctx.active_flows(), 1, "cap keeps only one flow");
     assert_eq!(ctx.stats().flows_dropped, 1);
 }
 
@@ -108,7 +108,7 @@ fn flow_cap_bounds_growth_under_flood() {
     let processed = ctx.process_packet(&packet).expect("parse ok");
 
     assert_eq!(processed, FLOOD, "every record decodes");
-    assert_eq!(ctx.flows.len(), CAP, "cache never exceeds the hard cap");
+    assert_eq!(ctx.active_flows(), CAP, "cache never exceeds the hard cap");
     assert_eq!(
         ctx.stats().flows_dropped as usize,
         FLOOD - CAP,
@@ -155,7 +155,7 @@ fn template_cap_bounds_growth_under_flood() {
 
     assert_eq!(ctx.stats().templates_received, FLOOD as u64);
     assert_eq!(
-        ctx.templates.len(),
+        ctx.active_templates(),
         CAP,
         "template cache never exceeds the hard cap"
     );
@@ -183,7 +183,7 @@ fn background_aging_evicts_and_emits() {
     std::thread::sleep(Duration::from_millis(300));
     ctx.stop_aging();
 
-    assert_eq!(ctx.flows.len(), 0, "idle flow evicted");
+    assert_eq!(ctx.active_flows(), 0, "idle flow evicted");
     assert!(
         !emitted.lock().unwrap().is_empty(),
         "eviction emitted a record"
@@ -205,14 +205,13 @@ fn clock_check_drops_skewed_packet_and_tracks_domain() {
     let export_ns = 1_700_000_000_000_000_000;
 
     let result = ctx.process_packet_at(&sample_v9_packet(), export_ns + 11);
-    assert!(result.is_err());
+    assert_eq!(result, Err(PacketError::ClockSkewExceeded));
     assert_eq!(ctx.stats().clock_dropped_packets, 1);
     assert_eq!(ctx.stats().clock_fallback_packets, 0);
-    assert_eq!(ctx.templates.len(), 0, "the entire packet is rejected");
+    assert_eq!(ctx.active_templates(), 0, "the entire packet is rejected");
 
     let state = ctx
-        .clocks
-        .get(SINGLE_EXPORTER, Scope::V9Domain(42))
+        .clock_state(SINGLE_EXPORTER, Scope::V9Domain(42))
         .expect("domain clock state");
     assert_eq!(state.last_skew_ns, 11);
     assert_eq!(state.clock_issues, 1);
@@ -262,17 +261,15 @@ fn clock_state_is_independent_per_domain() {
     ctx.process_packet_at(&second, 1_700_000_002_000_000_000)
         .unwrap();
 
-    assert_eq!(ctx.clocks.len(), 2);
+    assert_eq!(ctx.active_clocks(), 2);
     assert_eq!(
-        ctx.clocks
-            .get(SINGLE_EXPORTER, Scope::V9Domain(42))
+        ctx.clock_state(SINGLE_EXPORTER, Scope::V9Domain(42))
             .unwrap()
             .last_receipt_time_ns,
         1_700_000_001_000_000_000
     );
     assert_eq!(
-        ctx.clocks
-            .get(SINGLE_EXPORTER, Scope::V9Domain(43))
+        ctx.clock_state(SINGLE_EXPORTER, Scope::V9Domain(43))
             .unwrap()
             .last_receipt_time_ns,
         1_700_000_002_000_000_000
@@ -290,11 +287,11 @@ fn distinct_exporters_do_not_share_state() {
     assert_eq!(ctx.process_packet_from(1, &packet), Ok(1));
     assert_eq!(ctx.process_packet_from(2, &packet), Ok(1));
 
-    assert_eq!(ctx.templates.len(), 2, "templates are per-exporter");
-    assert_eq!(ctx.clocks.len(), 2, "clocks are per-exporter");
-    assert_eq!(ctx.flows.len(), 2, "flows are per-exporter");
-    assert!(ctx.clocks.get(1, Scope::V9Domain(42)).is_some());
-    assert!(ctx.clocks.get(2, Scope::V9Domain(42)).is_some());
+    assert_eq!(ctx.active_templates(), 2, "templates are per-exporter");
+    assert_eq!(ctx.active_clocks(), 2, "clocks are per-exporter");
+    assert_eq!(ctx.active_flows(), 2, "flows are per-exporter");
+    assert!(ctx.clock_state(1, Scope::V9Domain(42)).is_some());
+    assert!(ctx.clock_state(2, Scope::V9Domain(42)).is_some());
 
     let emitted: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = emitted.clone();
@@ -319,9 +316,9 @@ fn purge_exporter_emits_flows_then_drops_template_and_clock_state() {
 
     assert_eq!(ctx.process_packet_from(1, &packet), Ok(1));
     assert_eq!(ctx.process_packet_from(2, &packet), Ok(1));
-    assert_eq!(ctx.flows.len(), 2);
-    assert_eq!(ctx.templates.len(), 2);
-    assert_eq!(ctx.clocks.len(), 2);
+    assert_eq!(ctx.active_flows(), 2);
+    assert_eq!(ctx.active_templates(), 2);
+    assert_eq!(ctx.active_clocks(), 2);
 
     let emitted: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = emitted.clone();
@@ -335,13 +332,13 @@ fn purge_exporter_emits_flows_then_drops_template_and_clock_state() {
     assert_eq!(ctx.stats().flows_output, 1);
 
     // ...and all of exporter 1's state is gone, while exporter 2's is untouched.
-    assert_eq!(ctx.flows.len(), 1);
-    assert_eq!(ctx.templates.len(), 1);
-    assert_eq!(ctx.clocks.len(), 1);
-    assert!(ctx.templates.get(1, Scope::V9Domain(42), 256).is_none());
-    assert!(ctx.templates.get(2, Scope::V9Domain(42), 256).is_some());
-    assert!(ctx.clocks.get(1, Scope::V9Domain(42)).is_none());
-    assert!(ctx.clocks.get(2, Scope::V9Domain(42)).is_some());
+    assert_eq!(ctx.active_flows(), 1);
+    assert_eq!(ctx.active_templates(), 1);
+    assert_eq!(ctx.active_clocks(), 1);
+    assert!(ctx.template(1, Scope::V9Domain(42), 256).is_none());
+    assert!(ctx.template(2, Scope::V9Domain(42), 256).is_some());
+    assert!(ctx.clock_state(1, Scope::V9Domain(42)).is_none());
+    assert!(ctx.clock_state(2, Scope::V9Domain(42)).is_some());
 
     // Purging an unknown key is a no-op that emits nothing.
     assert_eq!(ctx.purge_exporter(99, |_| panic!("no flows to emit")), 0);
@@ -349,8 +346,8 @@ fn purge_exporter_emits_flows_then_drops_template_and_clock_state() {
     // The purged key starts fresh: its template must be resent before its data
     // decodes again (proving the old cached template really was dropped).
     assert_eq!(ctx.process_packet_from(1, &packet), Ok(1));
-    assert_eq!(ctx.templates.len(), 2);
-    assert_eq!(ctx.clocks.len(), 2);
+    assert_eq!(ctx.active_templates(), 2);
+    assert_eq!(ctx.active_clocks(), 2);
 }
 
 #[test]

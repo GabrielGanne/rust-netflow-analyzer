@@ -12,14 +12,17 @@ use crate::scope::Scope;
 /// Supported versions of the NetFlow/IPFIX protocol
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProtocolVersion {
+    /// NetFlow version 5 (fixed-format, legacy).
     NetflowV5,
+    /// NetFlow version 9 (RFC 3954).
     NetflowV9,
+    /// IPFIX (RFC 7011).
     Ipfix,
 }
 
 /// Normalized structure for NetFlow v5 Headers (fixed-format, RFC-less legacy).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetflowV5Header {
+pub(crate) struct NetflowV5Header {
     /// Number of fixed-size flow records that follow the header.
     pub count: u16,
     pub system_uptime: u32,
@@ -33,7 +36,7 @@ pub struct NetflowV5Header {
 
 /// Normalized structure for NetFlow v9 Headers
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetflowV9Header {
+pub(crate) struct NetflowV9Header {
     pub count: u16,
     pub system_uptime: u32,
     pub unix_seconds: u32,
@@ -43,7 +46,7 @@ pub struct NetflowV9Header {
 
 /// Normalized structure for IPFIX Headers (RFC 7011)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IpfixHeader {
+pub(crate) struct IpfixHeader {
     pub total_length: u16,
     pub export_time: u32,
     pub sequence_number: u32,
@@ -52,7 +55,7 @@ pub struct IpfixHeader {
 
 /// Unified Header Enum representing a parsed network packet header
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParsedHeader {
+pub(crate) enum ParsedHeader {
     V5(NetflowV5Header),
     V9(NetflowV9Header),
     Ipfix(IpfixHeader),
@@ -125,7 +128,7 @@ fn parse_ipfix_header(input: &[u8]) -> IResult<&[u8], IpfixHeader> {
 }
 
 /// Master parser function that inspects the version string and routes processing
-pub fn parse_packet_header(input: &[u8]) -> IResult<&[u8], ParsedHeader> {
+pub(crate) fn parse_packet_header(input: &[u8]) -> IResult<&[u8], ParsedHeader> {
     let (remaining_input, version) = be_u16(input)?;
 
     match version {
@@ -152,7 +155,8 @@ impl ParsedHeader {
     /// Returns the observation domain identifier used to scope template lookups.
     /// NetFlow v9 uses the `source_id`; IPFIX uses the `observation_domain_id`.
     /// NetFlow v5 is template-less and has no domain, so it reports `0`.
-    pub fn domain_id(&self) -> u32 {
+    #[allow(dead_code)]
+    pub(crate) fn domain_id(&self) -> u32 {
         match self {
             ParsedHeader::V5(_) => 0,
             ParsedHeader::V9(h) => h.source_id,
@@ -165,7 +169,7 @@ impl ParsedHeader {
     /// Unlike [`Self::domain_id`], this keeps NetFlow v9, IPFIX, and NetFlow v5
     /// engine namespaces distinct so their identically numbered domains cannot
     /// collide within a single exporter. See `docs/exporter-identity.md`.
-    pub fn scope(&self) -> Scope {
+    pub(crate) fn scope(&self) -> Scope {
         match self {
             ParsedHeader::V5(h) => Scope::V5Engine {
                 engine_type: h.engine_type,
@@ -180,7 +184,7 @@ impl ParsedHeader {
     ///
     /// NetFlow v5 supplies a nanosecond remainder. NetFlow v9 and IPFIX only
     /// carry whole seconds in their headers, so their sub-second part is zero.
-    pub fn export_time_ns(&self) -> u64 {
+    pub(crate) fn export_time_ns(&self) -> u64 {
         const NS_PER_SECOND: u64 = 1_000_000_000;
         match self {
             ParsedHeader::V5(h) => (h.unix_seconds as u64)
@@ -192,7 +196,7 @@ impl ParsedHeader {
     }
 
     /// Exporter uptime in milliseconds, when the protocol header provides it.
-    pub fn system_uptime_ms(&self) -> Option<u32> {
+    pub(crate) fn system_uptime_ms(&self) -> Option<u32> {
         match self {
             ParsedHeader::V5(h) => Some(h.system_uptime),
             ParsedHeader::V9(h) => Some(h.system_uptime),
@@ -204,23 +208,23 @@ impl ParsedHeader {
 // --- FlowSet / Set Identifiers (RFC 3954 & RFC 7011) ---
 
 /// NetFlow v9 Template FlowSet identifier.
-pub const FLOWSET_ID_V9_TEMPLATE: u16 = 0;
+pub(crate) const FLOWSET_ID_V9_TEMPLATE: u16 = 0;
 /// NetFlow v9 Options Template FlowSet identifier.
-pub const FLOWSET_ID_V9_OPTIONS: u16 = 1;
+pub(crate) const FLOWSET_ID_V9_OPTIONS: u16 = 1;
 /// IPFIX Template Set identifier.
-pub const SET_ID_IPFIX_TEMPLATE: u16 = 2;
+pub(crate) const SET_ID_IPFIX_TEMPLATE: u16 = 2;
 /// IPFIX Options Template Set identifier.
-pub const SET_ID_IPFIX_OPTIONS: u16 = 3;
+pub(crate) const SET_ID_IPFIX_OPTIONS: u16 = 3;
 /// Set identifiers at or above this value carry data records keyed by template id.
-pub const FIRST_DATA_SET_ID: u16 = 256;
+pub(crate) const FIRST_DATA_SET_ID: u16 = 256;
 
 /// Fixed length, in bytes, of a single NetFlow v5 flow record.
-pub const V5_RECORD_LEN: usize = 48;
+pub(crate) const V5_RECORD_LEN: usize = 48;
 
 /// Total IPFIX message header length in bytes (version, length, export time,
 /// sequence number, observation domain id), per RFC 7011 §3.1. The message's
 /// declared `total_length` includes this header.
-pub const IPFIX_HEADER_LEN: usize = 16;
+pub(crate) const IPFIX_HEADER_LEN: usize = 16;
 
 /// Sentinel field length signalling an IPFIX variable-length element.
 pub const VARIABLE_LENGTH: u16 = 0xffff;
@@ -239,7 +243,9 @@ pub struct TemplateField {
 /// A decoded template describing the layout of subsequent data records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateRecord {
+    /// Template identifier assigned by the exporter (256 or higher for data templates).
     pub template_id: u16,
+    /// Ordered list of field specifiers forming the record layout.
     pub fields: Vec<TemplateField>,
     /// Sum of all fixed field lengths. `None` if the template contains any
     /// variable-length field (record size must then be computed per record).
@@ -293,13 +299,13 @@ impl TemplateRecord {
 
 /// Header that prefixes every FlowSet / Set in the packet payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlowSetHeader {
+pub(crate) struct FlowSetHeader {
     pub set_id: u16,
     pub length: u16,
 }
 
 /// Parses a 4-byte FlowSet header (set id + total length including the header).
-pub fn parse_flowset_header(input: &[u8]) -> IResult<&[u8], FlowSetHeader> {
+pub(crate) fn parse_flowset_header(input: &[u8]) -> IResult<&[u8], FlowSetHeader> {
     let (input, set_id) = be_u16(input)?;
     let (input, length) = be_u16(input)?;
     Ok((input, FlowSetHeader { set_id, length }))
@@ -361,7 +367,7 @@ fn parse_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
 /// whole set is rejected and no template is returned (RFC 7011 §9.1 requires a
 /// malformed message to be discarded rather than partially applied). Trailing
 /// padding shorter than a record header (< 4 bytes) is ignored.
-pub fn parse_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
+pub(crate) fn parse_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
     let mut templates = Vec::new();
     while body.len() >= 4 {
         let (rest, template) = parse_template_record(body)?;
@@ -380,7 +386,7 @@ const FIELD_SPECIFIER_MIN_LEN: usize = 4;
 /// template. Real templates carry at most a few dozen fields; this caps the
 /// per-template allocation from a hostile `field_count` far below what the
 /// datagram size alone would permit.
-pub const MAX_TEMPLATE_FIELDS: usize = 1024;
+pub(crate) const MAX_TEMPLATE_FIELDS: usize = 1024;
 
 /// Reads `count` field specifiers into a fallibly pre-allocated vector.
 ///
@@ -446,7 +452,9 @@ fn parse_v9_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateReco
 /// Parses every options-template record in a NetFlow v9 Options Template
 /// FlowSet body (set id 1). Transactional: any invalid record rejects the whole
 /// set (see [`parse_template_set`]).
-pub fn parse_v9_options_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
+pub(crate) fn parse_v9_options_template_set(
+    mut body: &[u8],
+) -> IResult<&[u8], Vec<TemplateRecord>> {
     let mut templates = Vec::new();
     // Minimum record is the 6-byte header (id + two length fields).
     while body.len() >= 6 {
@@ -488,7 +496,9 @@ fn parse_ipfix_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateR
 /// Parses every options-template record in an IPFIX Options Template Set body
 /// (set id 3). Transactional: any invalid record rejects the whole set (see
 /// [`parse_template_set`]).
-pub fn parse_ipfix_options_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
+pub(crate) fn parse_ipfix_options_template_set(
+    mut body: &[u8],
+) -> IResult<&[u8], Vec<TemplateRecord>> {
     let mut templates = Vec::new();
     // Minimum record is the 6-byte header (id + two count fields).
     while body.len() >= 6 {
@@ -503,7 +513,7 @@ pub fn parse_ipfix_options_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<T
 ///
 /// This is the zero-copy hot path: each returned element borrows directly from
 /// the original packet buffer rather than copying record bytes onto the heap.
-pub fn split_fixed_records(body: &[u8], record_len: usize) -> Vec<&[u8]> {
+pub(crate) fn split_fixed_records(body: &[u8], record_len: usize) -> Vec<&[u8]> {
     if record_len == 0 {
         return Vec::new();
     }

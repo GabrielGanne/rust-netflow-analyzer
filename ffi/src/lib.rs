@@ -2,6 +2,26 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! # netflow_analyzer_ffi
+//!
+//! C ABI (FFI) bindings for the `netflow_analyzer_core` NetFlow/IPFIX decoding and flow
+//! aggregation engine.
+//!
+//! This crate exposes an `extern "C"` interface and produces the C header
+//! `include/netflow-analyzer.h` using cbindgen. It compiles to both a shared library
+//! (`.so` / `.dylib` / `.dll`) and a static archive (`.a`).
+//!
+//! ## Overview
+//!
+//! - **Lifecycle**: `netflow_analyzer_create` creates an engine instance and starts the
+//!   background aging worker; `netflow_analyzer_destroy` stops aging and reclaims all resources.
+//! - **Packet Processing**: `netflow_analyzer_process_packet` (fused decode + aggregation)
+//!   and `netflow_analyzer_decode_packet` (stateless per-record callback).
+//! - **Exporter Scoping**: Key-aware symbols (`_from` and `_from_at`) allow one engine
+//!   context to track multiple exporters concurrently without template or flow collisions.
+//! - **Telemetry**: `netflow_analyzer_get_stats` returns a point-in-time snapshot of
+//!   parsing diagnostics and resident flow counts.
+
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,14 +31,17 @@ use netflow_analyzer_core::clock::ClockConfig;
 use netflow_analyzer_core::records::{FlowFields, FlowRecord, NetflowAnalyzerFlowRecord};
 use netflow_analyzer_core::scope::{ExporterKey, Scope};
 use netflow_analyzer_core::stats::NetflowAnalyzerStats;
-use netflow_analyzer_core::{EngineConfig, FlowContext, CLOCK_SKEW_ERROR};
+use netflow_analyzer_core::{EngineConfig, FlowContext, PacketError};
 
 // Protocol discriminator values for `NetflowAnalyzerFlowRecord::scope_protocol`.
 // These are literals (rather than re-exports of the core `scope` constants)
 // because cbindgen cannot evaluate cross-crate constant paths;
 // `scope_protocol_tags_match_core` keeps them in sync.
+/// Protocol tag for NetFlow v9 scope.
 pub const NETFLOW_ANALYZER_SCOPE_V9: u8 = 0;
+/// Protocol tag for IPFIX scope.
 pub const NETFLOW_ANALYZER_SCOPE_IPFIX: u8 = 1;
+/// Protocol tag for NetFlow v5 scope.
 pub const NETFLOW_ANALYZER_SCOPE_V5: u8 = 2;
 
 /// ABI version of this library's C interface. Bumped whenever the public struct
@@ -114,26 +137,42 @@ pub type NetflowAnalyzerRecordCallback = Option<
 // treated as absent rather than a real zero. These are literals (rather than
 // re-exports of the core `presence` module) because cbindgen cannot evaluate
 // cross-crate constant paths; `presence_bits_match_core` keeps them in sync.
+/// Flow ID was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_FLOW_ID: u32 = 1 << 0;
+/// Ingress interface index was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_IFACE_IN: u32 = 1 << 1;
+/// Egress interface index was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_IFACE_OUT: u32 = 1 << 2;
+/// Source MAC address was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_SRC_MAC: u32 = 1 << 3;
+/// Destination MAC address was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_DST_MAC: u32 = 1 << 4;
+/// ICMP type was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_ICMP_TYPE: u32 = 1 << 5;
+/// ICMP code was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_ICMP_CODE: u32 = 1 << 6;
+/// Cumulative TCP control flags were present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_TCP_FLAGS: u32 = 1 << 7;
+/// Differentiated Services Code Point (DSCP) was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_DSCP: u32 = 1 << 8;
+/// VLAN identifier was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_VLAN_TAG: u32 = 1 << 9;
+/// IP version marker was present in the record.
 pub const NETFLOW_ANALYZER_PRESENT_IP_VERSION: u32 = 1 << 10;
 
 /// Tunable engine settings passed from C at construction time. A null pointer
 /// to [`netflow_analyzer_create`] selects library defaults for every field.
 #[repr(C)]
 pub struct NetflowAnalyzerConfig {
+    /// Maximum number of active flows retained in the flow cache.
     pub max_flows: u64,
+    /// Maximum number of templates retained in the template cache.
     pub max_templates: u64,
+    /// Flow idle eviction timeout in seconds.
     pub idle_timeout_secs: u64,
+    /// Flow active rollover timeout in seconds.
     pub active_timeout_secs: u64,
+    /// Background aging sweep interval in seconds.
     pub scan_interval_secs: u64,
     /// Enable export-time versus receipt-time skew validation.
     pub clock_sync_check_enabled: bool,
@@ -351,7 +390,7 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet(
         let data = std::slice::from_raw_parts(packet_bytes, length as usize);
         match (*ctx).internal.process_packet(data) {
             Ok(records) => records as i32,
-            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(PacketError::ClockSkewExceeded) => -3,
             Err(_) => -2,
         }
     })
@@ -376,7 +415,7 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet_at(
         let data = std::slice::from_raw_parts(packet_bytes, length as usize);
         match (*ctx).internal.process_packet_at(data, receipt_time_ns) {
             Ok(records) => records as i32,
-            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(PacketError::ClockSkewExceeded) => -3,
             Err(_) => -2,
         }
     })
@@ -403,7 +442,7 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet_from(
         let data = std::slice::from_raw_parts(packet_bytes, length as usize);
         match (*ctx).internal.process_packet_from(exporter_key, data) {
             Ok(records) => records as i32,
-            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(PacketError::ClockSkewExceeded) => -3,
             Err(_) => -2,
         }
     })
@@ -432,7 +471,7 @@ pub unsafe extern "C" fn netflow_analyzer_process_packet_from_at(
             .process_packet_from_at(exporter_key, data, receipt_time_ns)
         {
             Ok(records) => records as i32,
-            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(PacketError::ClockSkewExceeded) => -3,
             Err(_) => -2,
         }
     })
@@ -477,7 +516,7 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet(
         };
         match (*ctx).internal.decode_packet_scoped(data, &mut sink) {
             Ok(records) => records as i32,
-            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(PacketError::ClockSkewExceeded) => -3,
             Err(_) => -2,
         }
     })
@@ -519,7 +558,7 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_at(
             .decode_packet_scoped_at(data, receipt_time_ns, &mut sink)
         {
             Ok(records) => records as i32,
-            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(PacketError::ClockSkewExceeded) => -3,
             Err(_) => -2,
         }
     })
@@ -562,7 +601,7 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_from(
             .decode_packet_from(exporter_key, data, &mut sink)
         {
             Ok(records) => records as i32,
-            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(PacketError::ClockSkewExceeded) => -3,
             Err(_) => -2,
         }
     })
@@ -605,7 +644,7 @@ pub unsafe extern "C" fn netflow_analyzer_decode_packet_from_at(
             .decode_packet_from_at(exporter_key, data, receipt_time_ns, &mut sink)
         {
             Ok(records) => records as i32,
-            Err(CLOCK_SKEW_ERROR) => -3,
+            Err(PacketError::ClockSkewExceeded) => -3,
             Err(_) => -2,
         }
     })

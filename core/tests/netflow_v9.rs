@@ -7,7 +7,6 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use common::{sample_v9_packet, Builder};
@@ -22,7 +21,7 @@ fn decodes_v9_data_record_into_cache() {
     let processed = ctx.process_packet(&sample_v9_packet()).expect("parse ok");
 
     assert_eq!(processed, 1, "one data record expected");
-    assert_eq!(ctx.flows.len(), 1, "one flow cached");
+    assert_eq!(ctx.active_flows(), 1, "one flow cached");
 
     let stats = ctx.stats();
     assert_eq!(stats.pkts_parsed, 1);
@@ -56,7 +55,7 @@ fn flush_emits_decoded_fields() {
     assert_eq!(f.end_time_ns, 1_700_000_000_000_000_000);
 
     // The cache is emptied by flush.
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
     assert_eq!(ctx.stats().flows_output, 1);
     assert_eq!(ctx.stats().flows_dropped, 0);
 }
@@ -70,7 +69,7 @@ fn repeated_records_accumulate_counters() {
     ctx.process_packet(&packet).expect("parse ok");
     ctx.process_packet(&packet).expect("parse ok");
 
-    assert_eq!(ctx.flows.len(), 1, "same 5-tuple stays a single flow");
+    assert_eq!(ctx.active_flows(), 1, "same 5-tuple stays a single flow");
 
     let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = collected.clone();
@@ -100,7 +99,7 @@ fn data_without_template_is_skipped() {
     let ctx = FlowContext::new();
     let processed = ctx.process_packet(&b.buf).expect("parse ok");
     assert_eq!(processed, 0);
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
 }
 
 #[test]
@@ -124,12 +123,7 @@ fn malformed_options_template_is_handled_gracefully() {
     let processed = ctx.process_packet(&b.buf).expect("parse ok");
     assert_eq!(processed, 0);
     assert_eq!(ctx.stats().templates_received, 0);
-    assert_eq!(
-        ctx.counters
-            .options_templates_received
-            .load(Ordering::Relaxed),
-        0
-    );
+    assert_eq!(ctx.stats().options_templates_received, 0);
 }
 
 #[test]
@@ -168,30 +162,20 @@ fn options_template_and_data_are_decoded_but_not_flows() {
 
     // Options records are not flows: nothing is returned or cached as a flow.
     assert_eq!(processed, 0);
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
     assert_eq!(
         ctx.stats().templates_received,
         0,
         "options are not regular templates"
     );
-    assert_eq!(
-        ctx.counters
-            .options_templates_received
-            .load(Ordering::Relaxed),
-        1
-    );
-    assert_eq!(
-        ctx.counters
-            .options_records_processed
-            .load(Ordering::Relaxed),
-        1
-    );
+    assert_eq!(ctx.stats().options_templates_received, 1);
+    assert_eq!(ctx.stats().options_records_processed, 1);
     // The samplingInterval (IE 34) carried by the options record is learned as a
     // 1000/1 ratio for this exporter and observation domain (source id 42). The
     // record carries no flowSamplerId/selectorId, so it is the domain sampler.
-    assert_eq!(ctx.sampling.len(), 1);
+    assert_eq!(ctx.active_samplers(), 1);
     assert_eq!(
-        ctx.sampling.get(
+        ctx.sampler_ratio(
             SINGLE_EXPORTER,
             Scope::V9Domain(42),
             SamplerSelector::Domain
@@ -298,7 +282,7 @@ fn per_sampler_ratio_scales_by_the_flows_own_selector() {
     let ctx = FlowContext::new();
     assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
     assert_eq!(
-        ctx.sampling.get(
+        ctx.sampler_ratio(
             SINGLE_EXPORTER,
             Scope::V9Domain(100),
             SamplerSelector::FlowSampler(7)
@@ -362,7 +346,7 @@ fn count_based_options_sampling_scales_flow_counters() {
     let ctx = FlowContext::new();
     assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
     assert_eq!(
-        ctx.sampling.get(
+        ctx.sampler_ratio(
             SINGLE_EXPORTER,
             Scope::V9Domain(42),
             SamplerSelector::Domain
@@ -428,7 +412,7 @@ fn conflicting_domain_sampling_leaves_the_flow_unscaled() {
     assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
     // The conflicting advertisements poisoned the domain bucket.
     assert_eq!(
-        ctx.sampling.get(
+        ctx.sampler_ratio(
             SINGLE_EXPORTER,
             Scope::V9Domain(42),
             SamplerSelector::Domain
@@ -490,7 +474,7 @@ fn flow_with_an_unadvertised_sampler_is_not_scaled() {
     let ctx = FlowContext::new();
     assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
     assert_eq!(
-        ctx.sampling.get(
+        ctx.sampler_ratio(
             SINGLE_EXPORTER,
             Scope::V9Domain(42),
             SamplerSelector::FlowSampler(9)
@@ -589,7 +573,7 @@ fn partial_decode_keeps_records_before_a_malformed_set() {
     let ctx = FlowContext::new();
     let processed = ctx.process_packet(&b.buf).expect("header parse ok");
     assert_eq!(processed, 1, "the record before the bad set is kept");
-    assert_eq!(ctx.flows.len(), 1);
+    assert_eq!(ctx.active_flows(), 1);
     assert_eq!(ctx.stats().malformed_packets, 1);
 }
 
@@ -690,7 +674,7 @@ fn rejected_template_set_stops_decoding_and_keeps_old_template() {
         .put(8, 2) // length = 4 + 4
         .put(0xC0A8_0001, 4);
     assert_eq!(ctx.process_packet(&first.buf), Ok(1));
-    assert_eq!(ctx.flows.len(), 1);
+    assert_eq!(ctx.active_flows(), 1);
 
     // Packet 2: a template set validly redefining 256 as an 8-byte layout, then
     // an invalid record (reserved id 100 defining a field). The whole set is
@@ -729,7 +713,7 @@ fn rejected_template_set_stops_decoding_and_keeps_old_template() {
          must not split the following 8-byte record into two"
     );
     assert_eq!(
-        ctx.flows.len(),
+        ctx.active_flows(),
         1,
         "no flow fabricated from the stale layout"
     );
@@ -747,7 +731,7 @@ fn rejected_template_set_stops_decoding_and_keeps_old_template() {
         .put(42, 4);
     third.put(256, 2).put(8, 2).put(0xC0A8_0003, 4);
     assert_eq!(ctx.process_packet(&third.buf), Ok(1));
-    assert_eq!(ctx.flows.len(), 2);
+    assert_eq!(ctx.active_flows(), 2);
 }
 
 #[test]
@@ -839,7 +823,7 @@ fn metadata_fields_survive_aggregation_and_flush() {
     // First packet carries DSCP, second omits it: the merge must retain DSCP.
     ctx.process_packet(&metadata_v9_packet(true)).expect("ok");
     ctx.process_packet(&metadata_v9_packet(false)).expect("ok");
-    assert_eq!(ctx.flows.len(), 1, "same 5-tuple stays one flow");
+    assert_eq!(ctx.active_flows(), 1, "same 5-tuple stays one flow");
 
     let collected: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = collected.clone();
@@ -907,5 +891,5 @@ fn variable_length_records_via_process_packet() {
     let ctx = FlowContext::new();
     let processed = ctx.process_packet(&b.buf).expect("parse ok");
     assert_eq!(processed, 2);
-    assert_eq!(ctx.flows.len(), 2);
+    assert_eq!(ctx.active_flows(), 2);
 }

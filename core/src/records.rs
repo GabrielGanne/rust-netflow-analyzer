@@ -80,6 +80,7 @@ pub struct RecordTimeContext {
     pub original_export_time_ns: u64,
     /// Export timestamp after optional receipt-time fallback.
     pub effective_export_time_ns: u64,
+    /// Exporter system uptime in milliseconds, when provided by the packet header.
     pub system_uptime_ms: Option<u32>,
 }
 
@@ -102,12 +103,19 @@ impl RecordTimeContext {
 /// that context alongside the identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlowIdentity {
+    /// Exporter-assigned flow identifier (IPFIX element `flowId`, IE 148).
     FlowId(u64),
+    /// Traditional 5-tuple flow identity.
     FiveTuple {
+        /// Source IP address in IPv4-mapped IPv6 representation.
         src_ip: [u8; 16],
+        /// Destination IP address in IPv4-mapped IPv6 representation.
         dst_ip: [u8; 16],
+        /// Transport source port.
         src_port: u16,
+        /// Transport destination port.
         dst_port: u16,
+        /// IP protocol number (e.g. 6 for TCP, 17 for UDP).
         proto: u8,
     },
 }
@@ -120,8 +128,11 @@ pub enum FlowIdentity {
 /// See `docs/exporter-identity.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
+    /// Exporter/transport-session key.
     pub exporter: ExporterKey,
+    /// Protocol-tagged observation scope.
     pub scope: Scope,
+    /// Within-scope identity (either explicit flow ID or 5-tuple).
     pub identity: FlowIdentity,
 }
 
@@ -132,16 +143,27 @@ pub struct FlowKey {
 /// Each bit here is set only when the corresponding field was actually decoded,
 /// letting downstream formatters reproduce the empty-vs-zero distinction.
 pub mod presence {
+    /// Flow ID was present in the record.
     pub const FLOW_ID: u32 = 1 << 0;
+    /// Ingress interface index was present in the record.
     pub const IFACE_IN: u32 = 1 << 1;
+    /// Egress interface index was present in the record.
     pub const IFACE_OUT: u32 = 1 << 2;
+    /// Source MAC address was present in the record.
     pub const SRC_MAC: u32 = 1 << 3;
+    /// Destination MAC address was present in the record.
     pub const DST_MAC: u32 = 1 << 4;
+    /// ICMP type was present in the record.
     pub const ICMP_TYPE: u32 = 1 << 5;
+    /// ICMP code was present in the record.
     pub const ICMP_CODE: u32 = 1 << 6;
+    /// Cumulative TCP control flags were present in the record.
     pub const TCP_FLAGS: u32 = 1 << 7;
+    /// Differentiated Services Code Point (DSCP) was present in the record.
     pub const DSCP: u32 = 1 << 8;
+    /// VLAN identifier was present in the record.
     pub const VLAN_TAG: u32 = 1 << 9;
+    /// IP version marker was present in the record.
     pub const IP_VERSION: u32 = 1 << 10;
 }
 
@@ -154,12 +176,19 @@ pub mod presence {
 pub struct FlowFields {
     /// Exporter-assigned flow identity (IPFIX information element 148).
     pub flow_id: Option<u64>,
+    /// Source IP address in IPv4-mapped IPv6 format.
     pub src_ip: [u8; 16],
+    /// Destination IP address in IPv4-mapped IPv6 format.
     pub dst_ip: [u8; 16],
+    /// Transport source port (or 0 if not present).
     pub src_port: u16,
+    /// Transport destination port (or 0 if not present).
     pub dst_port: u16,
+    /// IP protocol number (e.g. 6 for TCP, 17 for UDP).
     pub proto: u8,
+    /// Flow byte count (scaled by any configured sampling ratio).
     pub bytes: u64,
+    /// Flow packet count (scaled by any configured sampling ratio).
     pub packets: u64,
     /// Effective flow start time in Unix nanoseconds, corrected when fallback is used.
     pub start_time_ns: u64,
@@ -232,7 +261,7 @@ impl FlowFields {
         Self::from_record_sized(template, record).map(|(fields, _)| fields)
     }
 
-    /// Like [`from_record`], but also returns the number of bytes consumed.
+    /// Like [`Self::from_record`], but also returns the number of bytes consumed.
     ///
     /// This is required when walking variable-length records back to back,
     /// where the record boundary is only known after decoding the layout.
@@ -471,6 +500,7 @@ pub struct FlowRecord {
 }
 
 impl FlowRecord {
+    /// Constructs an initial cached record from decoded fields and scope identity.
     pub fn from_fields(
         fields: &FlowFields,
         exporter: ExporterKey,
@@ -503,26 +533,38 @@ impl DerefMut for FlowRecord {
     }
 }
 
-// A C-compatible representation to safely pass over the FFI boundary.
-//
-// `#[non_exhaustive]` is a deliberate ABI decision: consumers must not assume
-// this layout is frozen and must not exhaustively construct or match it, so
-// future additions (coordinated with an ABI version/size mechanism) do not break
-// callers. See `docs/exporter-identity.md`.
+/// A C-compatible representation to safely pass over the FFI boundary.
+///
+/// `#[non_exhaustive]` is a deliberate ABI decision: consumers must not assume
+/// this layout is frozen and must not exhaustively construct or match it, so
+/// future additions (coordinated with an ABI version/size mechanism) do not break
+/// callers. See `docs/exporter-identity.md`.
 #[repr(C)]
 #[non_exhaustive]
 pub struct NetflowAnalyzerFlowRecord {
+    /// Source IP address in IPv4-mapped IPv6 representation.
     pub src_ip: [u8; 16],
+    /// Destination IP address in IPv4-mapped IPv6 representation.
     pub dst_ip: [u8; 16],
+    /// Source MAC address (or zero if absent).
     pub src_mac: [u8; 6],
+    /// Destination MAC address (or zero if absent).
     pub dst_mac: [u8; 6],
+    /// Transport layer source port.
     pub src_port: u16,
+    /// Transport layer destination port.
     pub dst_port: u16,
+    /// 802.1Q VLAN identifier.
     pub vlan_tag: u16,
+    /// Cumulative TCP control flags.
     pub tcp_flags: u16,
+    /// IP protocol number.
     pub proto: u8,
+    /// Differentiated Services Code Point (DSCP).
     pub dscp: u8,
+    /// ICMP type value.
     pub icmp_type: u8,
+    /// ICMP code value.
     pub icmp_code: u8,
     /// IP version marker: 4, 6, or 0 when unknown.
     pub ip_version: u8,
@@ -535,7 +577,9 @@ pub struct NetflowAnalyzerFlowRecord {
     pub scope_engine_id: u8,
     /// Observation domain (v9 `source_id` / IPFIX domain); `0` for v5.
     pub observation_domain: u32,
+    /// Accumulated byte count.
     pub bytes: u64,
+    /// Accumulated packet count.
     pub packets: u64,
     /// Ingress interface index (`ingressInterface`; v5 `input`).
     pub iface_in: u64,
@@ -604,6 +648,7 @@ impl FlowFields {
 }
 
 impl FlowRecord {
+    /// Converts this record to the C-compatible [`NetflowAnalyzerFlowRecord`] representation.
     pub fn to_ffi(&self) -> NetflowAnalyzerFlowRecord {
         self.fields.to_ffi(self.exporter, self.scope)
     }
@@ -779,7 +824,9 @@ fn walk_record_fields(
 /// fractional rate is not truncated early.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SamplingObservation {
+    /// Sampler identity extracted from options scope or options data fields.
     pub selector: SamplerSelector,
+    /// Extracted packet-sampling ratio.
     pub ratio: SamplingRatio,
 }
 

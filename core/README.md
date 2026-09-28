@@ -17,7 +17,7 @@ let ctx = FlowContext::new();
 let records = ctx.process_packet(datagram)?;
 println!("decoded {records} data records");
 let stats = ctx.stats();
-# Ok::<(), &'static str>(())
+# Ok::<(), netflow_analyzer_core::PacketError>(())
 ```
 
 Use `decode_packet`/`decode_packet_at` for a decode-only path that delivers each

@@ -2,37 +2,125 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! # netflow_analyzer_core
+//!
+//! A high-performance, zero-copy NetFlow v5, NetFlow v9, and IPFIX decoding and
+//! flow aggregation engine in Rust.
+//!
+//! `netflow_analyzer_core` parses exported datagrams directly from caller-provided
+//! byte buffers without heap allocations for packet framing. It manages template
+//! definitions, tracks exporter clock skew, and folds decoded flow records into an
+//! internally sharded, size-bounded cache supporting concurrent ingestion, flushing,
+//! and background timeout aging.
+//!
+//! ## Quick Start
+//!
+//! ```rust
+//! use netflow_analyzer_core::FlowContext;
+//!
+//! let ctx = FlowContext::new();
+//!
+//! // Fused decode + aggregation path
+//! let packet: &[u8] = &[]; // Raw NetFlow or IPFIX packet bytes
+//! if !packet.is_empty() {
+//!     let count = ctx.process_packet(packet).unwrap();
+//!     println!("Decoded and cached {count} records");
+//! }
+//!
+//! // Read diagnostic counters and active flow count
+//! let stats = ctx.stats();
+//! println!("Active flows in cache: {}", stats.active_flows);
+//! ```
+//!
+//! ## Decode-Only Mode
+//!
+//! To bypass cache aggregation and receive decoded records directly:
+//!
+//! ```rust
+//! use netflow_analyzer_core::FlowContext;
+//!
+//! let ctx = FlowContext::new();
+//! let packet: &[u8] = &[];
+//! if !packet.is_empty() {
+//!     ctx.decode_packet(packet, &mut |domain_id, fields| {
+//!         println!("Observed domain {domain_id}, bytes: {}", fields.bytes);
+//!     }).unwrap();
+//! }
+//! ```
+
+/// Cache configurations and hard caps for flows and templates.
 pub mod cache;
+/// Exporter clock tracking and skew validation.
 pub mod clock;
+/// Template definitions and protocol versions.
 pub mod parser;
+/// Flow record representation, field bitmasks, and metadata.
 pub mod records;
+/// Packet sampling factors and options-template tracking.
 pub mod sampling;
+/// Exporter keys and protocol-tagged observation domain scopes.
 pub mod scope;
+/// Telemetry snapshots and diagnostic counters.
 pub mod stats;
+
+pub use cache::AgingConfig;
+pub use clock::ClockConfig;
+pub use records::{FlowFields, FlowRecord, NetflowAnalyzerFlowRecord};
+pub use scope::{ExporterKey, Scope, SINGLE_EXPORTER};
+pub use stats::NetflowAnalyzerStats;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cache::{
-    AgingConfig, AgingHandle, FlowCache, TemplateCache, DEFAULT_MAX_FLOWS, DEFAULT_MAX_TEMPLATES,
-};
-use clock::{ClockConfig, ClockDecision, ClockTracker};
+use cache::{AgingHandle, FlowCache, TemplateCache, DEFAULT_MAX_FLOWS, DEFAULT_MAX_TEMPLATES};
+use clock::{ClockDecision, ClockTracker};
 use parser::{
     ParsedHeader, FIRST_DATA_SET_ID, FLOWSET_ID_V9_OPTIONS, FLOWSET_ID_V9_TEMPLATE,
     IPFIX_HEADER_LEN, SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
 };
-use records::{FlowFields, FlowRecord, RecordTimeContext};
+use records::RecordTimeContext;
 use sampling::SamplingTracker;
-use scope::{ExporterKey, Scope, SINGLE_EXPORTER};
-use stats::{InternalCounters, NetflowAnalyzerStats};
+use stats::InternalCounters;
 
-/// Error returned when clock validation rejects an otherwise parseable packet.
+/// Errors that can occur when processing or decoding a NetFlow/IPFIX packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketError {
+    /// The NetFlow/IPFIX packet header was structurally invalid, unsupported, or truncated.
+    InvalidHeader,
+    /// The IPFIX message `total_length` was inconsistent with the received datagram
+    /// or its Sets.
+    InconsistentIpfixLength,
+    /// The packet was dropped because the exporter's clock skew exceeded the configured
+    /// limit (and timestamp fallback was not enabled).
+    ClockSkewExceeded,
+}
+
+impl std::fmt::Display for PacketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidHeader => write!(f, "Failed to parse NetFlow header packet structure"),
+            Self::InconsistentIpfixLength => {
+                write!(
+                    f,
+                    "IPFIX message total_length is inconsistent with the datagram"
+                )
+            }
+            Self::ClockSkewExceeded => {
+                write!(
+                    f,
+                    "Packet dropped because exporter clock skew exceeds limit"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PacketError {}
+
+/// Legacy error string returned when clock validation rejects an otherwise parseable packet.
+#[deprecated(note = "use PacketError::ClockSkewExceeded instead")]
 pub const CLOCK_SKEW_ERROR: &str = "Packet dropped because exporter clock skew exceeds limit";
-
-/// Error returned when an IPFIX message's declared `total_length` is impossible
-/// or exceeds the received datagram.
-const IPFIX_LENGTH_ERROR: &str = "IPFIX message total_length is inconsistent with the datagram";
 
 /// Returns true if `body` is tiled exactly by IPFIX Sets: every Set has a valid
 /// length (at least the 4-byte Set header) that fits, and the Sets consume the
@@ -65,9 +153,13 @@ fn now_unix_ns() -> u64 {
 /// Top-level engine configuration combining cache caps and aging timings.
 #[derive(Debug, Clone, Copy)]
 pub struct EngineConfig {
+    /// Maximum number of active flows retained in the flow cache before dropping new flows.
     pub max_flows: usize,
+    /// Maximum number of templates retained in the template cache.
     pub max_templates: usize,
+    /// Timeout and scan interval parameters for the background aging thread.
     pub aging: AgingConfig,
+    /// Clock synchronization and skew tolerance settings.
     pub clock: ClockConfig,
 }
 
@@ -88,13 +180,11 @@ impl Default for EngineConfig {
 /// caches are internally sharded, so concurrent `process_packet` calls do not
 /// contend on a global lock.
 pub struct FlowContext {
-    pub counters: Arc<InternalCounters>,
-    pub templates: Arc<TemplateCache>,
-    pub flows: Arc<FlowCache>,
-    pub clocks: Arc<ClockTracker>,
-    /// Packet-sampling factors learned per `(exporter, scope, sampler)` from
-    /// options data records (see [`sampling::SamplingTracker`]).
-    pub sampling: Arc<SamplingTracker>,
+    counters: Arc<InternalCounters>,
+    templates: Arc<TemplateCache>,
+    flows: Arc<FlowCache>,
+    clocks: Arc<ClockTracker>,
+    sampling: Arc<SamplingTracker>,
     aging_cfg: AgingConfig,
     clock_cfg: ClockConfig,
     aging: Mutex<Option<AgingHandle>>,
@@ -125,7 +215,7 @@ impl FlowContext {
     /// Returns the number of data records successfully folded into the cache.
     /// The input is borrowed and never copied: parsing operates directly on the
     /// caller's buffer.
-    pub fn process_packet(&self, raw_bytes: &[u8]) -> Result<usize, &'static str> {
+    pub fn process_packet(&self, raw_bytes: &[u8]) -> Result<usize, PacketError> {
         self.process_packet_at(raw_bytes, now_unix_ns())
     }
 
@@ -139,7 +229,7 @@ impl FlowContext {
         &self,
         raw_bytes: &[u8],
         receipt_time_ns: u64,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         self.process_packet_from_at(SINGLE_EXPORTER, raw_bytes, receipt_time_ns)
     }
 
@@ -153,7 +243,7 @@ impl FlowContext {
         &self,
         exporter: ExporterKey,
         raw_bytes: &[u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         self.process_packet_from_at(exporter, raw_bytes, now_unix_ns())
     }
 
@@ -164,7 +254,7 @@ impl FlowContext {
         exporter: ExporterKey,
         raw_bytes: &[u8],
         receipt_time_ns: u64,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         self.decode_at(
             exporter,
             raw_bytes,
@@ -191,7 +281,7 @@ impl FlowContext {
         &self,
         raw_bytes: &[u8],
         sink: &mut dyn FnMut(u32, &FlowFields),
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         let receipt_time_ns = now_unix_ns();
         self.decode_packet_at(raw_bytes, receipt_time_ns, sink)
     }
@@ -209,7 +299,7 @@ impl FlowContext {
         raw_bytes: &[u8],
         receipt_time_ns: u64,
         sink: &mut dyn FnMut(u32, &FlowFields),
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         self.decode_at(
             SINGLE_EXPORTER,
             raw_bytes,
@@ -227,7 +317,7 @@ impl FlowContext {
         &self,
         raw_bytes: &[u8],
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         self.decode_packet_from(SINGLE_EXPORTER, raw_bytes, sink)
     }
 
@@ -238,7 +328,7 @@ impl FlowContext {
         raw_bytes: &[u8],
         receipt_time_ns: u64,
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         self.decode_packet_from_at(SINGLE_EXPORTER, raw_bytes, receipt_time_ns, sink)
     }
 
@@ -251,7 +341,7 @@ impl FlowContext {
         exporter: ExporterKey,
         raw_bytes: &[u8],
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         self.decode_packet_from_at(exporter, raw_bytes, now_unix_ns(), sink)
     }
 
@@ -262,7 +352,7 @@ impl FlowContext {
         raw_bytes: &[u8],
         receipt_time_ns: u64,
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         self.decode_at(exporter, raw_bytes, receipt_time_ns, sink)
     }
 
@@ -275,14 +365,14 @@ impl FlowContext {
         raw_bytes: &[u8],
         receipt_time_ns: u64,
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, PacketError> {
         let (mut payload, header) = match parser::parse_packet_header(raw_bytes) {
             Ok(parsed) => parsed,
             Err(_) => {
                 self.counters
                     .pkts_parse_error
                     .fetch_add(1, Ordering::Relaxed);
-                return Err("Failed to parse NetFlow header packet structure");
+                return Err(PacketError::InvalidHeader);
             }
         };
 
@@ -304,7 +394,7 @@ impl FlowContext {
                 self.counters
                     .pkts_parse_error
                     .fetch_add(1, Ordering::Relaxed);
-                return Err(IPFIX_LENGTH_ERROR);
+                return Err(PacketError::InconsistentIpfixLength);
             }
         }
 
@@ -336,7 +426,7 @@ impl FlowContext {
                 self.counters
                     .clock_dropped_packets
                     .fetch_add(1, Ordering::Relaxed);
-                return Err(CLOCK_SKEW_ERROR);
+                return Err(PacketError::ClockSkewExceeded);
             }
         };
         let time_context = RecordTimeContext {
@@ -744,6 +834,51 @@ impl FlowContext {
     /// Non-blocking telemetry snapshot, including the live active-flow gauge.
     pub fn stats(&self) -> NetflowAnalyzerStats {
         self.counters.get_ffi_snapshot(self.flows.len() as u64)
+    }
+
+    /// Number of active flows currently resident in the state cache.
+    pub fn active_flows(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// Number of templates currently resident in the template cache.
+    pub fn active_templates(&self) -> usize {
+        self.templates.len()
+    }
+
+    /// Looks up a cached template for `(exporter, scope, template_id)`.
+    pub fn template(
+        &self,
+        exporter: ExporterKey,
+        scope: Scope,
+        template_id: u16,
+    ) -> Option<Arc<parser::TemplateRecord>> {
+        self.templates.get(exporter, scope, template_id)
+    }
+
+    /// Number of clock states currently tracked across all exporters and scopes.
+    pub fn active_clocks(&self) -> usize {
+        self.clocks.len()
+    }
+
+    /// Looks up the clock observation state for `(exporter, scope)`.
+    pub fn clock_state(&self, exporter: ExporterKey, scope: Scope) -> Option<clock::ClockState> {
+        self.clocks.get(exporter, scope)
+    }
+
+    /// Number of samplers currently tracked across all exporters and scopes.
+    pub fn active_samplers(&self) -> usize {
+        self.sampling.len()
+    }
+
+    /// Looks up the sampling ratio learned for a specific sampler.
+    pub fn sampler_ratio(
+        &self,
+        exporter: ExporterKey,
+        scope: Scope,
+        selector: sampling::SamplerSelector,
+    ) -> Option<sampling::SamplingRatio> {
+        self.sampling.get(exporter, scope, selector)
     }
 }
 

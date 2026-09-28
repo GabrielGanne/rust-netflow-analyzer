@@ -38,13 +38,21 @@ pub enum Scope {
     /// IPFIX observation domain id.
     IpfixDomain(u32),
     /// NetFlow v5 switching engine, which has no observation domain.
-    V5Engine { engine_type: u8, engine_id: u8 },
+    V5Engine {
+        /// Type of switching engine (header `engine_type`).
+        engine_type: u8,
+        /// Slot/identifier of switching engine (header `engine_id`).
+        engine_id: u8,
+    },
 }
 
 /// Protocol discriminator for a [`Scope`], as surfaced on emitted records so a
 /// consumer can tell the flattened scope fields apart. Mirrored on the FFI side.
+/// Protocol tag for NetFlow v9 scope.
 pub const SCOPE_PROTOCOL_V9: u8 = 0;
+/// Protocol tag for IPFIX scope.
 pub const SCOPE_PROTOCOL_IPFIX: u8 = 1;
+/// Protocol tag for NetFlow v5 scope.
 pub const SCOPE_PROTOCOL_V5: u8 = 2;
 
 impl Scope {

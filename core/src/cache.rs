@@ -19,15 +19,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 /// Template lookup key: templates are scoped to the exporter/transport session
 /// and its protocol-tagged observation [`Scope`], so identical template ids from
 /// different exporters, protocol versions, or domains never collide.
-pub type TemplateKey = (ExporterKey, Scope, u16);
+pub(crate) type TemplateKey = (ExporterKey, Scope, u16);
 
 /// Default hard caps. These bound heap growth even under a hostile exporter
 /// that floods the engine with unique templates or flows.
+/// Default maximum number of templates retained in the template cache (65,536).
 pub const DEFAULT_MAX_TEMPLATES: usize = 65_536;
+/// Default maximum number of active flows retained in the flow cache (1,000,000).
 pub const DEFAULT_MAX_FLOWS: usize = 1_000_000;
 
 /// Concurrent, size-bounded cache of decoded templates.
-pub struct TemplateCache {
+pub(crate) struct TemplateCache {
     map: DashMap<TemplateKey, Arc<TemplateRecord>>,
     max_templates: usize,
     /// Live entry count, reserved atomically so the hard cap cannot be
@@ -36,7 +38,7 @@ pub struct TemplateCache {
 }
 
 impl TemplateCache {
-    pub fn new(max_templates: usize) -> Self {
+    pub(crate) fn new(max_templates: usize) -> Self {
         Self {
             map: DashMap::new(),
             max_templates,
@@ -51,7 +53,12 @@ impl TemplateCache {
     /// The vacant path holds the per-key shard lock (via the `Entry` API) and
     /// reserves a slot with an atomic compare-and-update, so two threads can
     /// never both admit a new key past the cap.
-    pub fn insert(&self, exporter: ExporterKey, scope: Scope, template: TemplateRecord) -> bool {
+    pub(crate) fn insert(
+        &self,
+        exporter: ExporterKey,
+        scope: Scope,
+        template: TemplateRecord,
+    ) -> bool {
         let key = (exporter, scope, template.template_id);
         match self.map.entry(key) {
             Entry::Occupied(mut entry) => {
@@ -80,7 +87,7 @@ impl TemplateCache {
     }
 
     /// Cheap, lock-light lookup returning a shared handle to the template.
-    pub fn get(
+    pub(crate) fn get(
         &self,
         exporter: ExporterKey,
         scope: Scope,
@@ -91,11 +98,12 @@ impl TemplateCache {
             .map(|e| e.value().clone())
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
@@ -103,7 +111,7 @@ impl TemplateCache {
     /// and template ids, releasing each reserved capacity slot. Returns the
     /// number of templates removed. Part of the per-key purge that lets a
     /// transport session be retired without leaking bounded cache slots.
-    pub fn purge_exporter(&self, exporter: ExporterKey) -> usize {
+    pub(crate) fn purge_exporter(&self, exporter: ExporterKey) -> usize {
         let mut removed = 0usize;
         let count = &self.count;
         self.map.retain(|key, _template| {
@@ -119,7 +127,7 @@ impl TemplateCache {
 }
 
 /// Concurrent, size-bounded cache of active flow state.
-pub struct FlowCache {
+pub(crate) struct FlowCache {
     map: DashMap<FlowKey, FlowRecord>,
     max_flows: usize,
     /// Live entry count, reserved atomically so the hard cap cannot be
@@ -128,7 +136,7 @@ pub struct FlowCache {
 }
 
 impl FlowCache {
-    pub fn new(max_flows: usize) -> Self {
+    pub(crate) fn new(max_flows: usize) -> Self {
         Self {
             map: DashMap::new(),
             max_flows,
@@ -144,7 +152,7 @@ impl FlowCache {
     /// observation timestamps.
     /// New flows are admitted only while the cache is below its hard cap; once
     /// full, the record is dropped and counted rather than risking OOM.
-    pub fn upsert(
+    pub(crate) fn upsert(
         &self,
         exporter: ExporterKey,
         scope: Scope,
@@ -231,11 +239,12 @@ impl FlowCache {
             .map(|(_k, record)| record)
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
@@ -248,7 +257,7 @@ impl FlowCache {
     /// or deadlock by calling back into the engine. A candidate flow's timeout
     /// is re-checked while its lock is held before it is evicted or rolled over,
     /// so a flow that a concurrent packet refreshed in between is left alone.
-    pub fn sweep<F>(&self, cfg: &AgingConfig, counters: &InternalCounters, on_emit: &F)
+    pub(crate) fn sweep<F>(&self, cfg: &AgingConfig, counters: &InternalCounters, on_emit: &F)
     where
         F: Fn(&FlowRecord),
     {
@@ -311,7 +320,7 @@ impl FlowCache {
     ///
     /// [`sweep`]: Self::sweep
     /// [`purge_exporter`]: Self::purge_exporter
-    pub fn flush_all<F>(&self, counters: &InternalCounters, on_emit: &F)
+    pub(crate) fn flush_all<F>(&self, counters: &InternalCounters, on_emit: &F)
     where
         F: Fn(&FlowRecord),
     {
@@ -344,7 +353,7 @@ impl FlowCache {
     /// deadlock-freedom: purge is **not** atomic against concurrent or
     /// re-entrant ingestion for the same exporter, which the caller must fence
     /// (see [`crate::FlowContext::purge_exporter`]).
-    pub fn purge_exporter<F>(
+    pub(crate) fn purge_exporter<F>(
         &self,
         exporter: ExporterKey,
         counters: &InternalCounters,
@@ -399,7 +408,7 @@ impl Default for AgingConfig {
 }
 
 /// Owns the background aging thread and the flag used to stop it cleanly.
-pub struct AgingHandle {
+pub(crate) struct AgingHandle {
     running: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -409,7 +418,7 @@ impl AgingHandle {
     ///
     /// Returns the OS error if the worker thread cannot be created, rather than
     /// panicking, so FFI callers can surface the failure without unwinding.
-    pub fn spawn<F>(
+    pub(crate) fn spawn<F>(
         flows: Arc<FlowCache>,
         counters: Arc<InternalCounters>,
         cfg: AgingConfig,
@@ -457,7 +466,7 @@ impl AgingHandle {
     /// the current sweep; the handle is detached instead. Tearing the engine
     /// down from within its own callback is misuse — see the shutdown-sequence
     /// documentation on `netflow_analyzer_destroy` / [`crate::FlowContext::stop_aging`].
-    pub fn stop(&mut self) {
+    pub(crate) fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.join.take() {
             if handle.thread().id() == thread::current().id() {

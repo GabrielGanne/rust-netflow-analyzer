@@ -6,14 +6,13 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use common::{sample_ipfix_packet, set_ipfix_total_length, Builder};
 use netflow_analyzer_core::records::FlowRecord;
 use netflow_analyzer_core::sampling::{SamplerSelector, SamplingRatio};
 use netflow_analyzer_core::scope::{Scope, SINGLE_EXPORTER};
-use netflow_analyzer_core::FlowContext;
+use netflow_analyzer_core::{FlowContext, PacketError};
 
 #[test]
 fn decodes_ipfix_packet() {
@@ -71,30 +70,20 @@ fn options_template_and_data_are_decoded_but_not_flows() {
     let processed = ctx.process_packet(&b.buf).expect("parse ok");
 
     assert_eq!(processed, 0);
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
     assert_eq!(
         ctx.stats().templates_received,
         0,
         "options are not regular templates"
     );
-    assert_eq!(
-        ctx.counters
-            .options_templates_received
-            .load(Ordering::Relaxed),
-        1
-    );
-    assert_eq!(
-        ctx.counters
-            .options_records_processed
-            .load(Ordering::Relaxed),
-        1
-    );
+    assert_eq!(ctx.stats().options_templates_received, 1);
+    assert_eq!(ctx.stats().options_records_processed, 1);
     // The samplingInterval (IE 34) carried by the options record is learned as a
     // 1000/1 ratio for this exporter and observation domain (id 7). The record
     // carries no flowSamplerId/selectorId, so it is the domain-wide sampler.
-    assert_eq!(ctx.sampling.len(), 1);
+    assert_eq!(ctx.active_samplers(), 1);
     assert_eq!(
-        ctx.sampling.get(
+        ctx.sampler_ratio(
             SINGLE_EXPORTER,
             Scope::IpfixDomain(7),
             SamplerSelector::Domain
@@ -154,7 +143,7 @@ fn options_sampling_scales_ipfix_flow_counters() {
     let ctx = FlowContext::new();
     assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 1);
     assert_eq!(
-        ctx.sampling.get(
+        ctx.sampler_ratio(
             SINGLE_EXPORTER,
             Scope::IpfixDomain(7),
             SamplerSelector::Domain
@@ -186,7 +175,7 @@ fn trailing_bytes_beyond_total_length_are_ignored() {
     assert_eq!(ctx.process_packet(&packet), Ok(1));
     assert_eq!(ctx.stats().pkts_parsed, 1);
     assert_eq!(ctx.stats().pkts_parse_error, 0);
-    assert_eq!(ctx.flows.len(), 1);
+    assert_eq!(ctx.active_flows(), 1);
 }
 
 #[test]
@@ -198,14 +187,17 @@ fn total_length_claiming_more_than_datagram_is_rejected() {
     packet[2..4].copy_from_slice(&overstated.to_be_bytes());
 
     let ctx = FlowContext::new();
-    assert!(ctx.process_packet(&packet).is_err());
+    assert_eq!(
+        ctx.process_packet(&packet),
+        Err(PacketError::InconsistentIpfixLength)
+    );
     assert_eq!(
         ctx.stats().pkts_parsed,
         0,
         "an inconsistent message is not counted as parsed"
     );
     assert_eq!(ctx.stats().pkts_parse_error, 1);
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
 }
 
 #[test]
@@ -215,9 +207,12 @@ fn total_length_below_header_is_rejected() {
     packet[2..4].copy_from_slice(&8u16.to_be_bytes());
 
     let ctx = FlowContext::new();
-    assert!(ctx.process_packet(&packet).is_err());
+    assert_eq!(
+        ctx.process_packet(&packet),
+        Err(PacketError::InconsistentIpfixLength)
+    );
     assert_eq!(ctx.stats().pkts_parse_error, 1);
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
 }
 
 #[test]
@@ -229,10 +224,13 @@ fn total_length_that_truncates_a_set_is_rejected() {
     packet[2..4].copy_from_slice(&40u16.to_be_bytes());
 
     let ctx = FlowContext::new();
-    assert!(ctx.process_packet(&packet).is_err());
+    assert_eq!(
+        ctx.process_packet(&packet),
+        Err(PacketError::InconsistentIpfixLength)
+    );
     assert_eq!(ctx.stats().pkts_parsed, 0);
     assert_eq!(ctx.stats().pkts_parse_error, 1);
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
 }
 
 #[test]
@@ -250,5 +248,5 @@ fn total_length_can_shorten_the_walk() {
         "data set is beyond total_length"
     );
     assert_eq!(ctx.stats().pkts_parsed, 1);
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
 }

@@ -9,8 +9,6 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
-
 use common::{sample_v5_packet, sample_v9_packet, Builder};
 use netflow_analyzer_core::records::FlowFields;
 use netflow_analyzer_core::FlowContext;
@@ -29,7 +27,7 @@ fn decode_emits_per_record_without_caching() {
     assert_eq!(processed, 1, "one data record decoded");
     assert_eq!(collected.len(), 1, "sink invoked once");
     // Crucially: nothing is aggregated into the flow cache.
-    assert_eq!(ctx.flows.len(), 0, "decode-only must not cache flows");
+    assert_eq!(ctx.active_flows(), 0, "decode-only must not cache flows");
 
     let (domain, fields) = &collected[0];
     assert_eq!(*domain, 42, "v9 source id is the observation domain");
@@ -68,7 +66,7 @@ fn decode_does_not_accumulate_across_calls() {
 
     assert_eq!(count, 2, "each record surfaced separately");
     assert_eq!(last.bytes, 1500, "no accumulation on the decode path");
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
 }
 
 #[test]
@@ -83,7 +81,7 @@ fn decode_v5_reports_zero_domain() {
 
     assert_eq!(processed, 1);
     assert_eq!(domains, vec![0], "v5 is template-less and domain-less");
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.active_flows(), 0);
 }
 
 #[test]
@@ -116,11 +114,6 @@ fn decode_counts_options_records_but_never_emits_them() {
 
     assert_eq!(processed, 0, "options records are not flows");
     assert_eq!(emitted, 0, "sink is never called for options data");
-    assert_eq!(
-        ctx.counters
-            .options_records_processed
-            .load(Ordering::Relaxed),
-        1
-    );
-    assert_eq!(ctx.flows.len(), 0);
+    assert_eq!(ctx.stats().options_records_processed, 1);
+    assert_eq!(ctx.active_flows(), 0);
 }

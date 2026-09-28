@@ -15,11 +15,11 @@
 //! per interface or per `flowSamplerId`), each in its own options record. State
 //! is therefore keyed by `(exporter, scope, selector)` — the exporter/transport
 //! session, the protocol-tagged observation [`Scope`], and the sampler
-//! [`SamplerSelector`] — so per-sampler rates do not overwrite one another (see
+//! [`SamplerSelector`](crate::sampling::SamplerSelector) — so per-sampler rates do not overwrite one another (see
 //! `docs/exporter-identity.md`). The selector is exactly the identifier a flow
 //! record can also carry (`flowSamplerId` / `selectorId`), so a decoded flow can
 //! be matched back to the sampler that produced it. Absent any advertisement,
-//! callers use the neutral [`SamplingRatio::NONE`].
+//! callers use the neutral [`SamplingRatio::NONE`](crate::sampling::SamplingRatio::NONE).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -119,14 +119,14 @@ enum SamplerRate {
 
 /// Concurrent, size-bounded cache of the sampling ratio advertised per
 /// `(exporter, scope, selector)`.
-pub struct SamplingTracker {
+pub(crate) struct SamplingTracker {
     rates: DashMap<SamplingKey, SamplerRate>,
     max_samplers: usize,
     sampler_count: AtomicUsize,
 }
 
 impl SamplingTracker {
-    pub fn new(max_samplers: usize) -> Self {
+    pub(crate) fn new(max_samplers: usize) -> Self {
         Self {
             rates: DashMap::new(),
             max_samplers,
@@ -145,7 +145,7 @@ impl SamplingTracker {
     /// not a conflict. A brand new sampler is admitted only while below the hard
     /// cap, so a hostile exporter flooding distinct samplers cannot grow this
     /// cache without bound.
-    pub fn observe(
+    pub(crate) fn observe(
         &self,
         exporter: ExporterKey,
         scope: Scope,
@@ -188,7 +188,7 @@ impl SamplingTracker {
 
     /// The sampling ratio unambiguously advertised for one sampler, if any.
     /// A poisoned (ambiguous) domain bucket reports `None`.
-    pub fn get(
+    pub(crate) fn get(
         &self,
         exporter: ExporterKey,
         scope: Scope,
@@ -206,7 +206,7 @@ impl SamplingTracker {
 
     /// The sampling ratio to scale a flow by: the sampler's rate when it is
     /// known and unambiguous, otherwise [`SamplingRatio::NONE`] (no scaling).
-    pub fn ratio(
+    pub(crate) fn ratio(
         &self,
         exporter: ExporterKey,
         scope: Scope,
@@ -216,11 +216,11 @@ impl SamplingTracker {
             .unwrap_or(SamplingRatio::NONE)
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.rates.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.rates.is_empty()
     }
 
@@ -229,7 +229,7 @@ impl SamplingTracker {
     /// number of samplers removed. Part of the per-key purge that retires a
     /// transport session (e.g. an exporter restart) without leaking bounded
     /// slots.
-    pub fn purge_exporter(&self, exporter: ExporterKey) -> usize {
+    pub(crate) fn purge_exporter(&self, exporter: ExporterKey) -> usize {
         let mut removed = 0usize;
         let count = &self.sampler_count;
         self.rates.retain(|key, _rate| {

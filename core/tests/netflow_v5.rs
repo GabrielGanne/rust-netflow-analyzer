@@ -22,7 +22,7 @@ fn decodes_v5_packet_with_multiple_records() {
 
     let processed = ctx.process_packet(&packet).expect("parse ok");
     assert_eq!(processed, 2);
-    assert_eq!(ctx.flows.len(), 2);
+    assert_eq!(ctx.active_flows(), 2);
 
     let stats = ctx.stats();
     assert_eq!(stats.data_records_processed, 2);
@@ -54,5 +54,5 @@ fn v5_count_is_bounded_by_buffer() {
 
     let processed = ctx.process_packet(&packet).expect("parse ok");
     assert_eq!(processed, 1);
-    assert_eq!(ctx.flows.len(), 1);
+    assert_eq!(ctx.active_flows(), 1);
 }

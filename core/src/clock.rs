@@ -39,11 +39,17 @@ impl Default for ClockConfig {
 /// Latest clock observations for one NetFlow/IPFIX observation domain.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClockState {
+    /// Most recent export timestamp observed from the exporter, in Unix nanoseconds.
     pub last_export_time_ns: u64,
+    /// Local receipt timestamp of the most recent packet, in Unix nanoseconds.
     pub last_receipt_time_ns: u64,
+    /// Absolute clock skew computed for the most recent packet, in nanoseconds.
     pub last_skew_ns: u64,
+    /// Total number of packets observed for this exporter/scope.
     pub packets_seen: u64,
+    /// Number of packets rejected or fallen back due to clock skew.
     pub clock_issues: u64,
+    /// Whether the clock timestamp of the most recent packet was within skew limits.
     pub last_was_usable: bool,
 }
 
@@ -55,14 +61,14 @@ pub(crate) enum ClockDecision {
 }
 
 /// Concurrent, bounded exporter-clock state keyed by `(exporter, scope)`.
-pub struct ClockTracker {
+pub(crate) struct ClockTracker {
     states: DashMap<ClockKey, ClockState>,
     max_scopes: usize,
     scope_count: AtomicUsize,
 }
 
 impl ClockTracker {
-    pub fn new(max_scopes: usize) -> Self {
+    pub(crate) fn new(max_scopes: usize) -> Self {
         Self {
             states: DashMap::new(),
             max_scopes,
@@ -70,17 +76,18 @@ impl ClockTracker {
         }
     }
 
-    pub fn get(&self, exporter: ExporterKey, scope: Scope) -> Option<ClockState> {
+    pub(crate) fn get(&self, exporter: ExporterKey, scope: Scope) -> Option<ClockState> {
         self.states
             .get(&(exporter, scope))
             .map(|entry| *entry.value())
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.states.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.states.is_empty()
     }
 
@@ -88,7 +95,7 @@ impl ClockTracker {
     /// scopes, releasing each reserved capacity slot. Returns the number of
     /// scopes removed. Part of the per-key purge that retires a transport
     /// session (e.g. an exporter restart) without leaking bounded slots.
-    pub fn purge_exporter(&self, exporter: ExporterKey) -> usize {
+    pub(crate) fn purge_exporter(&self, exporter: ExporterKey) -> usize {
         let mut removed = 0usize;
         let count = &self.scope_count;
         self.states.retain(|key, _state| {
