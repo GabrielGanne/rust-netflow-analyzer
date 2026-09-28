@@ -86,23 +86,23 @@
 
 ### Public Rust API and documentation
 
-- [ ] Review the public API before 0.1: reduce public modules, fields, caches,
+- [x] Review the public API before 0.1: reduce public modules, fields, caches,
   parser internals, and atomic counters to the surface intended for SemVer
   support. This is a breaking API design decision if postponed.
-- [ ] Replace stringly `Result<_, &'static str>` failures with a documented,
+- [x] Replace stringly `Result<_, &'static str>` failures with a documented,
   typed error enum that callers can match without comparing message text.
-- [ ] Add crate-level documentation and examples for both crates, then document
+- [x] Add crate-level documentation and examples for both crates, then document
   every intended public item or explicitly allow narrowly justified omissions.
-- [ ] Fix the broken rustdoc link to `FlowFields::from_record` and make
+- [x] Fix the broken rustdoc link to `FlowFields::from_record` and make
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` pass.
-- [ ] Add a public README covering supported protocols, architecture, Rust and C
+- [x] Add a public README covering supported protocols, architecture, Rust and C
   quick starts, threading/lifecycle rules, resource limits, security posture,
   feature limitations, MSRV, license, and support status.
-- [ ] Add a changelog, security policy/reporting instructions, contribution
+- [x] Add a changelog, security policy/reporting instructions, contribution
   guidance, and a documented release procedure with version tags.
-- [ ] Rewrite or exclude `netflow-analyzer-migration.md` for public release; it
+- [x] Rewrite or exclude `netflow-analyzer-migration.md` for public release; it
   currently contains environment-specific paths and downstream-project details.
-- [ ] Compare `include/netflow-analyzer.h` with the downstream
+- [x] Compare `include/netflow-analyzer.h` with the downstream
   `src/netflow-parser/netflow.h` contract and document intentional differences.
 
 ### Security and dependency policy
