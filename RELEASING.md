@@ -18,9 +18,10 @@ first, then the FFI crate.
 
 ## Verifying before release
 
-Package and verify both crates with a single workspace command:
+Run local verification and verify dependency policy:
 
 ```sh
+./tools/test.sh                    # fmt, tests, clippy, cargo deny, C ABI smoke test
 cargo package --workspace          # build every .crate and verify-build each
 cargo package --workspace --list   # inspect the file list of every archive
 ```

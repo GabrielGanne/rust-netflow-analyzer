@@ -10,6 +10,7 @@ Thank you for your interest in contributing to `rust-netflow-analyzer`! This doc
 
 - **Rust**: Version **1.82** or newer (stable toolchain recommended).
 - **C/C++ Toolchain**: `gcc` or `clang`, `g++`, and `make` (required to run the C integration and ABI smoke tests).
+- **cargo-deny**: `cargo install cargo-deny` (requires Rust 1.88+ or prebuilt binary; required for dependency policy and security checks).
 - **cbindgen** (optional, required only when modifying FFI types): `cargo install cbindgen`.
 
 ### Clone and Build
@@ -36,9 +37,10 @@ Before submitting a pull request, run the local verification gate:
 3. `cargo test --release` in optimized release mode
 4. `cargo test --doc` (documentation tests)
 5. `cargo clippy` with warnings denied (`-D warnings`)
-6. `cargo build --release`
-7. Compilation and execution of the C integration example (`examples/c_integration`) with C11 and C++11 ABI static assertions
-8. Public C symbol verification (`tools/check_symbols.sh`)
+6. `cargo deny --locked check` (dependency licenses, security advisories, bans, and sources policy)
+7. `cargo build --release`
+8. Compilation and execution of the C integration example (`examples/c_integration`) with C11 and C++11 ABI static assertions
+9. Public C symbol verification (`tools/check_symbols.sh`)
 
 Additionally, verify documentation build cleanly:
 

@@ -1,0 +1,43 @@
+# cargo-deny configuration for rust-netflow-analyzer
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+targets = []
+all-features = false
+no-default-features = false
+
+[advisories]
+ignore = []
+
+[licenses]
+unused-allowed-license = "allow"
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = [
+    { crate = "atty", reason = "unmaintained and unsound; use is-terminal instead" },
+    { crate = "lazy_static", reason = "superseded by once_cell or std::sync::OnceLock" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

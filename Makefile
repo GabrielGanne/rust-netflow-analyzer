@@ -3,7 +3,7 @@
 CARGO  ?= cargo
 HEADER := ffi/include/netflow-analyzer.h
 
-.PHONY: all build release test check header c-example bench clean
+.PHONY: all build release test check header c-example bench clean deny
 
 all: build
 
@@ -18,6 +18,10 @@ release:
 # Run the Rust test suite.
 test:
 	$(CARGO) test
+
+# Run dependency and security checks (licenses, bans, sources, advisories).
+deny:
+	$(CARGO) deny --locked check
 
 # Full local verification, including formatting, Clippy, release tests, and
 # the C ABI smoke test.

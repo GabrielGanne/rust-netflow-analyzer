@@ -110,7 +110,7 @@
 - [x] Update `crossbeam-epoch` from 0.9.18 to at least 0.9.20 and make
   `cargo audit` pass without RUSTSEC-2026-0204. It is currently reached through
   benchmark/dev dependencies, not the runtime dependency path.
-- [ ] Add and review a `deny.toml` policy for advisories, allowed licenses,
+- [x] Add and review a `deny.toml` policy for advisories, allowed licenses,
   dependency sources, duplicate versions, and banned crates; make
   `cargo deny check` a release gate.
 - [ ] Document deployment hardening for the public UDP listener: trusted exporter

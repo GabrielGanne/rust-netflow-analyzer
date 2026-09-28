@@ -15,6 +15,7 @@ test_target_dir="${NETFLOW_ANALYZER_TEST_TARGET_DIR:-$repo_root/target/test}"
 "$cargo" test --locked --target-dir "$test_target_dir" --all-targets --release
 "$cargo" test --locked --target-dir "$test_target_dir" --doc
 "$cargo" clippy --locked --target-dir "$test_target_dir" --all-targets -- -D warnings
+"$cargo" deny --locked check
 
 # Exercise the public static-library/header integration in addition to Rust
 # unit and integration tests.
