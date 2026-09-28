@@ -107,7 +107,7 @@
 
 ### Security and dependency policy
 
-- [ ] Update `crossbeam-epoch` from 0.9.18 to at least 0.9.20 and make
+- [x] Update `crossbeam-epoch` from 0.9.18 to at least 0.9.20 and make
   `cargo audit` pass without RUSTSEC-2026-0204. It is currently reached through
   benchmark/dev dependencies, not the runtime dependency path.
 - [ ] Add and review a `deny.toml` policy for advisories, allowed licenses,
