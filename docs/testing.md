@@ -15,7 +15,8 @@ Run the full local gate:
 
 That command checks formatting, runs debug and release tests for every
 workspace target, runs documentation tests, runs Clippy with warnings denied,
-and builds/runs the C static-library smoke test.
+runs dependency policy checks (`cargo deny --locked check`), and builds/runs the
+C static-library smoke test.
 
 Run only the C integration test:
 
@@ -49,9 +50,9 @@ Additional Criterion arguments can be passed after the command, for example
 
 ## Planned additions
 
-1. Stabilize the local gate. Resolve the existing rustfmt drift, then keep
-   `tools/test.sh` as the one documented correctness command. Add an explicit
-   supported Rust version before adding an MSRV runner.
+1. Stabilize the local gate. The rustfmt drift is resolved, and
+   `tools/test.sh` is maintained as the documented correctness command. The
+   supported MSRV is Rust 1.82.
 2. Complete protocol and state-machine coverage. Add table-driven packet
    builders/fixtures for header and FlowSet length boundaries, template
    replacement/expiry, multiple domains, padding, unknown fields, options

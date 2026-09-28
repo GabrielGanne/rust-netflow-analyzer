@@ -51,6 +51,20 @@ Runnable integration examples are provided in the repository:
 
 ---
 
+## Testing and Verification
+
+Run the full local verification gate before submitting changes:
+
+```sh
+./tools/test.sh
+# or
+make check
+```
+
+This checks formatting (`cargo fmt --check`), runs debug and release tests across all workspace targets, runs documentation tests, runs Clippy with warnings denied (`-D warnings`), validates dependency policy and security advisories (`cargo deny --locked check`), and builds and runs the C integration test and ABI checks.
+
+---
+
 ## Threading and Lifecycle Rules
 
 1. **Concurrent Packet Ingestion**:

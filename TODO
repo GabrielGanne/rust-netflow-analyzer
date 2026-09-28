@@ -121,7 +121,7 @@
 ## Testing and local verification
 
 - [x] Fix the existing rustfmt drift so `./tools/test.sh` is a passing local gate.
-- [ ] Keep the local gate as the documented correctness command: locked debug and
+- [x] Keep the local gate as the documented correctness command: locked debug and
   release tests, documentation tests, Clippy with warnings denied, and the C
   ABI smoke test.
 - [ ] Add CI for formatting, strict Clippy, debug/release/all-target tests,
