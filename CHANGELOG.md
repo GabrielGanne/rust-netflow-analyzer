@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Expire templates 30 minutes after their last definition, reclaiming capacity through lookup, admission, and background aging.
 - Bound the UDP listener peer table, admit configured exporter IPs, retire idle peers, and rotate keys after detected restarts.
+- Keep UDP listener keys per endpoint and protocol scope so one domain's restart preserves the others.
 
 ## [0.1.0] - 2026-09-28
 

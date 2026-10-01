@@ -356,12 +356,14 @@ step's stated prerequisites are also in place.
    **best-effort**, and prefer an authenticated, session-bound transport for
    high-assurance deployments.
 
-   *Status: the reference `udp_listener` maps admitted source endpoints to
-   distinct, never-reused keys. It caps the peer table, allows only configured
-   source IPs, and purges idle peers when capacity is needed or they return.
+   *Status: the reference `udp_listener` maps each admitted source endpoint and
+   tagged scope to a distinct, never-reused key. It caps the peer table, allows
+   only configured source IPs, and purges idle peers when capacity is needed or
+   they return.
    Per-scope sequence and uptime evidence can trigger a restart: the receive
-   loop stops the aging worker, purges the old key, allocates a fresh one, and
-   replays bounded candidate datagrams to retain startup templates. It drops
+   loop stops the aging worker, purges only that scope's old key, allocates a
+   fresh one, and replays only that scope's bounded candidate datagrams to
+   retain startup templates. Other scopes keep their keys and state. It drops
    later packets for a short quiescence window. Purges are spaced at least six
    seconds apart so the aging worker can complete its five-second sweep;
    packets requiring an earlier purge are dropped. Detection is conservative

@@ -49,6 +49,7 @@ Runnable integration examples are provided in the repository:
   cargo run -p netflow_analyzer_core --example udp_listener -- --help
   ```
   The listener admits loopback sources by default. Use repeated `--allow-exporter <IP>` options to admit specific remote exporters; this replaces the loopback defaults. `--max-peers` bounds endpoint state, and `--peer-idle` reclaims idle peers when capacity is needed or they return. Source-IP admission requires a network boundary that prevents spoofing.
+  Each endpoint and protocol scope has its own exporter key, so a detected restart in one observation domain leaves other domains running.
 
 ---
 

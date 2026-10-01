@@ -7,9 +7,10 @@
 //! Binds a UDP socket, feeds every received datagram into the engine, prints
 //! emitted flows from the background aging thread, and reports telemetry.
 //!
-//! Each admitted source endpoint is given a distinct exporter key. Idle peers
-//! are purged when capacity is needed or they return, and evidence of a restart
-//! rotates the key after the aging worker stops (see `docs/exporter-identity.md`).
+//! Each admitted source endpoint and protocol scope is given a distinct
+//! exporter key. Idle peers are purged when capacity is needed or they return,
+//! and evidence of a restart rotates only the affected scope's key after the
+//! aging worker stops (see `docs/exporter-identity.md`).
 //!
 //! Run with:
 //!     cargo run -p netflow_analyzer_core --example udp_listener -- --address 10.0.0.10 --allow-exporter 10.0.0.1
@@ -144,11 +145,31 @@ fn sequence_decision(previous: HeaderInfo, current: HeaderInfo) -> SequenceDecis
 }
 
 struct PeerState {
-    key: ExporterKey,
+    keys: HashMap<Scope, ExporterKey>,
     last_seen: Instant,
     scopes: HashMap<Scope, HeaderInfo>,
     pending_restart: HashMap<Scope, RestartCandidate>,
-    quiet_until: Option<Instant>,
+    quiet_until: HashMap<Scope, Instant>,
+}
+
+impl PeerState {
+    fn new(scope: Scope, key: ExporterKey, now: Instant) -> Self {
+        Self {
+            keys: HashMap::from([(scope, key)]),
+            last_seen: now,
+            scopes: HashMap::new(),
+            pending_restart: HashMap::new(),
+            quiet_until: HashMap::new(),
+        }
+    }
+
+    fn effective_last_seen(&self) -> Instant {
+        self.quiet_until
+            .values()
+            .copied()
+            .max()
+            .map_or(self.last_seen, |until| self.last_seen.max(until))
+    }
 }
 
 struct RestartCandidate {
@@ -260,18 +281,17 @@ impl PeerTable {
             return Ok(());
         }
         let mut retired = Vec::new();
+        let mut retired_peers = 0;
         self.peers.retain(|_, state| {
-            if state.quiet_until.is_none_or(|until| now >= until)
-                && now.duration_since(state.quiet_until.unwrap_or(state.last_seen))
-                    >= self.idle_timeout
-            {
-                retired.push(state.key);
+            if now.saturating_duration_since(state.effective_last_seen()) >= self.idle_timeout {
+                retired.extend(state.keys.values().copied());
+                retired_peers += 1;
                 false
             } else {
                 true
             }
         });
-        self.idle_retirements += retired.len() as u64;
+        self.idle_retirements += retired_peers;
         self.purge_keys(ctx, &retired, printer)?;
         if !retired.is_empty() {
             self.last_purge_at = Some(Instant::now());
@@ -279,35 +299,45 @@ impl PeerTable {
         Ok(())
     }
 
-    fn rotate(
+    fn rotate_scope(
         &mut self,
         peer: SocketAddr,
-        quiet: bool,
+        scope: Scope,
         ctx: &FlowContext,
         printer: fn(&FlowRecord),
     ) -> std::io::Result<Admission> {
-        if let Some(retired) = self.peers.remove(&peer) {
-            self.purge_keys(ctx, &[retired.key], printer)?;
-            self.last_purge_at = Some(Instant::now());
-        }
+        let old_key = self.peers[&peer].keys[&scope];
+        self.purge_keys(ctx, &[old_key], printer)?;
+        self.last_purge_at = Some(Instant::now());
         self.rotations += 1;
         let key = self.allocate_key()?;
         let now = Instant::now();
-        self.peers.insert(
-            peer,
-            PeerState {
-                key,
-                last_seen: now,
-                scopes: HashMap::new(),
-                pending_restart: HashMap::new(),
-                quiet_until: quiet.then_some(now + RESTART_QUIET_PERIOD),
-            },
-        );
-        Ok(if quiet {
-            Admission::Quiet
-        } else {
-            Admission::Accept(key)
-        })
+        let state = self.peers.get_mut(&peer).expect("rotating a tracked peer");
+        state.keys.insert(scope, key);
+        state.scopes.remove(&scope);
+        state.pending_restart.remove(&scope);
+        state.quiet_until.insert(scope, now + RESTART_QUIET_PERIOD);
+        state.last_seen = now;
+        Ok(Admission::Quiet)
+    }
+
+    fn retire_peer(
+        &mut self,
+        peer: SocketAddr,
+        scope: Scope,
+        ctx: &FlowContext,
+        printer: fn(&FlowRecord),
+    ) -> std::io::Result<Admission> {
+        let retired = self.peers.remove(&peer).expect("retiring a tracked peer");
+        let keys: Vec<_> = retired.keys.values().copied().collect();
+        self.purge_keys(ctx, &keys, printer)?;
+        self.last_purge_at = Some(Instant::now());
+        self.idle_retirements += 1;
+        self.rotations += 1;
+        let key = self.allocate_key()?;
+        self.peers
+            .insert(peer, PeerState::new(scope, key, Instant::now()));
+        Ok(Admission::Accept(key))
     }
 
     fn packet_key(
@@ -319,12 +349,12 @@ impl PeerTable {
         printer: fn(&FlowRecord),
     ) -> std::io::Result<Admission> {
         if let Some(state) = self.peers.get_mut(&peer) {
-            if let Some(until) = state.quiet_until {
+            if let Some(until) = state.quiet_until.get(&header.scope).copied() {
                 if now < until {
                     return Ok(Admission::Quiet);
                 }
-                state.quiet_until = None;
-                state.last_seen = until;
+                state.quiet_until.remove(&header.scope);
+                state.last_seen = state.last_seen.max(until);
             }
             if let Some(&previous) = state.scopes.get(&header.scope) {
                 if state
@@ -335,20 +365,19 @@ impl PeerTable {
                     if !self.purge_due(now) {
                         return Ok(Admission::PurgeDeferred);
                     }
-                    return self.rotate(peer, true, ctx, printer);
+                    return self.rotate_scope(peer, header.scope, ctx, printer);
                 }
             }
-            if now.duration_since(state.last_seen) >= self.idle_timeout {
+            if now.saturating_duration_since(state.effective_last_seen()) >= self.idle_timeout {
                 if !self.purge_due(now) {
                     return Ok(Admission::PurgeDeferred);
                 }
-                self.idle_retirements += 1;
-                return self.rotate(peer, false, ctx, printer);
+                return self.retire_peer(peer, header.scope, ctx, printer);
             }
             if let Some(&previous) = state.scopes.get(&header.scope) {
                 return match sequence_decision(previous, header) {
-                    SequenceDecision::Accept => Ok(Admission::Accept(state.key)),
-                    SequenceDecision::Stale => Ok(Admission::Accept(state.key)),
+                    SequenceDecision::Accept => Ok(Admission::Accept(state.keys[&header.scope])),
+                    SequenceDecision::Stale => Ok(Admission::Accept(state.keys[&header.scope])),
                     SequenceDecision::Restart => {
                         state.last_seen = now;
                         state
@@ -363,11 +392,22 @@ impl PeerTable {
                     }
                 };
             }
-            return Ok(if state.scopes.len() >= MAX_SCOPES_PER_PEER {
-                Admission::ScopeLimit
-            } else {
-                Admission::Accept(state.key)
-            });
+            if let Some(&key) = state.keys.get(&header.scope) {
+                return Ok(Admission::Accept(key));
+            }
+        }
+
+        if let Some(state) = self.peers.get(&peer) {
+            if state.keys.len() >= MAX_SCOPES_PER_PEER {
+                return Ok(Admission::ScopeLimit);
+            }
+            let key = self.allocate_key()?;
+            self.peers
+                .get_mut(&peer)
+                .unwrap()
+                .keys
+                .insert(header.scope, key);
+            return Ok(Admission::Accept(key));
         }
 
         if self.peers.len() >= self.max_peers {
@@ -377,16 +417,8 @@ impl PeerTable {
             return Ok(Admission::AtCapacity);
         }
         let key = self.allocate_key()?;
-        self.peers.insert(
-            peer,
-            PeerState {
-                key,
-                last_seen: now,
-                scopes: HashMap::new(),
-                pending_restart: HashMap::new(),
-                quiet_until: None,
-            },
-        );
+        self.peers
+            .insert(peer, PeerState::new(header.scope, key, now));
         Ok(Admission::Accept(key))
     }
 
@@ -399,7 +431,10 @@ impl PeerTable {
         ctx: &FlowContext,
         printer: fn(&FlowRecord),
     ) -> std::io::Result<Admission> {
-        let old_key = self.peers.get(&peer).map(|state| state.key);
+        let old_key = self
+            .peers
+            .get(&peer)
+            .and_then(|state| state.keys.get(&header.scope).copied());
         let replay = self.peers.get(&peer).and_then(|state| {
             state
                 .pending_restart
@@ -407,13 +442,11 @@ impl PeerTable {
                 .and_then(|candidate| {
                     confirms_restart(candidate, *state.scopes.get(&header.scope)?, header).then(
                         || {
-                            state
-                                .pending_restart
-                                .values()
-                                .flat_map(|candidate| {
-                                    candidate.packets.iter().map(|packet| {
-                                        (candidate.observed_at, candidate.header, packet.clone())
-                                    })
+                            candidate
+                                .packets
+                                .iter()
+                                .map(|packet| {
+                                    (candidate.observed_at, candidate.header, packet.clone())
                                 })
                                 .collect::<Vec<_>>()
                         },
@@ -462,19 +495,17 @@ impl PeerTable {
         }
         if let (Some(old_key), Some(mut replay)) = (old_key, replay) {
             if let Some(state) = self.peers.get_mut(&peer) {
-                if state.key != old_key && admission == Admission::Quiet {
+                let key = state.keys[&header.scope];
+                if key != old_key && admission == Admission::Quiet {
                     replay.sort_by_key(|(observed_at, _, _)| *observed_at);
                     for (_, candidate_header, candidate_packet) in replay {
-                        if ctx
-                            .process_packet_from(state.key, &candidate_packet)
-                            .is_ok()
-                        {
+                        if ctx.process_packet_from(key, &candidate_packet).is_ok() {
                             state
                                 .scopes
                                 .insert(candidate_header.scope, candidate_header);
                         }
                     }
-                    return Ok(Admission::Restarted(state.key));
+                    return Ok(Admission::Restarted(key));
                 }
             }
         }
@@ -989,6 +1020,36 @@ mod tests {
     }
 
     #[test]
+    fn retiring_idle_peer_purges_every_scope_key() {
+        let ctx = FlowContext::new();
+        let mut peers = PeerTable::new(1, Duration::from_secs(60));
+        let now = Instant::now();
+        let a: SocketAddr = "10.0.0.1:2055".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:2055".parse().unwrap();
+        for (domain, key) in [(1, 1), (2, 2)] {
+            let header = v9_header(domain, 1, 1000, 100);
+            assert_eq!(
+                peers.packet_key(a, header, now, &ctx, print_flow).unwrap(),
+                Admission::Accept(key)
+            );
+            ctx.process_packet_from(key, &template_packet(header))
+                .unwrap();
+            peers.record(a, header, now);
+        }
+        assert_eq!(ctx.active_templates(), 2);
+        let header = v9_header(3, 1, 1000, 100);
+        assert_eq!(
+            peers
+                .packet_key(b, header, now + Duration::from_secs(61), &ctx, print_flow)
+                .unwrap(),
+            Admission::Accept(3)
+        );
+        assert_eq!(ctx.active_templates(), 0);
+        assert_eq!(peers.idle_retirements, 1);
+        ctx.stop_aging();
+    }
+
+    #[test]
     fn restart_rotates_key_and_purges_old_template_state() {
         let ctx = FlowContext::new();
         let mut peers = PeerTable::new(2, Duration::from_secs(1800));
@@ -1028,9 +1089,9 @@ mod tests {
             Admission::Quiet
         );
         assert_eq!(ctx.active_templates(), 0);
-        assert_eq!(peers.peers[&peer].key, 2);
+        assert_eq!(peers.peers[&peer].keys[&before.scope], 2);
         assert_eq!(peers.rotations, 1);
-        let quiet_until = peers.peers[&peer].quiet_until.unwrap();
+        let quiet_until = peers.peers[&peer].quiet_until[&after.scope];
         assert_eq!(
             peers
                 .packet_key(
@@ -1105,7 +1166,7 @@ mod tests {
             Admission::Restarted(2)
         );
         assert_eq!(ctx.active_templates(), 1);
-        assert!(peers.peers[&peer].quiet_until.is_some());
+        assert!(peers.peers[&peer].quiet_until.contains_key(&before.scope));
         ctx.stop_aging();
     }
 
@@ -1271,7 +1332,7 @@ mod tests {
                 .unwrap(),
             Admission::Quiet
         );
-        assert_eq!(peers.peers[&peer].key, 2);
+        assert_eq!(peers.peers[&peer].keys[&before.scope], 2);
         ctx.stop_aging();
     }
 
@@ -1303,7 +1364,7 @@ mod tests {
                 .unwrap(),
             Admission::Quiet
         );
-        let quiet_until = peers.peers[&peer].quiet_until.unwrap();
+        let quiet_until = peers.peers[&peer].quiet_until[&second.scope];
         peers
             .retire_idle(quiet_until - Duration::from_millis(1), &ctx, print_flow)
             .unwrap();
@@ -1319,7 +1380,7 @@ mod tests {
                 .unwrap(),
             Admission::Quiet
         );
-        assert_eq!(peers.peers[&peer].key, 2);
+        assert_eq!(peers.peers[&peer].keys[&before.scope], 2);
         assert_eq!(
             peers
                 .packet_key(peer, second, quiet_until, &ctx, print_flow)
@@ -1357,7 +1418,7 @@ mod tests {
                 .unwrap(),
             Admission::Quiet
         );
-        let quiet_until = peers.peers[&peer].quiet_until.unwrap();
+        let quiet_until = peers.peers[&peer].quiet_until[&second.scope];
         assert_eq!(
             peers
                 .packet_key(
@@ -1401,7 +1462,7 @@ mod tests {
                 .unwrap(),
             Admission::PurgeDeferred
         );
-        assert_eq!(peers.peers[&peer].key, 2);
+        assert_eq!(peers.peers[&peer].keys[&header.scope], 2);
         assert_eq!(
             peers
                 .packet_key(peer, header, now + Duration::from_secs(8), &ctx, print_flow)
@@ -1488,7 +1549,7 @@ mod tests {
                 peers
                     .packet_key(peer, header, now, &ctx, print_flow)
                     .unwrap(),
-                Admission::Accept(1)
+                Admission::Accept(domain as u64)
             );
             peers.record(peer, header, now);
         }
@@ -1519,7 +1580,79 @@ mod tests {
                 .unwrap(),
             Admission::Quiet
         );
-        assert_eq!(peers.peers[&peer].key, 2);
+        assert_eq!(peers.peers[&peer].keys[&Scope::V9Domain(1)], 3);
+        assert_eq!(peers.peers[&peer].keys[&Scope::V9Domain(2)], 2);
+        assert!(peers.peers[&peer]
+            .pending_restart
+            .contains_key(&Scope::V9Domain(2)));
+        ctx.stop_aging();
+    }
+
+    #[test]
+    fn rotating_one_domain_preserves_other_domain_and_its_unconfirmed_candidate() {
+        let ctx = FlowContext::new();
+        let mut peers = PeerTable::new(1, Duration::from_secs(1800));
+        let peer: SocketAddr = "10.0.0.1:2055".parse().unwrap();
+        let now = Instant::now();
+        let a = v9_header(1, 2000, 1_000_000, 100);
+        let b = v9_header(2, 2000, 1_000_000, 100);
+        for (header, key) in [(a, 1), (b, 2)] {
+            assert_eq!(
+                peers
+                    .packet_key(peer, header, now, &ctx, print_flow)
+                    .unwrap(),
+                Admission::Accept(key)
+            );
+            ctx.process_packet_from(key, &template_packet(header))
+                .unwrap();
+            peers.record(peer, header, now);
+        }
+        assert_eq!(ctx.active_templates(), 2);
+
+        let a_reset = v9_header(1, 0, 1000, 101);
+        let b_delayed = v9_header(2, 0, 1000, 101);
+        assert_eq!(
+            peers
+                .packet_key_with_packet(
+                    peer,
+                    a_reset,
+                    &template_packet(a_reset),
+                    now,
+                    &ctx,
+                    print_flow,
+                )
+                .unwrap(),
+            Admission::RestartCandidate
+        );
+        let mut old_b_template = template_packet(b_delayed);
+        old_b_template[24..26].copy_from_slice(&257u16.to_be_bytes());
+        assert_eq!(
+            peers
+                .packet_key_with_packet(peer, b_delayed, &old_b_template, now, &ctx, print_flow,)
+                .unwrap(),
+            Admission::RestartCandidate
+        );
+        let a_confirmed = v9_header(1, 1, 2000, 102);
+        assert_eq!(
+            peers
+                .packet_key_with_packet(
+                    peer,
+                    a_confirmed,
+                    &header_only_packet(a_confirmed),
+                    now,
+                    &ctx,
+                    print_flow,
+                )
+                .unwrap(),
+            Admission::Restarted(3)
+        );
+        assert_eq!(ctx.active_templates(), 2);
+        assert_eq!(peers.peers[&peer].keys[&b.scope], 2);
+        assert!(peers.peers[&peer].pending_restart.contains_key(&b.scope));
+        assert_eq!(
+            peers.packet_key(peer, b, now, &ctx, print_flow).unwrap(),
+            Admission::Accept(2)
+        );
         ctx.stop_aging();
     }
 
@@ -1626,7 +1759,7 @@ mod tests {
                 .unwrap(),
             Admission::Quiet
         );
-        assert_eq!(peers.peers[&peer].key, 2);
+        assert_eq!(peers.peers[&peer].keys[&before.scope], 2);
         ctx.stop_aging();
     }
 
@@ -1670,7 +1803,7 @@ mod tests {
                 .unwrap(),
             Admission::Quiet
         );
-        assert_eq!(peers.peers[&peer].key, 2);
+        assert_eq!(peers.peers[&peer].keys[&before.scope], 2);
         ctx.stop_aging();
     }
 
@@ -1829,7 +1962,7 @@ mod tests {
                 .unwrap(),
             Admission::Quiet
         );
-        assert_eq!(peers.peers[&peer].key, 2);
+        assert_eq!(peers.peers[&peer].keys[&before.scope], 2);
         ctx.stop_aging();
     }
 
@@ -1852,7 +1985,7 @@ mod tests {
             peers
                 .packet_key(peer, second, now, &ctx, print_flow)
                 .unwrap(),
-            Admission::Accept(1)
+            Admission::Accept(2)
         );
         peers.record(peer, second, now);
         assert_eq!(peers.rotations, 0);
@@ -1870,7 +2003,7 @@ mod tests {
                 peers
                     .packet_key(peer, header, now, &ctx, print_flow)
                     .unwrap(),
-                Admission::Accept(1)
+                Admission::Accept(domain as u64 + 1)
             );
             peers.record(peer, header, now);
         }
