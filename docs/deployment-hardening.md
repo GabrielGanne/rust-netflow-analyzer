@@ -68,12 +68,13 @@ record:
   subsequent legitimate templates from being registered until the exporter state is purged.
 
 ### Peer Key Table Exhaustion (Listener Layer)
-- If the UDP listener automatically maps each distinct `SocketAddr` to an
-  `ExporterKey` (as in `core/examples/udp_listener.rs`), spoofed source IP attacks
-  can expand the listener's internal endpoint-to-key table indefinitely.
-- Because engine state for each key persists until explicitly purged via
-  `FlowContext::purge_exporter`, allocating keys to untrusted or spoofed peers
-  eventually leaks bounded slots across template, clock, and sampling trackers.
+- A listener that maps each distinct `SocketAddr` to an `ExporterKey` without a
+  peer cap can exhaust memory under spoofed source addresses. The reference
+  listener caps mappings at 1,024 by default and drops new peers when full.
+- The reference listener purges peer keys idle for at least 30 minutes by
+  default when a peer returns or capacity is needed, and rotates keys after
+  conservative restart detection. Allowed source IPs must still be protected
+  against spoofing by the network boundary.
 
 ---
 
@@ -97,9 +98,10 @@ network boundary is required**:
    - Bind the UDP listener exclusively to private, management-plane, or VPN tunnel
      interfaces (e.g., `10.x.x.x` or loopback) rather than wildcard addresses (`0.0.0.0` or `::`).
 3. **Application-Level Admission Control**:
-   - Implement an explicit allow-list of approved exporter IP addresses/subnets
-     in the listener application before allocating an `ExporterKey` or invoking
-     `process_packet_from`.
+   - The reference listener accepts only loopback source IPs by default. Supply
+     one or more `--allow-exporter <IP>` options for approved remote exporters;
+     these replace the loopback defaults. It checks the source IP before
+     allocating an `ExporterKey` or invoking `process_packet_from`.
    - Immediately discard datagrams from unknown peers without allocating state.
 
 ### 3.2 Ingress Rate Limiting

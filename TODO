@@ -49,14 +49,15 @@
   expiry below.
   Templates expire 30 minutes after their last definition. Lookup, capacity
   admission, and the background aging worker reclaim expired entries.
-- [ ] Update the UDP listener to maintain separate state for each exporter when
+- [x] Update the UDP listener to maintain separate state for each exporter when
   it receives packets from multiple peers. Sequenced **after** the per-key purge
   above: without it the listener cannot rotate keys on exporter restart or
   reclaim table slots without leaking engine state, and it also needs an
   admission policy (trusted-exporter allow-list / rate limit) per the hostile-
   input model. The key-aware ingestion API it builds on is already in place.
-  (Partly done: per-endpoint exporter keying delivered; hard table cap,
-  admission policy, and restart-driven key rotation still pending.)
+  The reference listener now has a capped peer table, a trusted-IP allow-list,
+  idle purge, and conservative per-scope restart detection with a quiescence
+  window before accepting packets under a new key.
 - [x] Validate template IDs, options scope counts/lengths, and template
   replacement/lifecycle rules against NetFlow v9 and IPFIX requirements.
 

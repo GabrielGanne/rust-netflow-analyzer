@@ -235,10 +235,10 @@ the existing size caps on the template, clock, and flow caches, and is covered
 further by the resource-limit and deployment-hardening work tracked separately.
 
 The **caller's** endpoint-to-session-key table is a separate concern that the
-engine caps do not bound. A UDP listener that allocates a fresh key per peer will
+engine caps do not bound. A UDP listener that allocates a fresh key per peer can
 grow that table without limit under spoofed source addresses or genuinely
-high-cardinality traffic, and — until the per-key purge exists — cannot safely
-evict entries. Any caller that allocates keys must therefore give that table its
+high-cardinality traffic unless it enforces its own cap and purges retired keys.
+Any caller that allocates keys must therefore give that table its
 own **hard cap, an admission policy** (for example a trusted-exporter allow-list
 or rate limit), **and an expiry tied to the per-key purge**, so a flood of
 distinct or spoofed peers cannot exhaust memory. This ties into the [deployment
@@ -356,9 +356,14 @@ step's stated prerequisites are also in place.
    **best-effort**, and prefer an authenticated, session-bound transport for
    high-assurance deployments.
 
-   *Status: the reference `udp_listener` example now maps each source endpoint
-   to a distinct, monotonically increasing, never-reused exporter key and feeds
-   packets through `process_packet_from`, so distinct senders no longer share
-   engine state. The rest of this step is still pending: the endpoint→key table
-   is unbounded (no hard cap or admission policy), and there is no restart
-   detection, per-key purge-and-rekey, or aging-worker generation barrier yet.*
+   *Status: the reference `udp_listener` maps admitted source endpoints to
+   distinct, never-reused keys. It caps the peer table, allows only configured
+   source IPs, and purges idle peers when capacity is needed or they return.
+   Per-scope sequence and uptime evidence can trigger a restart: the receive
+   loop stops the aging worker, purges the old key, allocates a fresh one, and
+   replays bounded candidate datagrams to retain startup templates. It drops
+   later packets for a short quiescence window. Purges are spaced at least six
+   seconds apart so the aging worker can complete its five-second sweep;
+   packets requiring an earlier purge are dropped. Detection is conservative
+   and best-effort; UDP packets carry no authenticated generation marker, so
+   late packets after that window remain a risk.*
