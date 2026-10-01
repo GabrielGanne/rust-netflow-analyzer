@@ -65,15 +65,17 @@
 
 - [x] Invoke flow callbacks only after releasing `DashMap` shard locks so a slow
   or reentrant callback cannot block ingestion or deadlock on flush/process.
-- [ ] Define the callback contract in Rust and in the generated C header:
+- [x] Define the callback contract in Rust and in the generated C header:
   non-null requirements, callback thread, reentrancy, record-pointer lifetime,
   and `user_data` lifetime/synchronization responsibilities.
-- [ ] Represent optional callbacks safely (for example,
+- [x] Represent optional callbacks safely (for example,
   `Option<NetflowAnalyzerFlowCallback>`), or validate/reject missing callbacks
   without accepting an invalid Rust function-pointer value from C.
 - [ ] Prevent destruction from an aging callback and concurrent destruction
   while another API call is active; document the required shutdown sequence.
-- [ ] Prevent Rust panics from reaching an `extern "C"` boundary. Replace
+  The shutdown sequence is documented and self-join is avoided, but destruction
+  from callbacks or concurrent with another API call remains unsupported.
+- [x] Prevent Rust panics from reaching an `extern "C"` boundary. Replace
   avoidable `expect` paths in FFI-reachable code and define failure behavior for
   worker-thread creation and poisoned state.
 - [x] Add an ABI version query and size/version fields (or reserved space) to
@@ -148,25 +150,27 @@
   audit commands when the required tools and policies are defined.
 - [ ] Add sanitizer/Miri coverage where supported for unsafe FFI lifecycle and
   concurrency paths.
-- [ ] Declare a supported `rust-version` before adding an MSRV test runner.
+- [x] Declare a supported `rust-version` before adding an MSRV test runner.
+  Both crates inherit `rust-version = "1.82"` from the workspace metadata.
 
 ## Pending actions
 
 - [ ] Reject unmatched scoped rates instead of treating them as domain-wide
-- [ ] Options semantics: options templates + data records are now decoded and
-  counted, but their scoped values are not interpreted. Extract the sampling
-  interval (samplingInterval IE 34, samplerRandomInterval IE 305) per
-  observation domain from options records.
-- [ ] Apply the decoded sampling interval to scale flow byte/packet counters per
-  domain (defaults to a factor of 1 when no options are seen). This also
-  addresses the missing sampling-normalization gap.
-- [ ] Expose the new options metrics (options_templates_received,
+- [x] Interpret sampling rates from options records: samplingInterval (IE 34),
+  samplerRandomInterval (IE 50), and the samplingPacketInterval /
+  samplingPacketSpace pair (IE 305/306). State is keyed by exporter,
+  observation scope, and sampler; rejecting unmatched scopes remains above.
+- [x] Apply the decoded sampling ratio to scale flow byte/packet counters per
+  sampler before aggregation (defaults to a factor of 1 when no unambiguous
+  rate is known).
+- [x] Expose the new options metrics (options_templates_received,
   options_records_processed) in the FFI NetflowAnalyzerStats snapshot, then
-  regenerate include/netflow-analyzer.h via `make header` (cbindgen).
-- [ ] Decide which aggregation semantics are in scope for the first public
+  regenerate ffi/include/netflow-analyzer.h via `make header` (cbindgen).
+- [x] Decide which aggregation semantics are in scope for the first public
   release: stitching, deduplication, bidirectional aggregation, periodic
   intermediate emission, and empty-record dropping. Document unsupported modes.
-- [ ] Test options-template data interpretation and enrichment end to end.
+  See docs/aggregation.md for supported behavior and limitations.
+- [x] Test options-template data interpretation and enrichment end to end.
 
 ## To investigate
 
