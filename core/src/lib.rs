@@ -736,6 +736,7 @@ impl FlowContext {
     {
         let handle = AgingHandle::spawn(
             self.flows.clone(),
+            self.templates.clone(),
             self.counters.clone(),
             self.aging_cfg,
             on_emit,

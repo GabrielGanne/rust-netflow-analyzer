@@ -14,10 +14,19 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * Protocol tag for NetFlow v9 scope.
+ */
 #define NETFLOW_ANALYZER_SCOPE_V9 0
 
+/**
+ * Protocol tag for IPFIX scope.
+ */
 #define NETFLOW_ANALYZER_SCOPE_IPFIX 1
 
+/**
+ * Protocol tag for NetFlow v5 scope.
+ */
 #define NETFLOW_ANALYZER_SCOPE_V5 2
 
 /**
@@ -29,26 +38,59 @@
  */
 #define NETFLOW_ANALYZER_ABI_VERSION 2
 
+/**
+ * Flow ID was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_FLOW_ID (1 << 0)
 
+/**
+ * Ingress interface index was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_IFACE_IN (1 << 1)
 
+/**
+ * Egress interface index was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_IFACE_OUT (1 << 2)
 
+/**
+ * Source MAC address was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_SRC_MAC (1 << 3)
 
+/**
+ * Destination MAC address was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_DST_MAC (1 << 4)
 
+/**
+ * ICMP type was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_ICMP_TYPE (1 << 5)
 
+/**
+ * ICMP code was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_ICMP_CODE (1 << 6)
 
+/**
+ * Cumulative TCP control flags were present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_TCP_FLAGS (1 << 7)
 
+/**
+ * Differentiated Services Code Point (DSCP) was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_DSCP (1 << 8)
 
+/**
+ * VLAN identifier was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_VLAN_TAG (1 << 9)
 
+/**
+ * IP version marker was present in the record.
+ */
 #define NETFLOW_ANALYZER_PRESENT_IP_VERSION (1 << 10)
 
 /**
@@ -61,10 +103,25 @@ typedef struct NetflowAnalyzerContext NetflowAnalyzerContext;
  * to [`netflow_analyzer_create`] selects library defaults for every field.
  */
 typedef struct {
+    /**
+     * Maximum number of active flows retained in the flow cache.
+     */
     uint64_t max_flows;
+    /**
+     * Maximum number of templates retained in the template cache.
+     */
     uint64_t max_templates;
+    /**
+     * Flow idle eviction timeout in seconds.
+     */
     uint64_t idle_timeout_secs;
+    /**
+     * Flow active rollover timeout in seconds.
+     */
     uint64_t active_timeout_secs;
+    /**
+     * Background aging sweep interval in seconds.
+     */
     uint64_t scan_interval_secs;
     /**
      * Enable export-time versus receipt-time skew validation.
@@ -87,18 +144,62 @@ typedef struct {
     uint64_t reserved[8];
 } NetflowAnalyzerConfig;
 
+/**
+ * A C-compatible representation to safely pass over the FFI boundary.
+ *
+ * `#[non_exhaustive]` is a deliberate ABI decision: consumers must not assume
+ * this layout is frozen and must not exhaustively construct or match it, so
+ * future additions (coordinated with an ABI version/size mechanism) do not break
+ * callers. See `docs/exporter-identity.md`.
+ */
 typedef struct {
+    /**
+     * Source IP address in IPv4-mapped IPv6 representation.
+     */
     uint8_t src_ip[16];
+    /**
+     * Destination IP address in IPv4-mapped IPv6 representation.
+     */
     uint8_t dst_ip[16];
+    /**
+     * Source MAC address (or zero if absent).
+     */
     uint8_t src_mac[6];
+    /**
+     * Destination MAC address (or zero if absent).
+     */
     uint8_t dst_mac[6];
+    /**
+     * Transport layer source port.
+     */
     uint16_t src_port;
+    /**
+     * Transport layer destination port.
+     */
     uint16_t dst_port;
+    /**
+     * 802.1Q VLAN identifier.
+     */
     uint16_t vlan_tag;
+    /**
+     * Cumulative TCP control flags.
+     */
     uint16_t tcp_flags;
+    /**
+     * IP protocol number.
+     */
     uint8_t proto;
+    /**
+     * Differentiated Services Code Point (DSCP).
+     */
     uint8_t dscp;
+    /**
+     * ICMP type value.
+     */
     uint8_t icmp_type;
+    /**
+     * ICMP code value.
+     */
     uint8_t icmp_code;
     /**
      * IP version marker: 4, 6, or 0 when unknown.
@@ -121,7 +222,13 @@ typedef struct {
      * Observation domain (v9 `source_id` / IPFIX domain); `0` for v5.
      */
     uint32_t observation_domain;
+    /**
+     * Accumulated byte count.
+     */
     uint64_t bytes;
+    /**
+     * Accumulated packet count.
+     */
     uint64_t packets;
     /**
      * Ingress interface index (`ingressInterface`; v5 `input`).
@@ -246,7 +353,13 @@ typedef struct {
      * Skewed packets accepted after rebasing timestamps onto receipt time.
      */
     uint64_t clock_fallback_packets;
+    /**
+     * Total number of template records received.
+     */
     uint64_t templates_received;
+    /**
+     * Total number of flow data records processed.
+     */
     uint64_t data_records_processed;
     /**
      * Flow records delivered to the configured output callback.

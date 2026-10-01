@@ -42,13 +42,13 @@
 - [x] Validate template field counts against the remaining input before
   reserving memory, and define conservative per-message/template limits to
   prevent allocation churn from hostile datagrams.
-- [ ] Add template lifetime/expiry and transport-session reset semantics so the
+- [x] Add template lifetime/expiry and transport-session reset semantics so the
   bounded template cache cannot fill permanently with stale entries. Provide a
   per-key purge (emit-and-drain a key's flows, then drop its templates/clock/
   sampling state) — this is the prerequisite for safe listener key rotation and
   expiry below.
-  (Partly done: per-key purge + transport-session reset delivered; automatic
-  time-based template lifetime/expiry still pending.)
+  Templates expire 30 minutes after their last definition. Lookup, capacity
+  admission, and the background aging worker reclaim expired entries.
 - [ ] Update the UDP listener to maintain separate state for each exporter when
   it receives packets from multiple peers. Sequenced **after** the per-key purge
   above: without it the listener cannot rotate keys on exporter restart or

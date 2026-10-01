@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,11 +27,19 @@ pub(crate) type TemplateKey = (ExporterKey, Scope, u16);
 pub const DEFAULT_MAX_TEMPLATES: usize = 65_536;
 /// Default maximum number of active flows retained in the flow cache (1,000,000).
 pub const DEFAULT_MAX_FLOWS: usize = 1_000_000;
+pub(crate) const TEMPLATE_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+struct CachedTemplate {
+    record: Arc<TemplateRecord>,
+    defined_at: Instant,
+}
 
 /// Concurrent, size-bounded cache of decoded templates.
 pub(crate) struct TemplateCache {
-    map: DashMap<TemplateKey, Arc<TemplateRecord>>,
+    map: DashMap<TemplateKey, CachedTemplate>,
     max_templates: usize,
+    lifetime: Duration,
+    next_expiry: Mutex<Option<Instant>>,
     /// Live entry count, reserved atomically so the hard cap cannot be
     /// overshot by concurrent writers racing on a `len()` snapshot.
     count: AtomicUsize,
@@ -39,9 +47,15 @@ pub(crate) struct TemplateCache {
 
 impl TemplateCache {
     pub(crate) fn new(max_templates: usize) -> Self {
+        Self::with_lifetime(max_templates, TEMPLATE_LIFETIME)
+    }
+
+    fn with_lifetime(max_templates: usize, lifetime: Duration) -> Self {
         Self {
             map: DashMap::new(),
             max_templates,
+            lifetime,
+            next_expiry: Mutex::new(None),
             count: AtomicUsize::new(0),
         }
     }
@@ -60,20 +74,35 @@ impl TemplateCache {
         template: TemplateRecord,
     ) -> bool {
         let key = (exporter, scope, template.template_id);
-        match self.map.entry(key) {
-            Entry::Occupied(mut entry) => {
-                entry.insert(Arc::new(template));
-                true
-            }
-            Entry::Vacant(entry) => {
-                if self.reserve_slot() {
-                    entry.insert(Arc::new(template));
-                    true
-                } else {
-                    false
+        for attempt in 0..2 {
+            match self.map.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    let defined_at = Instant::now();
+                    entry.insert(CachedTemplate {
+                        record: Arc::new(template),
+                        defined_at,
+                    });
+                    drop(entry);
+                    self.note_definition(defined_at);
+                    return true;
+                }
+                Entry::Vacant(entry) => {
+                    if self.reserve_slot() {
+                        let defined_at = Instant::now();
+                        drop(entry.insert(CachedTemplate {
+                            record: Arc::new(template),
+                            defined_at,
+                        }));
+                        self.note_definition(defined_at);
+                        return true;
+                    }
                 }
             }
+            if attempt == 0 {
+                self.sweep_if_expired();
+            }
         }
+        false
     }
 
     /// Atomically claims one slot below the hard cap, returning `false` when the
@@ -93,12 +122,57 @@ impl TemplateCache {
         scope: Scope,
         template_id: u16,
     ) -> Option<Arc<TemplateRecord>> {
-        self.map
-            .get(&(exporter, scope, template_id))
-            .map(|e| e.value().clone())
+        let key = (exporter, scope, template_id);
+        let entry = self.map.get(&key)?;
+        if entry.defined_at.elapsed() < self.lifetime {
+            return Some(entry.record.clone());
+        }
+        drop(entry);
+        self.map.remove_if(&key, |_, template| {
+            let expired = template.defined_at.elapsed() >= self.lifetime;
+            if expired {
+                self.count.fetch_sub(1, Ordering::Relaxed);
+            }
+            expired
+        });
+        None
+    }
+
+    fn note_definition(&self, defined_at: Instant) {
+        let expiry = defined_at + self.lifetime;
+        let mut next = self.next_expiry.lock().unwrap_or_else(|e| e.into_inner());
+        *next = Some(next.map_or(expiry, |current| current.min(expiry)));
+    }
+
+    fn sweep_if_expired(&self) {
+        let now = Instant::now();
+        let mut next = self.next_expiry.lock().unwrap_or_else(|e| e.into_inner());
+        if next.is_none_or(|expiry| expiry <= now) {
+            self.sweep_expired_at(now, &mut next);
+        }
+    }
+
+    pub(crate) fn sweep_expired(&self) {
+        let mut next = self.next_expiry.lock().unwrap_or_else(|e| e.into_inner());
+        self.sweep_expired_at(Instant::now(), &mut next);
+    }
+
+    fn sweep_expired_at(&self, now: Instant, next_expiry: &mut Option<Instant>) {
+        *next_expiry = None;
+        self.map.retain(|_, template| {
+            let expiry = template.defined_at + self.lifetime;
+            if expiry <= now {
+                self.count.fetch_sub(1, Ordering::Relaxed);
+                false
+            } else {
+                *next_expiry = Some(next_expiry.map_or(expiry, |current| current.min(expiry)));
+                true
+            }
+        });
     }
 
     pub(crate) fn len(&self) -> usize {
+        self.sweep_expired();
         self.map.len()
     }
 
@@ -420,6 +494,7 @@ impl AgingHandle {
     /// panicking, so FFI callers can surface the failure without unwinding.
     pub(crate) fn spawn<F>(
         flows: Arc<FlowCache>,
+        templates: Arc<TemplateCache>,
         counters: Arc<InternalCounters>,
         cfg: AgingConfig,
         on_emit: F,
@@ -448,6 +523,7 @@ impl AgingHandle {
                     }
 
                     flows.sweep(&cfg, &counters, &on_emit);
+                    templates.sweep_expired();
                 }
             })?;
 
@@ -587,6 +663,49 @@ mod tests {
         // even in a cache that would otherwise be near a low cap.
         assert!(cache.insert(1, d, sample_template(256)));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn expired_templates_cannot_decode_and_release_capacity() {
+        let cache = TemplateCache::with_lifetime(1, Duration::from_secs(60));
+        let scope = Scope::V9Domain(1);
+        assert!(cache.insert(1, scope, sample_template(256)));
+        cache.map.get_mut(&(1, scope, 256)).unwrap().defined_at =
+            Instant::now() - Duration::from_secs(61);
+
+        assert!(cache.get(1, scope, 256).is_none());
+        assert!(cache.insert(2, scope, sample_template(257)));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(2, scope, 257).is_some());
+    }
+
+    #[test]
+    fn capacity_admission_sweeps_expired_templates() {
+        let cache = TemplateCache::with_lifetime(1, Duration::from_secs(60));
+        let scope = Scope::IpfixDomain(1);
+        assert!(cache.insert(1, scope, sample_template(256)));
+        assert!(!cache.insert(2, scope, sample_template(257)));
+        let defined_at = Instant::now() - Duration::from_secs(61);
+        cache.map.get_mut(&(1, scope, 256)).unwrap().defined_at = defined_at;
+        *cache.next_expiry.lock().unwrap() = Some(defined_at + cache.lifetime);
+
+        assert!(cache.insert(2, scope, sample_template(257)));
+        assert!(cache.get(1, scope, 256).is_none());
+        assert!(cache.get(2, scope, 257).is_some());
+        assert_eq!(cache.count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn redefining_template_refreshes_its_lifetime() {
+        let cache = TemplateCache::with_lifetime(1, Duration::from_secs(60));
+        let scope = Scope::V9Domain(1);
+        assert!(cache.insert(1, scope, sample_template(256)));
+        cache.map.get_mut(&(1, scope, 256)).unwrap().defined_at =
+            Instant::now() - Duration::from_secs(61);
+
+        assert!(cache.insert(1, scope, sample_template(256)));
+        assert!(cache.get(1, scope, 256).is_some());
+        assert_eq!(cache.count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -855,7 +974,9 @@ mod tests {
     fn aging_handle_runs_and_stops() {
         let counters = Arc::new(InternalCounters::default());
         let flows = Arc::new(FlowCache::new(10));
+        let templates = Arc::new(TemplateCache::with_lifetime(10, Duration::ZERO));
         flows.upsert(SINGLE_EXPORTER, TEST_SCOPE, &fields(6), &counters);
+        assert!(templates.insert(SINGLE_EXPORTER, TEST_SCOPE, sample_template(256)));
 
         let cfg = AgingConfig {
             idle_timeout: Duration::ZERO,
@@ -864,9 +985,15 @@ mod tests {
         };
         let emitted = Arc::new(AtomicUsize::new(0));
         let sink = emitted.clone();
-        let mut handle = AgingHandle::spawn(flows.clone(), counters.clone(), cfg, move |_r| {
-            sink.fetch_add(1, Ordering::Relaxed);
-        })
+        let mut handle = AgingHandle::spawn(
+            flows.clone(),
+            templates.clone(),
+            counters.clone(),
+            cfg,
+            move |_r| {
+                sink.fetch_add(1, Ordering::Relaxed);
+            },
+        )
         .expect("spawn aging thread");
 
         // Give the worker time to perform at least one sweep.
@@ -874,6 +1001,7 @@ mod tests {
         handle.stop();
 
         assert_eq!(flows.len(), 0, "idle flow should be evicted");
+        assert!(templates.map.is_empty(), "expired template should be swept");
         assert!(emitted.load(Ordering::Relaxed) >= 1);
     }
 }
