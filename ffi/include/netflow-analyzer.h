@@ -36,7 +36,7 @@
  * against [`netflow_analyzer_abi_version`] at runtime to detect a header/library
  * mismatch before using the API.
  */
-#define NETFLOW_ANALYZER_ABI_VERSION 2
+#define NETFLOW_ANALYZER_ABI_VERSION 3
 
 /**
  * Flow ID was present in the record.
@@ -94,7 +94,45 @@
 #define NETFLOW_ANALYZER_PRESENT_IP_VERSION (1 << 10)
 
 /**
- * Opaque handle handed back to C. Holds the engine plus the emission callback.
+ * Source IP address was present in the record.
+ */
+#define NETFLOW_ANALYZER_PRESENT_SRC_IP (1 << 11)
+
+/**
+ * Destination IP address was present in the record.
+ */
+#define NETFLOW_ANALYZER_PRESENT_DST_IP (1 << 12)
+
+/**
+ * IP protocol number was present in the record.
+ */
+#define NETFLOW_ANALYZER_PRESENT_PROTO (1 << 13)
+
+/**
+ * Transport source port was present in the record.
+ */
+#define NETFLOW_ANALYZER_PRESENT_SRC_PORT (1 << 14)
+
+/**
+ * Transport destination port was present in the record.
+ */
+#define NETFLOW_ANALYZER_PRESENT_DST_PORT (1 << 15)
+
+/**
+ * Flow start time was exported; when clear, `start_time_ns` is the packet
+ * export time.
+ */
+#define NETFLOW_ANALYZER_PRESENT_START_TIME (1 << 16)
+
+/**
+ * Flow end time was exported; when clear, `end_time_ns` is the packet export
+ * time.
+ */
+#define NETFLOW_ANALYZER_PRESENT_END_TIME (1 << 17)
+
+/**
+ * Opaque handle handed back to C. Holds the engine plus the emission callback
+ * (`None` for a decode-only context).
  */
 typedef struct NetflowAnalyzerContext NetflowAnalyzerContext;
 
@@ -243,7 +281,8 @@ typedef struct {
      */
     uint64_t flow_id;
     /**
-     * Caller-supplied exporter/transport-session key this flow belongs to.
+     * Caller-supplied exporter/transport-session key this flow belongs to
+     * (low 64 bits; see `exporter_key_hi`).
      */
     uint64_t exporter_key;
     /**
@@ -270,11 +309,17 @@ typedef struct {
      */
     uint32_t present;
     /**
+     * High 64 bits of the 128-bit exporter key; `0` for keys supplied through
+     * the 64-bit `_from` entry points. Added in ABI version 3 (took the first
+     * reserved slot).
+     */
+    uint64_t exporter_key_hi;
+    /**
      * Reserved for future fields. Always zero today; kept so new fields can be
      * added within this space without changing the struct size or ABI. Which
      * slots carry meaning is tied to the FFI `netflow_analyzer_abi_version`.
      */
-    uint64_t reserved[8];
+    uint64_t reserved[7];
 } NetflowAnalyzerFlowRecord;
 
 /**
@@ -286,12 +331,12 @@ typedef struct {
  * Callback contract (the decode-only [`NetflowAnalyzerRecordCallback`] has a
  * separate, per-call contract documented on that type):
  *
- * - Non-null: the callback pointer passed to `netflow_analyzer_create` must be
- *   a valid function pointer. A null callback is **rejected** —
- *   `netflow_analyzer_create` returns null rather than registering it — so it
- *   is never stored or called. `record` is always non-null and points to a
- *   valid record for the duration of the call. `user_data` is whatever was
- *   supplied at creation and may be null if the host chose so.
+ * - Null: passing a null callback to `netflow_analyzer_create` creates a
+ *   **decode-only** context (no flow cache use, no aging thread); see that
+ *   function. Otherwise the pointer must be a valid function pointer.
+ *   `record` is always non-null and points to a valid record for the duration
+ *   of the call. `user_data` is whatever was supplied at creation and may be
+ *   null if the host chose so.
  * - Thread: this callback may run on the engine's internal aging thread *or*
  *   on any host thread that calls `netflow_analyzer_flush` /
  *   `netflow_analyzer_purge_exporter`, so treat it as potentially concurrent
@@ -358,19 +403,23 @@ typedef struct {
      */
     uint64_t templates_received;
     /**
-     * Total number of flow data records processed.
+     * Total number of flow data records processed. On the decode-only path
+     * this is the number of records delivered to the record callback.
      */
     uint64_t data_records_processed;
     /**
-     * Flow records delivered to the configured output callback.
+     * Aggregated flows emitted by the flow cache to the flow callback. Flow
+     * cache only: always `0` on the decode-only path.
      */
     uint64_t flows_output;
     /**
-     * Decoded flow records rejected because the flow cache was full.
+     * Decoded flow records rejected because the flow cache was full. Flow
+     * cache only: always `0` on the decode-only path.
      */
     uint64_t flows_dropped;
     /**
-     * Number of flows currently resident in the state cache.
+     * Number of flows currently resident in the state cache. Flow cache
+     * only: always `0` on the decode-only path.
      */
     uint64_t active_flows;
     /**
@@ -395,8 +444,10 @@ typedef struct {
 
 /**
  * C-compatible callback invoked once per decoded data record on the decode-only
- * path (`netflow_analyzer_decode_packet[_at]`), before any aggregation. The
- * `observation_domain_id` scopes the record (NetFlow v5 reports `0`).
+ * path (`netflow_analyzer_decode_packet*`), before any aggregation. The
+ * `observation_domain_id` scopes the record (NetFlow v5 reports `0`); it is
+ * redundant with `record->observation_domain` and kept only for source
+ * compatibility until the next signature-breaking ABI change.
  *
  * Unlike [`NetflowAnalyzerFlowCallback`], this callback is **not** registered
  * on the context: it is passed to a single `netflow_analyzer_decode_packet*`
@@ -451,9 +502,13 @@ uint32_t netflow_analyzer_abi_version(void);
  * must remain valid until after `netflow_analyzer_destroy` returns, because
  * the aging thread can deliver flows at any time until then.
  *
- * Returns null on failure: a **null `callback`** is rejected (taking the
- * parameter as `Option` lets a null pointer from C arrive safely as `None`),
- * and so is a failure to spawn the background aging thread.
+ * A **null `callback`** creates a decode-only context: no aging thread is
+ * started, the `netflow_analyzer_process_packet*` entry points return `-1`,
+ * `netflow_analyzer_flush` is a no-op, and only the
+ * `netflow_analyzer_decode_packet*` entry points (plus stats and purge) are
+ * usable. The flow-cache settings in `config` are then ignored.
+ *
+ * Returns null on failure to spawn the background aging thread.
  *
  * # Safety
  * `config` must be either null or a valid pointer to a `NetflowAnalyzerConfig`.
@@ -623,6 +678,50 @@ void netflow_analyzer_flush(const NetflowAnalyzerContext *ctx);
  * `ctx` must be null or a valid context pointer.
  */
 int32_t netflow_analyzer_purge_exporter(const NetflowAnalyzerContext *ctx, uint64_t exporter_key);
+
+/**
+ * Like [`netflow_analyzer_purge_exporter`], for a 16-byte exporter key as
+ * accepted by the `_from_addr` entry points.
+ *
+ * # Safety
+ * `ctx` must be null or a valid context pointer; `exporter_key` must be null
+ * or point to 16 readable bytes.
+ */
+int32_t netflow_analyzer_purge_exporter_addr(const NetflowAnalyzerContext *ctx,
+                                             const uint8_t *exporter_key);
+
+/**
+ * Like [`netflow_analyzer_process_packet_from_at`], but takes a 16-byte
+ * big-endian exporter key, so a raw IPv6 (or IPv4-mapped) exporter address can
+ * be used without hashing. A 16-byte key whose first 8 bytes are zero is the
+ * same key as the equal 64-bit key. Emitted records carry it split across
+ * `exporter_key_hi` (first 8 bytes) and `exporter_key` (last 8 bytes).
+ *
+ * # Safety
+ * As [`netflow_analyzer_process_packet`]; `exporter_key` must point to 16
+ * readable bytes.
+ */
+int32_t netflow_analyzer_process_packet_from_addr_at(const NetflowAnalyzerContext *ctx,
+                                                     const uint8_t *exporter_key,
+                                                     const uint8_t *packet_bytes,
+                                                     uint32_t length,
+                                                     uint64_t receipt_time_ns);
+
+/**
+ * Like [`netflow_analyzer_decode_packet_from_at`], but takes a 16-byte
+ * big-endian exporter key; see [`netflow_analyzer_process_packet_from_addr_at`].
+ *
+ * # Safety
+ * As [`netflow_analyzer_decode_packet`]; `exporter_key` must point to 16
+ * readable bytes.
+ */
+int32_t netflow_analyzer_decode_packet_from_addr_at(const NetflowAnalyzerContext *ctx,
+                                                    const uint8_t *exporter_key,
+                                                    const uint8_t *packet_bytes,
+                                                    uint32_t length,
+                                                    uint64_t receipt_time_ns,
+                                                    NetflowAnalyzerRecordCallback callback,
+                                                    void *user_data);
 
 /**
  * Destructor exposed to C. Stops the aging thread and releases all memory.

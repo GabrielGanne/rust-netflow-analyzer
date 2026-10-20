@@ -296,7 +296,8 @@ fn flow_record_round_trips_to_ffi() {
     assert_eq!(record.fields, fields);
     assert_eq!(record.flow_id, Some(42));
     let ffi = record.to_ffi();
-    assert_eq!(ffi.exporter_key, SINGLE_EXPORTER);
+    assert_eq!(ffi.exporter_key, 0);
+    assert_eq!(ffi.exporter_key_hi, 0);
     assert_eq!(ffi.scope_protocol, crate::scope::SCOPE_PROTOCOL_IPFIX);
     assert_eq!(ffi.observation_domain, 9);
     assert_eq!(ffi.src_ip, [1u8; 16]);
@@ -370,7 +371,8 @@ fn from_record_decodes_l2_qos_and_icmp_metadata() {
         | presence::VLAN_TAG
         | presence::ICMP_TYPE
         | presence::ICMP_CODE
-        | presence::IP_VERSION;
+        | presence::IP_VERSION
+        | presence::SRC_IP;
     assert_eq!(fields.present, expected);
 }
 
@@ -406,8 +408,16 @@ fn absent_metadata_leaves_presence_bits_clear() {
     })
     .unwrap();
 
-    // Only the IP-version bit is set (from decoding the v4 addresses).
-    assert_eq!(fields.present, presence::IP_VERSION);
+    // Only the 5-tuple and IP-version bits are set; no metadata, no timestamps.
+    assert_eq!(
+        fields.present,
+        presence::IP_VERSION
+            | presence::SRC_IP
+            | presence::DST_IP
+            | presence::SRC_PORT
+            | presence::DST_PORT
+            | presence::PROTO
+    );
     assert_eq!(fields.tcp_flags, 0);
     assert_eq!(fields.present & presence::TCP_FLAGS, 0, "zero != present");
 }
@@ -430,7 +440,12 @@ fn v5_record_populates_structural_metadata() {
         | presence::IFACE_OUT
         | presence::TCP_FLAGS
         | presence::DSCP
-        | presence::IP_VERSION;
+        | presence::IP_VERSION
+        | presence::SRC_IP
+        | presence::DST_IP
+        | presence::PROTO
+        | presence::SRC_PORT
+        | presence::DST_PORT;
     assert_eq!(fields.present, expected);
 }
 

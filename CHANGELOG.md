@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expire templates 30 minutes after their last definition, reclaiming capacity through lookup, admission, and background aging.
 - Bound the UDP listener peer table, admit configured exporter IPs, retire idle peers, and rotate keys after detected restarts.
 - Keep UDP listener keys per endpoint and protocol scope so one domain's restart preserves the others.
+- Presence bits for the 5-tuple and flow timestamps (`NETFLOW_ANALYZER_PRESENT_SRC_IP` … `_END_TIME`), so an absent field is no longer indistinguishable from zero.
+- Decode-only C contexts: `netflow_analyzer_create` accepts a null flow callback and then starts no aging thread.
+- 128-bit exporter keys (`ExporterKey = u128`) with C entry points taking a 16-byte key (`*_from_addr_at`, `netflow_analyzer_purge_exporter_addr`) and `exporter_key_hi` on emitted records.
+- Scale NetFlow v5 counters by the header sampling interval.
+- `make install` with a `netflow-analyzer.pc` pkg-config file, and a `REUSE.toml` declaring copyright and license.
+
+### Changed
+- C ABI version bumped to 3 (`NetflowAnalyzerFlowRecord::exporter_key_hi` takes the first reserved slot).
+- Documented that `flows_output`, `flows_dropped` and `active_flows` are flow-cache counters, always `0` on the decode-only path.
 
 ## [0.1.0] - 2026-09-28
 

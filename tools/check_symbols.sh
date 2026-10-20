@@ -39,6 +39,9 @@ expected=(
     netflow_analyzer_decode_packet_at
     netflow_analyzer_decode_packet_from
     netflow_analyzer_decode_packet_from_at
+    netflow_analyzer_purge_exporter_addr
+    netflow_analyzer_process_packet_from_addr_at
+    netflow_analyzer_decode_packet_from_addr_at
 )
 
 # Public `netflow_analyzer_*` symbols this crate exports as global text (`T`),

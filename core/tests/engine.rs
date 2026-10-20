@@ -297,7 +297,7 @@ fn distinct_exporters_do_not_share_state() {
     let sink = emitted.clone();
     ctx.flush(move |record| sink.lock().unwrap().push(record.clone()));
 
-    let mut keys: Vec<u64> = emitted.lock().unwrap().iter().map(|r| r.exporter).collect();
+    let mut keys: Vec<u128> = emitted.lock().unwrap().iter().map(|r| r.exporter).collect();
     keys.sort_unstable();
     assert_eq!(
         keys,

@@ -93,7 +93,8 @@ static_assert(offsetof(NetflowAnalyzerFlowRecord, end_time_ns) == 120, "FlowReco
 static_assert(offsetof(NetflowAnalyzerFlowRecord, original_start_time_ns) == 128, "FlowRecord layout changed");
 static_assert(offsetof(NetflowAnalyzerFlowRecord, original_end_time_ns) == 136, "FlowRecord layout changed");
 static_assert(offsetof(NetflowAnalyzerFlowRecord, present) == 144, "FlowRecord layout changed");
-static_assert(offsetof(NetflowAnalyzerFlowRecord, reserved) == 152, "FlowRecord reserved tail moved");
+static_assert(offsetof(NetflowAnalyzerFlowRecord, exporter_key_hi) == 152, "FlowRecord layout changed");
+static_assert(offsetof(NetflowAnalyzerFlowRecord, reserved) == 160, "FlowRecord reserved tail moved");
 
 /*
  * A reference to every exported function. Taking each address forces the
@@ -120,4 +121,7 @@ const nfa_anyfn netflow_analyzer_abi_export_probe[] = {
     (nfa_anyfn)netflow_analyzer_decode_packet_at,
     (nfa_anyfn)netflow_analyzer_decode_packet_from,
     (nfa_anyfn)netflow_analyzer_decode_packet_from_at,
+    (nfa_anyfn)netflow_analyzer_purge_exporter_addr,
+    (nfa_anyfn)netflow_analyzer_process_packet_from_addr_at,
+    (nfa_anyfn)netflow_analyzer_decode_packet_from_addr_at,
 };

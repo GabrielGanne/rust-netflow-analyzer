@@ -165,6 +165,20 @@ pub mod presence {
     pub const VLAN_TAG: u32 = 1 << 9;
     /// IP version marker was present in the record.
     pub const IP_VERSION: u32 = 1 << 10;
+    /// Source IP address was present in the record.
+    pub const SRC_IP: u32 = 1 << 11;
+    /// Destination IP address was present in the record.
+    pub const DST_IP: u32 = 1 << 12;
+    /// IP protocol number was present in the record.
+    pub const PROTO: u32 = 1 << 13;
+    /// Transport source port was present in the record.
+    pub const SRC_PORT: u32 = 1 << 14;
+    /// Transport destination port was present in the record.
+    pub const DST_PORT: u32 = 1 << 15;
+    /// Flow start time was exported (otherwise it is the packet export time).
+    pub const START_TIME: u32 = 1 << 16;
+    /// Flow end time was exported (otherwise it is the packet export time).
+    pub const END_TIME: u32 = 1 << 17;
 }
 
 /// Normalized values decoded from a single exported data record.
@@ -290,8 +304,16 @@ impl FlowFields {
         let fallback = time_context
             .map(|ctx| ctx.original_export_time_ns)
             .unwrap_or(0);
-        fields.original_start_time_ns = timestamps.resolve_start(time_context).unwrap_or(fallback);
-        fields.original_end_time_ns = timestamps.resolve_end(time_context).unwrap_or(fallback);
+        let start = timestamps.resolve_start(time_context);
+        let end = timestamps.resolve_end(time_context);
+        if start.is_some() {
+            fields.present |= presence::START_TIME;
+        }
+        if end.is_some() {
+            fields.present |= presence::END_TIME;
+        }
+        fields.original_start_time_ns = start.unwrap_or(fallback);
+        fields.original_end_time_ns = end.unwrap_or(fallback);
         fields.start_time_ns = time_context
             .map(|ctx| ctx.adjust_to_effective_clock(fields.original_start_time_ns))
             .unwrap_or(fields.original_start_time_ns);
@@ -338,8 +360,14 @@ impl FlowFields {
             | presence::IFACE_OUT
             | presence::TCP_FLAGS
             | presence::DSCP
-            | presence::IP_VERSION;
+            | presence::IP_VERSION
+            | presence::SRC_IP
+            | presence::DST_IP
+            | presence::PROTO
+            | presence::SRC_PORT
+            | presence::DST_PORT;
         if let Some(ctx) = time_context {
+            fields.present |= presence::START_TIME | presence::END_TIME;
             fields.original_start_time_ns = uptime_timestamp_ns(ctx, first_ms);
             fields.original_end_time_ns = uptime_timestamp_ns(ctx, last_ms);
             fields.start_time_ns = ctx.adjust_to_effective_clock(fields.original_start_time_ns);
@@ -353,22 +381,35 @@ impl FlowFields {
             IE_SOURCE_IPV4_ADDRESS => {
                 copy_ipv4(&mut self.src_ip, raw);
                 self.set_ip_version(4);
+                self.present |= presence::SRC_IP;
             }
             IE_DESTINATION_IPV4_ADDRESS => {
                 copy_ipv4(&mut self.dst_ip, raw);
                 self.set_ip_version(4);
+                self.present |= presence::DST_IP;
             }
             IE_SOURCE_IPV6_ADDRESS => {
                 copy_ipv6(&mut self.src_ip, raw);
                 self.set_ip_version(6);
+                self.present |= presence::SRC_IP;
             }
             IE_DESTINATION_IPV6_ADDRESS => {
                 copy_ipv6(&mut self.dst_ip, raw);
                 self.set_ip_version(6);
+                self.present |= presence::DST_IP;
             }
-            IE_SOURCE_TRANSPORT_PORT => self.src_port = read_be_u16(raw),
-            IE_DESTINATION_TRANSPORT_PORT => self.dst_port = read_be_u16(raw),
-            IE_PROTOCOL_IDENTIFIER => self.proto = raw.first().copied().unwrap_or(0),
+            IE_SOURCE_TRANSPORT_PORT => {
+                self.src_port = read_be_u16(raw);
+                self.present |= presence::SRC_PORT;
+            }
+            IE_DESTINATION_TRANSPORT_PORT => {
+                self.dst_port = read_be_u16(raw);
+                self.present |= presence::DST_PORT;
+            }
+            IE_PROTOCOL_IDENTIFIER => {
+                self.proto = raw.first().copied().unwrap_or(0);
+                self.present |= presence::PROTO;
+            }
             IE_OCTET_DELTA_COUNT | IE_OCTET_TOTAL_COUNT => self.bytes = read_be_uint(raw),
             IE_PACKET_DELTA_COUNT | IE_PACKET_TOTAL_COUNT => self.packets = read_be_uint(raw),
             IE_FLOW_ID => {
@@ -482,6 +523,23 @@ impl FlowFields {
         if missing & presence::IP_VERSION != 0 {
             self.ip_version = other.ip_version;
         }
+        // Only reachable for `flowId`-keyed flows, whose records need not all
+        // carry the 5-tuple.
+        if missing & presence::SRC_IP != 0 {
+            self.src_ip = other.src_ip;
+        }
+        if missing & presence::DST_IP != 0 {
+            self.dst_ip = other.dst_ip;
+        }
+        if missing & presence::PROTO != 0 {
+            self.proto = other.proto;
+        }
+        if missing & presence::SRC_PORT != 0 {
+            self.src_port = other.src_port;
+        }
+        if missing & presence::DST_PORT != 0 {
+            self.dst_port = other.dst_port;
+        }
         self.present |= other.present;
     }
 }
@@ -587,7 +645,8 @@ pub struct NetflowAnalyzerFlowRecord {
     pub iface_out: u64,
     /// Exporter-assigned flow identity; `0` when absent (see `present`).
     pub flow_id: u64,
-    /// Caller-supplied exporter/transport-session key this flow belongs to.
+    /// Caller-supplied exporter/transport-session key this flow belongs to
+    /// (low 64 bits; see `exporter_key_hi`).
     pub exporter_key: u64,
     /// Effective flow start time as Unix epoch nanoseconds.
     pub start_time_ns: u64,
@@ -602,10 +661,14 @@ pub struct NetflowAnalyzerFlowRecord {
     /// should be rendered as empty rather than a real zero. See the `presence`
     /// constants for the individual bit positions.
     pub present: u32,
+    /// High 64 bits of the 128-bit exporter key; `0` for keys supplied through
+    /// the 64-bit `_from` entry points. Added in ABI version 3 (took the first
+    /// reserved slot).
+    pub exporter_key_hi: u64,
     /// Reserved for future fields. Always zero today; kept so new fields can be
     /// added within this space without changing the struct size or ABI. Which
     /// slots carry meaning is tied to the FFI `netflow_analyzer_abi_version`.
-    pub reserved: [u64; 8],
+    pub reserved: [u64; 7],
 }
 
 impl FlowFields {
@@ -636,13 +699,14 @@ impl FlowFields {
             iface_in: self.iface_in,
             iface_out: self.iface_out,
             flow_id: self.flow_id.unwrap_or(0),
-            exporter_key: exporter,
+            exporter_key: exporter as u64,
             start_time_ns: self.start_time_ns,
             end_time_ns: self.end_time_ns,
             original_start_time_ns: self.original_start_time_ns,
             original_end_time_ns: self.original_end_time_ns,
             present: self.present,
-            reserved: [0; 8],
+            exporter_key_hi: (exporter >> 64) as u64,
+            reserved: [0; 7],
         }
     }
 }

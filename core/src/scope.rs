@@ -16,7 +16,11 @@
 /// [`crate::FlowContext`] can serve many exporters by giving each a distinct
 /// key. See `docs/exporter-identity.md` for the caller contract (uniqueness and
 /// non-reuse rules).
-pub type ExporterKey = u64;
+///
+/// It is 128 bits wide so a caller can use a raw IPv6 (or IPv4-mapped)
+/// exporter address directly, without hashing it down and risking collisions.
+/// A 64-bit key `k` is the same key as the 128-bit value `k` (upper half zero).
+pub type ExporterKey = u128;
 
 /// Reserved key used by the single-exporter convenience entry points
 /// (`process_packet` / `decode_packet`). Callers handling more than one exporter

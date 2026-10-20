@@ -56,3 +56,32 @@ fn v5_count_is_bounded_by_buffer() {
     assert_eq!(processed, 1);
     assert_eq!(ctx.active_flows(), 1);
 }
+
+#[test]
+fn v5_header_sampling_interval_scales_counters() {
+    // Header sampling_interval (bytes 22..24): mode bits 01, interval 100.
+    let ctx = FlowContext::new();
+    let mut packet = sample_v5_packet(&[([1, 1, 1, 1], [2, 2, 2, 2], 3, 300, 1, 2, 6)]);
+    packet[22..24].copy_from_slice(&(0x4000u16 | 100).to_be_bytes());
+
+    let mut seen = Vec::new();
+    ctx.decode_packet(&packet, &mut |_, fields| {
+        seen.push((fields.packets, fields.bytes))
+    })
+    .expect("parse ok");
+    assert_eq!(seen, vec![(300, 30_000)]);
+}
+
+#[test]
+fn v5_header_sampling_interval_of_one_is_unsampled() {
+    let ctx = FlowContext::new();
+    let mut packet = sample_v5_packet(&[([1, 1, 1, 1], [2, 2, 2, 2], 3, 300, 1, 2, 6)]);
+    packet[22..24].copy_from_slice(&1u16.to_be_bytes());
+
+    let mut seen = Vec::new();
+    ctx.decode_packet(&packet, &mut |_, fields| {
+        seen.push((fields.packets, fields.bytes))
+    })
+    .expect("parse ok");
+    assert_eq!(seen, vec![(3, 300)]);
+}

@@ -1549,7 +1549,7 @@ mod tests {
                 peers
                     .packet_key(peer, header, now, &ctx, print_flow)
                     .unwrap(),
-                Admission::Accept(domain as u64)
+                Admission::Accept(domain as ExporterKey)
             );
             peers.record(peer, header, now);
         }
@@ -2003,7 +2003,7 @@ mod tests {
                 peers
                     .packet_key(peer, header, now, &ctx, print_flow)
                     .unwrap(),
-                Admission::Accept(domain as u64 + 1)
+                Admission::Accept(domain as ExporterKey + 1)
             );
             peers.record(peer, header, now);
         }

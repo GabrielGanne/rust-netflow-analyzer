@@ -76,11 +76,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cache::{AgingHandle, FlowCache, TemplateCache, DEFAULT_MAX_FLOWS, DEFAULT_MAX_TEMPLATES};
 use clock::{ClockDecision, ClockTracker};
 use parser::{
-    ParsedHeader, FIRST_DATA_SET_ID, FLOWSET_ID_V9_OPTIONS, FLOWSET_ID_V9_TEMPLATE,
-    IPFIX_HEADER_LEN, SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE, V5_RECORD_LEN,
+    NetflowV5Header, ParsedHeader, FIRST_DATA_SET_ID, FLOWSET_ID_V9_OPTIONS,
+    FLOWSET_ID_V9_TEMPLATE, IPFIX_HEADER_LEN, SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE,
+    V5_RECORD_LEN,
 };
 use records::RecordTimeContext;
-use sampling::SamplingTracker;
+use sampling::{SamplingRatio, SamplingTracker};
 use stats::InternalCounters;
 
 /// Errors that can occur when processing or decoding a NetFlow/IPFIX packet.
@@ -139,6 +140,20 @@ fn ipfix_sets_tile_exactly(mut body: &[u8]) -> bool {
         body = &body[set_len..];
     }
     true
+}
+
+/// Sampling ratio advertised by a NetFlow v5 header `sampling_interval`: the
+/// top 2 bits are the sampling mode and the low 14 bits the "1 in N" interval.
+/// The interval is honoured whatever the mode, since exporters commonly leave
+/// the mode bits clear; `0` and `1` both mean unsampled.
+fn v5_sampling_ratio(sampling_interval: u16) -> SamplingRatio {
+    match u64::from(sampling_interval & 0x3FFF) {
+        0 | 1 => SamplingRatio::NONE,
+        interval => SamplingRatio {
+            numerator: interval,
+            denominator: 1,
+        },
+    }
 }
 
 /// Current wall-clock time as Unix nanoseconds, saturating at `u64::MAX`.
@@ -438,14 +453,7 @@ impl FlowContext {
         // NetFlow v5 is template-less: the payload is simply `count` fixed-size
         // records, so it takes a dedicated decode path instead of a set walk.
         if let ParsedHeader::V5(ref h) = header {
-            return Ok(self.process_v5_records(
-                exporter,
-                scope,
-                payload,
-                h.count as usize,
-                time_context,
-                sink,
-            ));
+            return Ok(self.process_v5_records(exporter, scope, payload, h, time_context, sink));
         }
 
         let mut data_records = 0usize;
@@ -565,16 +573,19 @@ impl FlowContext {
         }
     }
 
-    /// Decodes up to `count` fixed-format NetFlow v5 records from the payload.
+    /// Decodes up to the header's `count` fixed-format NetFlow v5 records from
+    /// the payload, scaling counters by the header's sampling interval.
     fn process_v5_records(
         &self,
         exporter: ExporterKey,
         scope: Scope,
         payload: &[u8],
-        count: usize,
+        header: &NetflowV5Header,
         time_context: RecordTimeContext,
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
     ) -> usize {
+        let count = header.count as usize;
+        let ratio = v5_sampling_ratio(header.sampling_interval);
         let mut decoded = 0usize;
         // Trust the header count but never read past the buffer.
         let available = payload.len() / V5_RECORD_LEN;
@@ -582,7 +593,9 @@ impl FlowContext {
             .into_iter()
             .take(count.min(available))
         {
-            if let Some(fields) = FlowFields::from_v5_record_at(record, Some(time_context)) {
+            if let Some(mut fields) = FlowFields::from_v5_record_at(record, Some(time_context)) {
+                fields.bytes = ratio.expand(fields.bytes);
+                fields.packets = ratio.expand(fields.packets);
                 sink(exporter, scope, &fields);
                 decoded += 1;
             }

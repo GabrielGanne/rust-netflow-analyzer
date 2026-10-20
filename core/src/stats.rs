@@ -58,13 +58,17 @@ pub struct NetflowAnalyzerStats {
     pub clock_fallback_packets: u64,
     /// Total number of template records received.
     pub templates_received: u64,
-    /// Total number of flow data records processed.
+    /// Total number of flow data records processed. On the decode-only path
+    /// this is the number of records delivered to the record callback.
     pub data_records_processed: u64,
-    /// Flow records delivered to the configured output callback.
+    /// Aggregated flows emitted by the flow cache to the flow callback. Flow
+    /// cache only: always `0` on the decode-only path.
     pub flows_output: u64,
-    /// Decoded flow records rejected because the flow cache was full.
+    /// Decoded flow records rejected because the flow cache was full. Flow
+    /// cache only: always `0` on the decode-only path.
     pub flows_dropped: u64,
-    /// Number of flows currently resident in the state cache.
+    /// Number of flows currently resident in the state cache. Flow cache
+    /// only: always `0` on the decode-only path.
     pub active_flows: u64,
     /// Options templates decoded and stored (NetFlow v9 set id 1, IPFIX set id
     /// 3). These describe options data records, not flows.
