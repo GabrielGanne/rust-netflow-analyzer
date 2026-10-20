@@ -30,7 +30,9 @@ const IE_VLAN_ID: u16 = 58;
 const IE_DESTINATION_MAC_ADDRESS: u16 = 80;
 const IE_OCTET_TOTAL_COUNT: u16 = 85;
 const IE_PACKET_TOTAL_COUNT: u16 = 86;
-const IE_POST_IP_CLASS_OF_SERVICE: u16 = 98;
+const IE_POST_IP_CLASS_OF_SERVICE: u16 = 55;
+const IE_POST_IP_DIFF_SERV_CODE_POINT: u16 = 98;
+const IE_IP_DIFF_SERV_CODE_POINT: u16 = 195;
 const IE_ICMP_TYPE_CODE_IPV6: u16 = 139;
 const IE_FLOW_ID: u16 = 148;
 const IE_ICMP_TYPE_IPV4: u16 = 176;
@@ -47,6 +49,8 @@ const IE_FLOW_START_MICROSECONDS: u16 = 154;
 const IE_FLOW_END_MICROSECONDS: u16 = 155;
 const IE_FLOW_START_NANOSECONDS: u16 = 156;
 const IE_FLOW_END_NANOSECONDS: u16 = 157;
+const IE_FLOW_START_DELTA_MICROSECONDS: u16 = 158;
+const IE_FLOW_END_DELTA_MICROSECONDS: u16 = 159;
 
 // --- Sampling information elements carried by options data records ---
 // Interpreted from options records rather than flow records (see
@@ -438,15 +442,25 @@ impl FlowFields {
                 self.vlan_tag = read_be_u16(raw);
                 self.present |= presence::VLAN_TAG;
             }
-            // The full ToS byte carries the DSCP in its high 6 bits. It takes
-            // precedence over the post-middlebox variant regardless of field
-            // order (the post value only fills in if none was seen yet).
+            // The full ToS byte carries the DSCP in its high 6 bits; the
+            // DiffServ elements carry the 6-bit code point directly. The
+            // observed (pre-middlebox) values take precedence over the post
+            // variants regardless of field order (a post value only fills in
+            // if no DSCP was seen yet).
             IE_IP_CLASS_OF_SERVICE => {
                 self.dscp = raw.first().copied().unwrap_or(0) >> 2;
                 self.present |= presence::DSCP;
             }
+            IE_IP_DIFF_SERV_CODE_POINT => {
+                self.dscp = raw.first().copied().unwrap_or(0) & 0x3F;
+                self.present |= presence::DSCP;
+            }
             IE_POST_IP_CLASS_OF_SERVICE if self.present & presence::DSCP == 0 => {
                 self.dscp = raw.first().copied().unwrap_or(0) >> 2;
+                self.present |= presence::DSCP;
+            }
+            IE_POST_IP_DIFF_SERV_CODE_POINT if self.present & presence::DSCP == 0 => {
+                self.dscp = raw.first().copied().unwrap_or(0) & 0x3F;
                 self.present |= presence::DSCP;
             }
             // Combined type/code elements pack the type in the high byte.
@@ -728,6 +742,8 @@ struct DecodedTimestamps {
     end_uptime_ms: Option<u32>,
     start_ntp: Option<u64>,
     end_ntp: Option<u64>,
+    start_delta_us: Option<u64>,
+    end_delta_us: Option<u64>,
 }
 
 impl DecodedTimestamps {
@@ -746,6 +762,8 @@ impl DecodedTimestamps {
             IE_FLOW_END_MICROSECONDS => self.end_ntp = Some(value),
             IE_FLOW_START_NANOSECONDS => self.start_ntp = Some(value),
             IE_FLOW_END_NANOSECONDS => self.end_ntp = Some(value),
+            IE_FLOW_START_DELTA_MICROSECONDS => self.start_delta_us = Some(value),
+            IE_FLOW_END_DELTA_MICROSECONDS => self.end_delta_us = Some(value),
             _ => return false,
         }
         true
@@ -776,6 +794,7 @@ impl DecodedTimestamps {
                     .zip(context)
                     .map(|(v, ctx)| uptime_timestamp_ns(ctx, v))
             })
+            .or_else(|| delta_timestamp_ns(context?, self.start_delta_us?))
     }
 
     fn resolve_end(&self, context: Option<RecordTimeContext>) -> Option<u64> {
@@ -787,7 +806,18 @@ impl DecodedTimestamps {
                     .zip(context)
                     .map(|(v, ctx)| uptime_timestamp_ns(ctx, v))
             })
+            .or_else(|| delta_timestamp_ns(context?, self.end_delta_us?))
     }
+}
+
+/// `flowStart/EndDeltaMicroseconds` (IE 158/159, RFC 5102) count microseconds
+/// *before* the message export time.
+fn delta_timestamp_ns(context: RecordTimeContext, delta_us: u64) -> Option<u64> {
+    Some(
+        context
+            .original_export_time_ns
+            .saturating_sub(delta_us.saturating_mul(1_000)),
+    )
 }
 
 fn uptime_timestamp_ns(context: RecordTimeContext, switched_ms: u32) -> u64 {

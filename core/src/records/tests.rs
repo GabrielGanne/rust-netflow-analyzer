@@ -393,6 +393,51 @@ fn ip_class_of_service_takes_precedence_over_post_variant() {
 }
 
 #[test]
+fn diffserv_code_points_are_decoded_unshifted() {
+    // ipDiffServCodePoint (195) carries the 6-bit DSCP directly and wins over
+    // postIpDiffServCodePoint (98) regardless of field order.
+    let tmpl = TemplateRecord::from_fields(
+        702,
+        vec![
+            field(IE_POST_IP_DIFF_SERV_CODE_POINT, 1),
+            field(IE_IP_DIFF_SERV_CODE_POINT, 1),
+        ],
+    );
+    let fields = FlowFields::from_record(&tmpl, &[46, 20]).unwrap();
+    assert_eq!(fields.dscp, 20);
+
+    // Alone, the post code point is taken as-is (not shifted like a ToS byte).
+    let tmpl = TemplateRecord::from_fields(703, vec![field(IE_POST_IP_DIFF_SERV_CODE_POINT, 1)]);
+    let fields = FlowFields::from_record(&tmpl, &[46]).unwrap();
+    assert_eq!(fields.dscp, 46);
+    assert_eq!(fields.present & presence::DSCP, presence::DSCP);
+}
+
+#[test]
+fn resolves_delta_microsecond_timestamps_before_export_time() {
+    let tmpl = TemplateRecord::from_fields(
+        704,
+        vec![
+            field(IE_FLOW_START_DELTA_MICROSECONDS, 4),
+            field(IE_FLOW_END_DELTA_MICROSECONDS, 4),
+        ],
+    );
+    let mut rec = Vec::new();
+    rec.extend_from_slice(&2_000_u32.to_be_bytes());
+    rec.extend_from_slice(&1_000_u32.to_be_bytes());
+    let ctx = RecordTimeContext {
+        original_export_time_ns: 1_700_000_000_000_000_000,
+        effective_export_time_ns: 1_700_000_000_000_000_000,
+        system_uptime_ms: None,
+    };
+    let (fields, _) = FlowFields::from_record_sized_at(&tmpl, &rec, Some(ctx)).unwrap();
+    assert_eq!(fields.start_time_ns, 1_699_999_999_998_000_000);
+    assert_eq!(fields.end_time_ns, 1_699_999_999_999_000_000);
+    let both = presence::START_TIME | presence::END_TIME;
+    assert_eq!(fields.present & both, both);
+}
+
+#[test]
 fn absent_metadata_leaves_presence_bits_clear() {
     // The plain 5-tuple template exports none of the optional metadata.
     let fields = FlowFields::from_record(&tuple_template(), &{

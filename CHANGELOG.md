@@ -15,7 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Decode-only C contexts: `netflow_analyzer_create` accepts a null flow callback and then starts no aging thread.
 - 128-bit exporter keys (`ExporterKey = u128`) with C entry points taking a 16-byte key (`*_from_addr_at`, `netflow_analyzer_purge_exporter_addr`) and `exporter_key_hi` on emitted records.
 - Scale NetFlow v5 counters by the header sampling interval.
+- Decode `ipDiffServCodePoint` (IE 195) and `flowStart/EndDeltaMicroseconds` (IE 158/159).
 - `make install` with a `netflow-analyzer.pc` pkg-config file, and a `REUSE.toml` declaring copyright and license.
+
+### Fixed
+- IE 98 is `postIpDiffServCodePoint` (a 6-bit code point), not `postIpClassOfService` (IE 55, a ToS byte); it was wrongly shifted right by 2.
 
 ### Changed
 - C ABI version bumped to 3 (`NetflowAnalyzerFlowRecord::exporter_key_hi` takes the first reserved slot).
