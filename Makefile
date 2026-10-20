@@ -3,7 +3,7 @@
 CARGO  ?= cargo
 HEADER := ffi/include/netflow-analyzer.h
 
-.PHONY: all build release test check header c-example bench clean deny
+.PHONY: all build release test check header c-example bench clean deny install uninstall
 
 all: build
 
@@ -39,6 +39,29 @@ c-example: release
 
 bench:
 	./tools/bench.sh
+
+# Install the C header, the static and shared libraries, and a pkg-config file
+# (netflow-analyzer.pc) so C projects can consume the library as an external
+# dependency. Honors PREFIX, LIBDIR, INCLUDEDIR and DESTDIR.
+PREFIX     ?= /usr/local
+LIBDIR     ?= $(PREFIX)/lib
+INCLUDEDIR ?= $(PREFIX)/include
+VERSION    := $(shell sed -n 's/^version = "\(.*\)"/\1/p' ffi/Cargo.toml)
+
+install: release
+	install -d $(DESTDIR)$(INCLUDEDIR) $(DESTDIR)$(LIBDIR)/pkgconfig
+	install -m 644 $(HEADER) $(DESTDIR)$(INCLUDEDIR)/
+	install -m 644 target/release/libnetflow_analyzer_ffi.a $(DESTDIR)$(LIBDIR)/
+	install -m 755 target/release/libnetflow_analyzer_ffi.so $(DESTDIR)$(LIBDIR)/
+	sed -e 's|@PREFIX@|$(PREFIX)|' -e 's|@LIBDIR@|$(LIBDIR)|' \
+	    -e 's|@INCLUDEDIR@|$(INCLUDEDIR)|' -e 's|@VERSION@|$(VERSION)|' \
+	    ffi/netflow-analyzer.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/netflow-analyzer.pc
+
+uninstall:
+	rm -f $(DESTDIR)$(INCLUDEDIR)/netflow-analyzer.h \
+	    $(DESTDIR)$(LIBDIR)/libnetflow_analyzer_ffi.a \
+	    $(DESTDIR)$(LIBDIR)/libnetflow_analyzer_ffi.so \
+	    $(DESTDIR)$(LIBDIR)/pkgconfig/netflow-analyzer.pc
 
 # Run the reference UDP listener (Ctrl-C to stop). ADDR overrides the bind addr.
 ADDR ?= 0.0.0.0:2055

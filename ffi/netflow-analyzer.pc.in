@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: netflow-analyzer
+Description: C ABI for the netflow_analyzer NetFlow v5/v9/IPFIX decoding and aggregation engine
+Version: @VERSION@
+Libs: -L${libdir} -lnetflow_analyzer_ffi
+Libs.private: -lpthread -ldl -lm
+Cflags: -I${includedir}

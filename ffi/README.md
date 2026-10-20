@@ -18,6 +18,14 @@ make release      # build the staticlib/cdylib
 make c-example    # compile and run examples/c_integration against it
 ```
 
+Install the header, libraries and `netflow-analyzer.pc` for use as an external
+dependency (`PREFIX`, `LIBDIR`, `INCLUDEDIR` and `DESTDIR` are honored):
+
+```sh
+make install PREFIX=/usr/local
+pkg-config --cflags --libs netflow-analyzer
+```
+
 ## Supported platforms and ABI stability
 
 **Tier 1 (built, tested, and guaranteed):** Linux on `x86_64` and `aarch64`
