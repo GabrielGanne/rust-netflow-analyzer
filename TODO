@@ -10,7 +10,7 @@
   processing/flushing, repeated aging start/stop, and bounded cache behavior.
   Replace timing sleeps with an injectable or controllable clock where tests
   require deterministic time.
-- [ ] Expand the runnable C example to cover decode-only callbacks, callback
+- [x] Expand the runnable C example to cover decode-only callbacks, callback
   field values, null/empty inputs, and explicit timestamps.
 - [ ] Keep benchmark workloads representative and runnable locally; cover packet
   size, records per packet, template warmness, cache hit/miss behavior, and

@@ -48,7 +48,10 @@ Additional Criterion arguments can be passed after the command, for example
 - FFI unit tests cover lifecycle, error mapping, configuration, callbacks, and
   decode-only callbacks, including pinned public structure layouts.
 - `core/examples/udp_listener.rs` is a runnable Rust example.
-- `examples/c_integration/main.c` is a runnable C ABI smoke test; its companion
+- `examples/c_integration/main.c` is a runnable, self-checking C ABI test: it
+  asserts every field of the emitted flow on the fused, manual-aging replay
+  (`*_at` + `netflow_analyzer_age_at`), and decode-only paths, and the error
+  codes for null and empty inputs. Its companion
   checks compile the header as C11 and C++11, pin every public structure field
   offset, link-probe each API function, and verify the exported symbol set.
 - `core/benches/process_packet.rs` provides v5, v9, IPFIX, warm-cache, and
