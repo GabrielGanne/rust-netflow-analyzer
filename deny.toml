@@ -17,6 +17,7 @@ allow = [
     "BSD-2-Clause",
     "MIT",
     "MPL-2.0",
+    "NCSA",
     "Unicode-3.0",
     "Unlicense",
 ]
@@ -27,6 +28,7 @@ ignore = false
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
