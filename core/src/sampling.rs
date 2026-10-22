@@ -103,14 +103,13 @@ impl SamplingRatio {
 ///
 /// A specific sampler (`FlowSampler`/`Selector`) is precisely attributable, so a
 /// re-advertisement is a legitimate reconfiguration and simply replaces the
-/// value. The [`SamplerSelector::Domain`] bucket is different: exporters that
-/// scope sampling by a finer key we cannot match to a flow (per interface, line
-/// card, …) with no `flowSamplerId`/`selectorId` all land here. If such records
-/// advertise *different* rates the domain is genuinely multi-sampler and an
-/// untagged flow cannot be attributed to any one of them, so the entry becomes
-/// [`SamplerRate::Ambiguous`] and stops scaling (a factor of 1) rather than
-/// applying an arbitrary wrong rate. See `docs/exporter-identity.md`; matching
-/// such flows per interface/line card is not supported in this release.
+/// value. The [`SamplerSelector::Domain`] bucket is different: rates scoped by
+/// a finer key we cannot match to a flow (per interface, line card, …) are
+/// rejected before reaching it, but several domain-wide records can still
+/// advertise *different* rates. The domain is then genuinely multi-sampler and
+/// an untagged flow cannot be attributed to any one of them, so the entry
+/// becomes [`SamplerRate::Ambiguous`] and stops scaling (a factor of 1) rather
+/// than applying an arbitrary wrong rate. See `docs/exporter-identity.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SamplerRate {
     Fixed(SamplingRatio),

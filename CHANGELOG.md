@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - IE 98 is `postIpDiffServCodePoint` (a 6-bit code point), not `postIpClassOfService` (IE 55, a ToS byte); it was wrongly shifted right by 2.
+- Ignore sampling rates scoped finer than the observation domain (per interface, line card, …) that carry no `flowSamplerId`/`selectorId`, instead of applying them domain-wide.
 
 ### Changed
 - C ABI version bumped to 3 (`NetflowAnalyzerFlowRecord::exporter_key_hi` takes the first reserved slot).

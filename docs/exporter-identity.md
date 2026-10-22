@@ -54,9 +54,13 @@ This matches the common cases — one global sampler per domain, or per-sampler
 rates tagged with `flowSamplerId`/`selectorId` — precisely. Two paths are
 **out of scope for the first release**:
 
-- Samplers scoped only by a key a flow cannot carry (per interface or line card
-  with no `flowSamplerId`/`selectorId`). Such options records all fall into the
-  `Domain` bucket; if they advertise **conflicting** rates the bucket is marked
+- Samplers scoped only by a key a flow cannot carry (per interface, line card,
+  cache, or template — any option scope other than NetFlow v9 `System` or the
+  IPFIX `observationDomainId`, `meteringProcessId`, `exportingProcessId`, or
+  `exporterIPv4/IPv6Address` — with no `flowSamplerId`/`selectorId`). Such
+  rates are **rejected**: they are never stored, so they neither scale untagged
+  flows domain-wide nor poison the `Domain` bucket. If several domain-wide
+  options records advertise **conflicting** rates, the bucket is marked
   ambiguous and untagged flows in that domain are left **unscaled** (factor 1)
   rather than mis-scaled. A genuine reconfiguration of a single domain-wide
   sampler to a new rate is indistinguishable from this case and likewise stops

@@ -695,6 +695,60 @@ fn selector_id_takes_precedence_over_flow_sampler_id() {
 }
 
 #[test]
+fn unmatched_scoped_rate_is_rejected() {
+    // An interface-scoped rate (IPFIX ingressInterface, IE 10; NetFlow v9
+    // scope type 2) without a selector cannot be matched to a flow, so it must
+    // not be treated as the domain-wide rate.
+    for scope_type in [10u16, 2] {
+        let template = TemplateRecord::from_options_fields(
+            260,
+            1,
+            vec![field(scope_type, 4), field(IE_SAMPLING_INTERVAL, 4)],
+        );
+        let mut record = 3u32.to_be_bytes().to_vec();
+        record.extend_from_slice(&1000u32.to_be_bytes());
+        assert_eq!(sampling_from_options_record(&template, &record), None);
+    }
+}
+
+#[test]
+fn domain_level_scopes_yield_the_domain_sampler() {
+    // NetFlow v9 System scope (type 1) and IPFIX process/exporter scopes are
+    // domain-wide.
+    for scope_type in [1u16, 130, 143, 144, 149] {
+        let template = TemplateRecord::from_options_fields(
+            260,
+            1,
+            vec![field(scope_type, 4), field(IE_SAMPLING_INTERVAL, 4)],
+        );
+        let mut record = 3u32.to_be_bytes().to_vec();
+        record.extend_from_slice(&1000u32.to_be_bytes());
+        let observation = sampling_from_options_record(&template, &record).unwrap();
+        assert_eq!(observation.selector, SamplerSelector::Domain);
+    }
+}
+
+#[test]
+fn selector_makes_a_finer_scope_attributable() {
+    // An interface-scoped record that also carries a flowSamplerId is matched
+    // by that sampler, so it is kept.
+    let template = TemplateRecord::from_options_fields(
+        260,
+        1,
+        vec![
+            field(10, 4),
+            field(IE_FLOW_SAMPLER_ID, 1),
+            field(IE_SAMPLING_INTERVAL, 4),
+        ],
+    );
+    let mut record = 3u32.to_be_bytes().to_vec();
+    record.push(5);
+    record.extend_from_slice(&1000u32.to_be_bytes());
+    let observation = sampling_from_options_record(&template, &record).unwrap();
+    assert_eq!(observation.selector, SamplerSelector::FlowSampler(5));
+}
+
+#[test]
 fn flow_record_decodes_its_sampler_selector() {
     // A flow record's flowSamplerId (IE 48) is captured so it can be matched to
     // its sampler; selectorId (IE 302) wins when both are present.

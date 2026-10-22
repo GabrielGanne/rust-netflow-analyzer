@@ -72,6 +72,23 @@ const IE_SAMPLING_PACKET_INTERVAL: u16 = 305;
 const IE_SAMPLING_PACKET_SPACE: u16 = 306;
 const IE_SELECTOR_ID: u16 = 302;
 
+// Option scopes that cover a whole observation domain, plus the sampler
+// selectors a flow can carry. Any other scope (interface, line card, cache,
+// template, enterprise-specific, …) is finer than a flow can be matched to.
+// NetFlow v9 scope type 1 is `System`; the rest are IPFIX IEs:
+// exporterIPv4Address (130), exporterIPv6Address (131), meteringProcessId
+// (143), exportingProcessId (144), and observationDomainId (149).
+const DOMAIN_OR_SELECTOR_SCOPES: [u16; 8] = [
+    1,
+    130,
+    131,
+    143,
+    144,
+    149,
+    IE_FLOW_SAMPLER_ID,
+    IE_SELECTOR_ID,
+];
+
 const NS_PER_SECOND: u64 = 1_000_000_000;
 const NS_PER_MILLISECOND: u64 = 1_000_000;
 const NTP_UNIX_EPOCH_OFFSET: u64 = 2_208_988_800;
@@ -935,7 +952,10 @@ pub struct SamplingObservation {
 /// 305/306 pair when more than one is present. Sampling and selector elements
 /// are read only from the IANA registry (enterprise-specific elements merely
 /// reuse the numeric ids), and a record shorter than its template requires
-/// yields `None`.
+/// yields `None`. A rate scoped finer than the observation domain (per
+/// interface, line card, …) that carries no `selectorId`/`flowSamplerId`
+/// cannot be matched to a flow and also yields `None`, rather than being
+/// applied domain-wide.
 pub fn sampling_from_options_record(
     template: &TemplateRecord,
     record: &[u8],
@@ -946,20 +966,26 @@ pub fn sampling_from_options_record(
     let mut random_interval: Option<u64> = None;
     let mut packet_interval: Option<u64> = None;
     let mut packet_space: Option<u64> = None;
+    let mut finer_scope = false;
     let mut index = 0usize;
 
     walk_record_fields(template, record, |type_id, enterprise_number, raw| {
         let field_index = index;
         index += 1;
-        if enterprise_number.is_some() {
-            return;
-        }
         // A selector identifies which sampler the record configures whether it
         // sits in the scope or the option fields. The *rate* elements are only
         // meaningful as option fields — as a scope field their value identifies
         // what the options apply to, not an advertised rate — so they are read
         // only past the scope fields.
         let is_option_field = field_index >= scope_field_count;
+        if !is_option_field
+            && (enterprise_number.is_some() || !DOMAIN_OR_SELECTOR_SCOPES.contains(&type_id))
+        {
+            finer_scope = true;
+        }
+        if enterprise_number.is_some() {
+            return;
+        }
         match type_id {
             // `selectorId` (302) wins over `flowSamplerId` (48); this must match
             // the precedence in `FlowFields::apply_element` so the two agree.
@@ -985,6 +1011,9 @@ pub fn sampling_from_options_record(
         packet_interval,
         packet_space,
     )?;
+    if finer_scope && selector == SamplerSelector::Domain {
+        return None;
+    }
     Some(SamplingObservation { selector, ratio })
 }
 
