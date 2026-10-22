@@ -11,7 +11,12 @@ cd "$repo_root/fuzz"
 seconds="${1:-60}"
 shift || true
 if [ "$#" -eq 0 ]; then
-    mapfile -t targets < <(cargo fuzz list)
+    target_list="$(cargo fuzz list)"
+    if [ -z "$target_list" ]; then
+        echo "fuzz.sh: cargo fuzz list returned no targets" >&2
+        exit 1
+    fi
+    mapfile -t targets <<<"$target_list"
 else
     targets=("$@")
 fi
