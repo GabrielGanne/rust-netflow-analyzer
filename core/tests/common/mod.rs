@@ -39,6 +39,59 @@ pub fn set_ipfix_total_length(buf: &mut [u8]) {
     buf[2..4].copy_from_slice(&len.to_be_bytes());
 }
 
+/// A 20-byte NetFlow v9 header for `source_id`.
+pub fn v9_header(source_id: u32) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.put(9, 2)
+        .put(1, 2)
+        .put(1000, 4)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(source_id as u64, 4);
+    b.buf
+}
+
+/// A 16-byte IPFIX header for `domain`, with `total_length` left at zero.
+pub fn ipfix_header(domain: u32) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.put(10, 2)
+        .put(0, 2)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(domain as u64, 4);
+    b.buf
+}
+
+/// A FlowSet/Set whose length field covers the 4-byte header plus `body`.
+pub fn flowset(set_id: u16, body: &[u8]) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.put(set_id as u64, 2).put(4 + body.len() as u64, 2);
+    b.buf.extend_from_slice(body);
+    b.buf
+}
+
+/// A template record body: id, field count, then `(type, length)` specifiers.
+pub fn template_record(template_id: u16, fields: &[(u16, u16)]) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.put(template_id as u64, 2).put(fields.len() as u64, 2);
+    for &(type_id, length) in fields {
+        b.put(type_id as u64, 2).put(length as u64, 2);
+    }
+    b.buf
+}
+
+/// Concatenates a header with sets, patching the IPFIX `total_length`.
+pub fn packet(header: Vec<u8>, sets: &[Vec<u8>]) -> Vec<u8> {
+    let mut buf = header;
+    for set in sets {
+        buf.extend_from_slice(set);
+    }
+    if buf.starts_with(&[0, 10]) {
+        set_ipfix_total_length(&mut buf);
+    }
+    buf
+}
+
 /// A NetFlow v9 packet with a 7-field template (id 256) and one data record.
 pub fn sample_v9_packet() -> Vec<u8> {
     let mut b = Builder::new();

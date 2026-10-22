@@ -2,7 +2,7 @@
 
 ## Testing and local verification
 
-- [ ] Add table-driven packet builders and fixtures for header/FlowSet length
+- [x] Add table-driven packet builders and fixtures for header/FlowSet length
   boundaries, truncation, padding, unknown fields, template replacement and
   expiry, multiple observation domains, options semantics, and all documented
   error paths.
