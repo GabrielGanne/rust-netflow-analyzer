@@ -735,6 +735,7 @@ pub unsafe extern "C" fn netflow_analyzer_age_at(
         }
         let context = &*ctx;
         let Some(callback) = context.callback else {
+            context.internal.age_at(now_ns, |_| {});
             return 0;
         };
         let user_data = context.user_data;
