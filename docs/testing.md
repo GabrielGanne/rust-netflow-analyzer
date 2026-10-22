@@ -92,7 +92,30 @@ Fuzzing needs `cargo install cargo-fuzz` and the nightly pinned in
 The fuzz crate is outside the workspace, so `cargo deny` does not cover it;
 `libfuzzer-sys` adds the NCSA license, which is used only to build the fuzzers.
 
-## Planned additions
+Miri and the sanitizers use the same nightly with the `miri` and `rust-src`
+components (override it with `NETFLOW_ANALYZER_NIGHTLY`):
+
+```sh
+./tools/sanitize.sh            # miri, address, and thread
+./tools/sanitize.sh thread     # one mode
+```
+
+- `miri` runs the core and FFI unit tests, which cover the `unsafe` FFI
+  create/destroy, callback, and aging-thread paths (the core crate has no
+  `unsafe`). Isolation is disabled because the wall-clock entry points read
+  the real-time clock. The integration suites' concurrent loads are too slow
+  under the interpreter.
+- `address` runs every core and FFI test under AddressSanitizer.
+- `thread` runs the unit, `engine`, and `lifecycle` suites, which hold the
+  concurrent ingestion, flush, aging, and lifecycle tests, under
+  ThreadSanitizer.
+
+Dependency audits (licenses, bans, sources, and RustSec advisories) are
+already part of the local gate through `cargo deny --locked check`.
+
+## Plan history
+
+All the items below are implemented; they are kept to record the intent.
 
 1. Stabilize the local gate. The rustfmt drift is resolved, and
    `tools/test.sh` is maintained as the documented correctness command. The

@@ -15,10 +15,10 @@
 - [x] Keep benchmark workloads representative and runnable locally; cover packet
   size, records per packet, template warmness, cache hit/miss behavior, and
   cold versus warm contexts. Record environment details when comparing runs.
-- [ ] Add a packet-parser fuzz crate with checked-in seeds for headers, FlowSets,
+- [x] Add a packet-parser fuzz crate with checked-in seeds for headers, FlowSets,
   templates, and variable-length records. Add optional sanitizer and dependency
   audit commands when the required tools and policies are defined.
-- [ ] Add sanitizer/Miri coverage where supported for unsafe FFI lifecycle and
+- [x] Add sanitizer/Miri coverage where supported for unsafe FFI lifecycle and
   concurrency paths.
 
 ## Before publishing
