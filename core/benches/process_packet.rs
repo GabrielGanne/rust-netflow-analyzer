@@ -20,9 +20,10 @@
 //!
 //! `tools/bench.sh` records the environment next to the Criterion results.
 
+use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use netflow_analyzer_core::FlowContext;
 
 /// Length of the v9 header plus the template FlowSet built by [`v9_packet`].
@@ -308,10 +309,11 @@ fn bench_flow_cache(c: &mut Criterion) {
             ctx.process_packet(&packet).expect("parse ok");
         }
         let resident = ctx.active_flows();
+        let warmed = HIT_POOL.div_ceil(RECORDS as u32) * RECORDS as u32;
         let mut first = 0u32;
         b.iter(|| {
             set_flows(&mut packet, RECORDS, first);
-            first = (first + RECORDS as u32) % HIT_POOL;
+            first = (first + RECORDS as u32) % warmed;
             black_box(ctx.process_packet(black_box(&packet)).expect("parse ok"));
         });
         assert_eq!(ctx.active_flows(), resident, "every record was a hit");
