@@ -64,5 +64,4 @@ These invariants are enforced by the test suite (run via `make c-example` /
 
 ## License
 
-Licensed under the Mozilla Public License 2.0 (MPL-2.0). See the workspace
-`LICENSE` file.
+Licensed under the Mozilla Public License 2.0 (MPL-2.0). See [`LICENSE`](https://github.com/GabrielGanne/rust-netflow-analyzer/blob/main/LICENSE).
