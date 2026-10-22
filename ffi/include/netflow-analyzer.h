@@ -174,12 +174,19 @@ typedef struct {
      */
     uint64_t max_clock_skew_ns;
     /**
+     * Nonzero selects manual aging: no background wall-clock aging thread is
+     * started, and the host drives aging and template expiry with
+     * [`netflow_analyzer_age_at`]. Use it with the `*_at` entry points, for
+     * example for capture replay. Zero keeps the background thread.
+     */
+    uint64_t manual_aging;
+    /**
      * Reserved for future settings. The caller must zero these (zero-initialize
      * the whole struct); the engine ignores them today, so a new field added
      * here later defaults to "unset" for callers that only zeroed it. Kept so
      * the struct can grow without changing its size or ABI.
      */
-    uint64_t reserved[8];
+    uint64_t reserved[7];
 } NetflowAnalyzerConfig;
 
 /**
@@ -508,6 +515,12 @@ uint32_t netflow_analyzer_abi_version(void);
  * `netflow_analyzer_decode_packet*` entry points (plus stats and purge) are
  * usable. The flow-cache settings in `config` are then ignored.
  *
+ * With a callback and a nonzero `config->manual_aging`, no aging thread is
+ * started either: flows are emitted only by `netflow_analyzer_age_at`,
+ * `netflow_analyzer_flush`, and purge. This is the mode for capture replay
+ * through the `*_at` entry points, whose timestamps the wall-clock thread
+ * would otherwise age against.
+ *
  * Returns null on failure to spawn the background aging thread.
  *
  * # Safety
@@ -651,6 +664,26 @@ int32_t netflow_analyzer_decode_packet_from_at(const NetflowAnalyzerContext *ctx
  * `ctx` must be null or a valid context pointer.
  */
 void netflow_analyzer_flush(const NetflowAnalyzerContext *ctx);
+
+/**
+ * Runs one aging pass at `now_ns` (Unix nanoseconds) on the calling thread:
+ * idle flows are evicted and long-lived flows rolled over through the flow
+ * callback, and templates expired by `now_ns` are dropped. Returns the number
+ * of records emitted, `0` for a decode-only context, `-1` if `ctx` is null, or
+ * `-4` on an internal error.
+ *
+ * This is the deterministic counterpart of the background aging thread for
+ * hosts that feed packets through the `*_at` entry points with their own
+ * timestamps (for example a capture replay). Use one time domain per context:
+ * either the wall-clock entry points with background aging, or the `*_at`
+ * entry points with this function on a context created with
+ * `manual_aging` set. Mixing them ages state against unrelated clocks. Time
+ * moving backwards never ages state early.
+ *
+ * # Safety
+ * `ctx` must be null or a valid context pointer.
+ */
+int32_t netflow_analyzer_age_at(const NetflowAnalyzerContext *ctx, uint64_t now_ns);
 
 /**
  * Purges all cached state for one exporter/transport session, reclaiming its

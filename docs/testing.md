@@ -39,6 +39,12 @@ Additional Criterion arguments can be passed after the command, for example
   behavior, aging, and clock handling.
 - Integration tests cover NetFlow v5, NetFlow v9, IPFIX, decode-only mode,
   malformed/truncated input, limits, metadata, and aging behavior.
+  `boundaries.rs` holds table-driven header/FlowSet length, padding,
+  unknown-field, multi-domain, and error-path cases. `lifecycle.rs` drives
+  aging and template expiry deterministically through `*_at` timestamps and
+  `age_at`, and covers repeated aging start/stop, concurrent ingestion with
+  flushing or aging, and the flow cap under concurrent load. No test relies
+  on a fixed sleep.
 - FFI unit tests cover lifecycle, error mapping, configuration, callbacks, and
   decode-only callbacks, including pinned public structure layouts.
 - `core/examples/udp_listener.rs` is a runnable Rust example.

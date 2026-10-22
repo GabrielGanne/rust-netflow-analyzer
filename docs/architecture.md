@@ -81,5 +81,6 @@ Options templates configure packet sampling rates (`samplingInterval` IE 34, `sa
 
 ### 5. Concurrent Sharded State and Aging
 - The flow cache and template cache are internally sharded using `DashMap`, allowing concurrent worker threads to ingest packets without a global lock.
-- A background worker thread sweeps the flow cache at configurable intervals (`scan_interval`), evicting idle flows (`idle_timeout`) and rolling over active flows (`active_timeout`).
+- A background worker thread sweeps the flow cache at configurable intervals (`scan_interval`), evicting idle flows (`idle_timeout`) and rolling over active flows (`active_timeout`). It waits on a condition variable, so `stop_aging` wakes it immediately.
+- Aging and template expiry run on each packet's receipt time in Unix nanoseconds. The wall-clock entry points pair with the background worker; the `*_at` entry points pair with `age_at` (`netflow_analyzer_age_at`, on a C context created with `manual_aging` set), which runs one sweep at a caller-supplied time for deterministic replay and tests. A context should use only one of these two time domains. Elapsed time saturates at zero, so time moving backwards never ages state early.
 - All callbacks run outside cache locks to avoid blocking ingestion or causing deadlocks.

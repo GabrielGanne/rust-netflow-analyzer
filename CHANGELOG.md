@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 128-bit exporter keys (`ExporterKey = u128`) with C entry points taking a 16-byte key (`*_from_addr_at`, `netflow_analyzer_purge_exporter_addr`) and `exporter_key_hi` on emitted records.
 - Scale NetFlow v5 counters by the header sampling interval.
 - Decode `ipDiffServCodePoint` (IE 195) and `flowStart/EndDeltaMicroseconds` (IE 158/159).
+- `FlowContext::age_at` and `netflow_analyzer_age_at`: run one aging sweep at a caller-supplied time, for contexts fed through the `*_at` entry points.
+- `NetflowAnalyzerConfig::manual_aging` (takes the first reserved slot; size unchanged): a callback-enabled C context that starts no wall-clock aging thread, for capture replay driven by `netflow_analyzer_age_at`. `FlowContext::is_aging` reports whether a worker is installed.
 - `make install` with a `netflow-analyzer.pc` pkg-config file, and a `REUSE.toml` declaring copyright and license.
 
 ### Fixed
@@ -25,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ignore sampling rates scoped finer than the observation domain (per interface, line card, …) that carry no `flowSamplerId`/`selectorId`, instead of applying them domain-wide.
 
 ### Changed
+- Flow aging and template expiry use each packet's receipt time (Unix nanoseconds) instead of the local monotonic clock, so `*_at` timestamps drive them. Do not mix wall-clock and `*_at` entry points on one context. `FlowRecord::from_fields` takes `now_ns: u64` instead of an `Instant`.
+- The aging worker waits on a condition variable instead of 100 ms sleep slices: `scan_interval` below 100 ms is honoured, and `stop_aging` / `netflow_analyzer_destroy` return without waiting for the slice to end.
 - C ABI version bumped to 3 (`NetflowAnalyzerFlowRecord::exporter_key_hi` takes the first reserved slot).
 - Documented that `flows_output`, `flows_dropped` and `active_flows` are flow-cache counters, always `0` on the decode-only path.
 

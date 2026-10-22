@@ -157,7 +157,7 @@ fn v5_sampling_ratio(sampling_interval: u16) -> SamplingRatio {
 }
 
 /// Current wall-clock time as Unix nanoseconds, saturating at `u64::MAX`.
-fn now_unix_ns() -> u64 {
+pub(crate) fn now_unix_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -194,6 +194,21 @@ impl Default for EngineConfig {
 /// A single `FlowContext` is shared (via `Arc`) across all worker threads. Its
 /// caches are internally sharded, so concurrent `process_packet` calls do not
 /// contend on a global lock.
+///
+/// # Time domains
+///
+/// Flow aging and template expiry run on the receipt time of each packet. The
+/// entry points without an `_at` suffix, and the background worker started by
+/// [`Self::start_aging`], read the wall clock. The `_at` entry points use the
+/// caller's timestamp instead, which lets a capture replay or a test age state
+/// deterministically through [`Self::age_at`].
+///
+/// Use **one** time domain per context: either the wall-clock entry points with
+/// [`Self::start_aging`], or the `_at` entry points with [`Self::age_at`].
+/// Mixing them, for example feeding capture timestamps while the background
+/// worker sweeps at wall-clock time, ages flows and templates against
+/// unrelated clocks. Time moving backwards never ages state early: elapsed
+/// time saturates at zero.
 pub struct FlowContext {
     counters: Arc<InternalCounters>,
     templates: Arc<TemplateCache>,
@@ -237,6 +252,10 @@ impl FlowContext {
     /// Like [`Self::process_packet`], with an explicit Unix-nanosecond receipt
     /// timestamp. Capture readers should pass the packet's capture timestamp.
     ///
+    /// The timestamp also drives flow aging and template expiry; see the
+    /// [time domains](Self#time-domains) note before combining it with
+    /// [`Self::start_aging`].
+    ///
     /// This is the fused decode + aggregate entry point for the reserved
     /// single-exporter key. It is a thin wrapper over
     /// [`Self::process_packet_from_at`].
@@ -275,7 +294,8 @@ impl FlowContext {
             raw_bytes,
             receipt_time_ns,
             &mut |exporter, scope, fields| {
-                self.flows.upsert(exporter, scope, fields, &self.counters);
+                self.flows
+                    .upsert(exporter, scope, fields, &self.counters, receipt_time_ns);
             },
         )
     }
@@ -493,7 +513,8 @@ impl FlowContext {
                                 self.counters
                                     .templates_received
                                     .fetch_add(1, Ordering::Relaxed);
-                                self.templates.insert(exporter, scope, template);
+                                self.templates
+                                    .insert(exporter, scope, template, receipt_time_ns);
                             }
                         }
                         Err(_) => {
@@ -507,9 +528,12 @@ impl FlowContext {
                 // can later be interpreted rather than silently dropped.
                 id if id == FLOWSET_ID_V9_OPTIONS => {
                     match parser::parse_v9_options_template_set(body) {
-                        Ok((_, templates)) => {
-                            self.store_options_templates(exporter, scope, templates)
-                        }
+                        Ok((_, templates)) => self.store_options_templates(
+                            exporter,
+                            scope,
+                            templates,
+                            receipt_time_ns,
+                        ),
                         Err(_) => {
                             rejected_template = true;
                             break;
@@ -518,18 +542,32 @@ impl FlowContext {
                 }
                 id if id == SET_ID_IPFIX_OPTIONS => {
                     match parser::parse_ipfix_options_template_set(body) {
-                        Ok((_, templates)) => {
-                            self.store_options_templates(exporter, scope, templates)
-                        }
+                        Ok((_, templates)) => self.store_options_templates(
+                            exporter,
+                            scope,
+                            templates,
+                            receipt_time_ns,
+                        ),
                         Err(_) => {
                             rejected_template = true;
                             break;
                         }
                     }
                 }
+                // Without the template we cannot interpret the records yet; the
+                // exporter will resend it periodically, so we skip until then.
                 id if id >= FIRST_DATA_SET_ID => {
-                    data_records +=
-                        self.process_data_set(exporter, scope, id, body, time_context, sink);
+                    if let Some(template) = self.templates.get(exporter, scope, id, receipt_time_ns)
+                    {
+                        data_records += self.process_data_set(
+                            exporter,
+                            scope,
+                            &template,
+                            body,
+                            time_context,
+                            sink,
+                        );
+                    }
                 }
                 // Reserved/unknown set ids (e.g. 4..=255) are ignored.
                 _ => {}
@@ -564,12 +602,13 @@ impl FlowContext {
         exporter: scope::ExporterKey,
         scope: Scope,
         templates: Vec<parser::TemplateRecord>,
+        now_ns: u64,
     ) {
         for template in templates {
             self.counters
                 .options_templates_received
                 .fetch_add(1, Ordering::Relaxed);
-            self.templates.insert(exporter, scope, template);
+            self.templates.insert(exporter, scope, template, now_ns);
         }
     }
 
@@ -608,22 +647,16 @@ impl FlowContext {
 
     /// Decodes every data record in a data FlowSet body against its template.
     ///
-    /// `(exporter, scope)` keys the template lookup and is forwarded to `sink`.
+    /// `(exporter, scope)` keys the sampling lookup and is forwarded to `sink`.
     fn process_data_set(
         &self,
         exporter: ExporterKey,
         scope: Scope,
-        template_id: u16,
+        template: &parser::TemplateRecord,
         body: &[u8],
         time_context: RecordTimeContext,
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
     ) -> usize {
-        // Without the template we cannot interpret the records yet; the exporter
-        // will resend it periodically, so we simply skip until then.
-        let Some(template) = self.templates.get(exporter, scope, template_id) else {
-            return 0;
-        };
-
         // Options data records carry exporter metadata, not observed flows, so
         // they are decoded and interpreted separately without polluting the flow
         // cache. `count` therefore tracks only flow records for the return value.
@@ -634,10 +667,10 @@ impl FlowContext {
             Some(record_len) if record_len > 0 => {
                 for record in parser::split_fixed_records(body, record_len) {
                     if let Some((mut fields, _)) =
-                        FlowFields::from_record_sized_at(&template, record, Some(time_context))
+                        FlowFields::from_record_sized_at(template, record, Some(time_context))
                     {
                         if is_options {
-                            self.consume_options_record(exporter, scope, &template, record);
+                            self.consume_options_record(exporter, scope, template, record);
                         } else {
                             self.apply_sampling(exporter, scope, &mut fields);
                             sink(exporter, scope, &fields);
@@ -650,7 +683,7 @@ impl FlowContext {
             None => {
                 let mut cursor = body;
                 while !cursor.is_empty() {
-                    match FlowFields::from_record_sized_at(&template, cursor, Some(time_context)) {
+                    match FlowFields::from_record_sized_at(template, cursor, Some(time_context)) {
                         Some((mut fields, consumed))
                             if consumed > 0 && consumed <= cursor.len() =>
                         {
@@ -658,7 +691,7 @@ impl FlowContext {
                                 self.consume_options_record(
                                     exporter,
                                     scope,
-                                    &template,
+                                    template,
                                     &cursor[..consumed],
                                 );
                             } else {
@@ -722,6 +755,10 @@ impl FlowContext {
     /// Starts the background aging thread. Idle flows are evicted and long-lived
     /// flows are rolled over; both events are delivered through `on_emit`.
     ///
+    /// The worker sweeps every `scan_interval` at wall-clock time. Contexts fed
+    /// through the `_at` entry points should call [`Self::age_at`] instead (see
+    /// the [time domains](Self#time-domains) note).
+    ///
     /// Calling this again first stops any previously running aging thread.
     ///
     /// Aging lifecycle control — [`Self::start_aging`], [`Self::stop_aging`], and
@@ -752,6 +789,7 @@ impl FlowContext {
             self.templates.clone(),
             self.counters.clone(),
             self.aging_cfg,
+            now_unix_ns,
             on_emit,
         )?;
         // Swap the new handle in under the lock, then drop the previous one only
@@ -789,6 +827,38 @@ impl FlowContext {
         if let Some(mut handle) = handle {
             handle.stop();
         }
+    }
+
+    /// Runs one aging pass at `now_ns` (Unix nanoseconds) on the calling thread:
+    /// evicts idle flows and rolls over active ones through `on_emit`, exactly
+    /// as one background sweep would, and drops templates expired by `now_ns`.
+    ///
+    /// This is the deterministic counterpart of [`Self::start_aging`] for
+    /// contexts fed through the `_at` entry points, such as capture replay.
+    /// `on_emit` runs with no cache lock held. Returns the number of records
+    /// emitted.
+    pub fn age_at<F>(&self, now_ns: u64, on_emit: F) -> usize
+    where
+        F: Fn(&FlowRecord),
+    {
+        let emitted = std::cell::Cell::new(0usize);
+        let counting = |record: &FlowRecord| {
+            on_emit(record);
+            emitted.set(emitted.get() + 1);
+        };
+        self.flows
+            .sweep(&self.aging_cfg, &self.counters, &counting, now_ns);
+        self.templates.sweep_expired(now_ns);
+        emitted.get()
+    }
+
+    /// Whether a background aging thread started by [`Self::start_aging`] is
+    /// currently installed.
+    pub fn is_aging(&self) -> bool {
+        self.aging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Emits and clears every flow still resident in the cache.
@@ -867,7 +937,7 @@ impl FlowContext {
         scope: Scope,
         template_id: u16,
     ) -> Option<Arc<parser::TemplateRecord>> {
-        self.templates.get(exporter, scope, template_id)
+        self.templates.get_latest(exporter, scope, template_id)
     }
 
     /// Number of clock states currently tracked across all exporters and scopes.

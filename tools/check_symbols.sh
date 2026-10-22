@@ -30,6 +30,7 @@ expected=(
     netflow_analyzer_destroy
     netflow_analyzer_get_stats
     netflow_analyzer_flush
+    netflow_analyzer_age_at
     netflow_analyzer_purge_exporter
     netflow_analyzer_process_packet
     netflow_analyzer_process_packet_at

@@ -173,22 +173,22 @@ fn background_aging_evicts_and_emits() {
     };
     let ctx = FlowContext::with_config(cfg);
 
-    let emitted: Arc<Mutex<Vec<FlowRecord>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = emitted.clone();
-    ctx.start_aging(move |rec| sink.lock().unwrap().push(rec.clone()));
-
     ctx.process_packet(&sample_v9_packet()).expect("parse ok");
 
-    // Wait for the aging thread to sweep the idle flow.
-    std::thread::sleep(Duration::from_millis(300));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx = Mutex::new(tx);
+    ctx.start_aging(move |rec| {
+        let _ = tx.lock().unwrap().send(rec.clone());
+    });
+
+    let record = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("aging thread evicts the idle flow");
     ctx.stop_aging();
 
+    assert_eq!(record.proto, 6);
     assert_eq!(ctx.active_flows(), 0, "idle flow evicted");
-    assert!(
-        !emitted.lock().unwrap().is_empty(),
-        "eviction emitted a record"
-    );
-    assert!(ctx.stats().flows_output >= 1);
+    assert_eq!(ctx.stats().flows_output, 1);
 }
 
 #[test]
@@ -352,9 +352,6 @@ fn purge_exporter_emits_flows_then_drops_template_and_clock_state() {
 
 #[test]
 fn stop_aging_from_within_callback_does_not_deadlock() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
-
     // An emission callback that tears the engine down runs on the aging thread
     // itself. `stop_aging` must not try to join that thread with itself (which
     // can deadlock or panic); it detaches instead. This mirrors the misuse of
@@ -370,22 +367,16 @@ fn stop_aging_from_within_callback_does_not_deadlock() {
     let ctx = Arc::new(FlowContext::with_config(cfg));
     ctx.process_packet(&sample_v9_packet()).expect("parse ok");
 
-    // Set only *after* the re-entrant stop returns, so a self-join deadlock
-    // would leave this false forever.
-    let completed = Arc::new(AtomicBool::new(false));
+    // Signalled only *after* the re-entrant stop returns, so a self-join
+    // deadlock would never send.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx = Mutex::new(tx);
     let ctx_cb = ctx.clone();
-    let completed_cb = completed.clone();
     ctx.start_aging(move |_rec| {
         ctx_cb.stop_aging();
-        completed_cb.store(true, Ordering::Relaxed);
+        let _ = tx.lock().unwrap().send(());
     });
 
-    let start = Instant::now();
-    while !completed.load(Ordering::Relaxed) {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "stop_aging from the aging callback never returned (deadlocked)"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("stop_aging from the aging callback never returned (deadlocked)");
 }

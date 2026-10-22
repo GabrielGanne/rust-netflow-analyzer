@@ -198,11 +198,16 @@ pub struct NetflowAnalyzerConfig {
     pub clock_fallback_to_receipt_time: bool,
     /// Maximum accepted clock skew, in nanoseconds. Zero selects the default.
     pub max_clock_skew_ns: u64,
+    /// Nonzero selects manual aging: no background wall-clock aging thread is
+    /// started, and the host drives aging and template expiry with
+    /// [`netflow_analyzer_age_at`]. Use it with the `*_at` entry points, for
+    /// example for capture replay. Zero keeps the background thread.
+    pub manual_aging: u64,
     /// Reserved for future settings. The caller must zero these (zero-initialize
     /// the whole struct); the engine ignores them today, so a new field added
     /// here later defaults to "unset" for callers that only zeroed it. Kept so
     /// the struct can grow without changing its size or ABI.
-    pub reserved: [u64; 8],
+    pub reserved: [u64; 7],
 }
 
 /// Wrapper that lets us move the host's opaque `user_data` pointer onto the
@@ -290,6 +295,12 @@ pub extern "C" fn netflow_analyzer_abi_version() -> u32 {
 /// `netflow_analyzer_decode_packet*` entry points (plus stats and purge) are
 /// usable. The flow-cache settings in `config` are then ignored.
 ///
+/// With a callback and a nonzero `config->manual_aging`, no aging thread is
+/// started either: flows are emitted only by `netflow_analyzer_age_at`,
+/// `netflow_analyzer_flush`, and purge. This is the mode for capture replay
+/// through the `*_at` entry points, whose timestamps the wall-clock thread
+/// would otherwise age against.
+///
 /// Returns null on failure to spawn the background aging thread.
 ///
 /// # Safety
@@ -302,10 +313,10 @@ pub unsafe extern "C" fn netflow_analyzer_create(
     user_data: *mut c_void,
 ) -> *mut NetflowAnalyzerContext {
     guard_ffi(std::ptr::null_mut(), || unsafe {
-        let engine_cfg = if config.is_null() {
-            EngineConfig::default()
+        let (engine_cfg, manual_aging) = if config.is_null() {
+            (EngineConfig::default(), false)
         } else {
-            engine_config_from(&*config)
+            (engine_config_from(&*config), (*config).manual_aging != 0)
         };
 
         let internal = Arc::new(FlowContext::with_config(engine_cfg));
@@ -314,7 +325,7 @@ pub unsafe extern "C" fn netflow_analyzer_create(
         // Bridge the emitted Rust records to the C callback. The user_data
         // pointer is wrapped so it can cross into the aging worker. If the
         // worker thread cannot be created, hand back null instead of a context.
-        if let Some(callback) = callback {
+        if let (Some(callback), false) = (callback, manual_aging) {
             if internal
                 .try_start_aging(move |record: &FlowRecord| {
                     emit_record(callback, user_data, record);
@@ -697,6 +708,43 @@ pub unsafe extern "C" fn netflow_analyzer_flush(ctx: *const NetflowAnalyzerConte
     })
 }
 
+/// Runs one aging pass at `now_ns` (Unix nanoseconds) on the calling thread:
+/// idle flows are evicted and long-lived flows rolled over through the flow
+/// callback, and templates expired by `now_ns` are dropped. Returns the number
+/// of records emitted, `0` for a decode-only context, `-1` if `ctx` is null, or
+/// `-4` on an internal error.
+///
+/// This is the deterministic counterpart of the background aging thread for
+/// hosts that feed packets through the `*_at` entry points with their own
+/// timestamps (for example a capture replay). Use one time domain per context:
+/// either the wall-clock entry points with background aging, or the `*_at`
+/// entry points with this function on a context created with
+/// `manual_aging` set. Mixing them ages state against unrelated clocks. Time
+/// moving backwards never ages state early.
+///
+/// # Safety
+/// `ctx` must be null or a valid context pointer.
+#[no_mangle]
+pub unsafe extern "C" fn netflow_analyzer_age_at(
+    ctx: *const NetflowAnalyzerContext,
+    now_ns: u64,
+) -> i32 {
+    guard_ffi(NETFLOW_ANALYZER_INTERNAL_ERROR, || unsafe {
+        if ctx.is_null() {
+            return -1;
+        }
+        let context = &*ctx;
+        let Some(callback) = context.callback else {
+            return 0;
+        };
+        let user_data = context.user_data;
+        let emitted = context.internal.age_at(now_ns, move |record| {
+            emit_record(callback, user_data, record)
+        });
+        i32::try_from(emitted).unwrap_or(i32::MAX)
+    })
+}
+
 /// Purges one exporter, emitting its resident flows through the registered
 /// callback (a decode-only context has none to emit).
 fn purge(context: &NetflowAnalyzerContext, exporter: ExporterKey) -> i32 {
@@ -950,6 +998,8 @@ const _ABI_SIGNATURES: () = {
     ) -> i32 = netflow_analyzer_decode_packet_from_at;
     let _: unsafe extern "C" fn(*const NetflowAnalyzerContext) = netflow_analyzer_flush;
     let _: unsafe extern "C" fn(*const NetflowAnalyzerContext, u64) -> i32 =
+        netflow_analyzer_age_at;
+    let _: unsafe extern "C" fn(*const NetflowAnalyzerContext, u64) -> i32 =
         netflow_analyzer_purge_exporter;
     let _: unsafe extern "C" fn(*mut NetflowAnalyzerContext) = netflow_analyzer_destroy;
     let _: unsafe extern "C" fn(*const NetflowAnalyzerContext, *const u8) -> i32 =
@@ -1101,7 +1151,8 @@ mod tests {
             clock_sync_check_enabled: false,
             clock_fallback_to_receipt_time: false,
             max_clock_skew_ns: 0,
-            reserved: [0; 8],
+            manual_aging: 0,
+            reserved: [0; 7],
         };
         let defaults = EngineConfig::default();
         let cfg = engine_config_from(&zero);
@@ -1124,7 +1175,8 @@ mod tests {
             clock_sync_check_enabled: true,
             clock_fallback_to_receipt_time: true,
             max_clock_skew_ns: 123,
-            reserved: [0; 8],
+            manual_aging: 0,
+            reserved: [0; 7],
         };
         let cfg = engine_config_from(&custom);
         assert_eq!(cfg.max_flows, 10);
@@ -1169,6 +1221,52 @@ mod tests {
         assert_eq!(stats.flows_dropped, 0);
 
         unsafe { netflow_analyzer_destroy(ctx) };
+    }
+
+    #[test]
+    fn age_at_ages_on_caller_time() {
+        let state = TestState {
+            count: AtomicU32::new(0),
+            last_proto: AtomicU32::new(0),
+        };
+        let ud = &state as *const TestState as *mut c_void;
+        let config = NetflowAnalyzerConfig {
+            max_flows: 0,
+            max_templates: 0,
+            idle_timeout_secs: 0,
+            active_timeout_secs: 0,
+            scan_interval_secs: 1,
+            clock_sync_check_enabled: false,
+            clock_fallback_to_receipt_time: false,
+            max_clock_skew_ns: 0,
+            manual_aging: 1,
+            reserved: [0; 7],
+        };
+        let ctx = unsafe { netflow_analyzer_create(&config, Some(count_cb), ud) };
+        assert!(!ctx.is_null());
+        assert!(
+            !unsafe { (*ctx).internal.is_aging() },
+            "manual aging starts no wall-clock worker"
+        );
+
+        // A historical capture timestamp: a wall-clock worker would find this
+        // flow idle on its first sweep.
+        const T: u64 = 1_700_000_000_000_000_000;
+        const SECOND: u64 = 1_000_000_000;
+        let packet = v9_packet();
+        unsafe {
+            assert_eq!(
+                netflow_analyzer_process_packet_at(ctx, packet.as_ptr(), packet.len() as u32, T),
+                1
+            );
+            // The default idle timeout is 30 seconds.
+            assert_eq!(netflow_analyzer_age_at(ctx, T + 29 * SECOND), 0);
+            assert_eq!(netflow_analyzer_age_at(ctx, T + 30 * SECOND), 1);
+            assert_eq!(netflow_analyzer_get_stats(ctx).active_flows, 0);
+            netflow_analyzer_destroy(ctx);
+        }
+        assert_eq!(state.count.load(Ordering::Relaxed), 1);
+        assert_eq!(state.last_proto.load(Ordering::Relaxed), 17);
     }
 
     /// Decode-only callback: counts per-record emissions and records the domain.
@@ -1382,7 +1480,8 @@ mod tests {
             clock_sync_check_enabled: true,
             clock_fallback_to_receipt_time: false,
             max_clock_skew_ns: 10,
-            reserved: [0; 8],
+            manual_aging: 0,
+            reserved: [0; 7],
         };
         let state = TestState {
             count: AtomicU32::new(0),
@@ -1424,6 +1523,7 @@ mod tests {
         // Flush and destroy on null are safe no-ops.
         unsafe {
             netflow_analyzer_flush(ptr::null());
+            assert_eq!(netflow_analyzer_age_at(ptr::null(), 0), -1);
             netflow_analyzer_destroy(ptr::null_mut());
         }
 
@@ -1449,6 +1549,7 @@ mod tests {
                 -1
             );
             netflow_analyzer_flush(ctx);
+            assert_eq!(netflow_analyzer_age_at(ctx, u64::MAX), 0);
             assert_eq!(netflow_analyzer_purge_exporter(ctx, 0), 0);
             assert_eq!(netflow_analyzer_purge_exporter_addr(ctx, ptr::null()), -1);
             netflow_analyzer_destroy(ctx);
@@ -1551,7 +1652,8 @@ mod tests {
             41
         );
         assert_eq!(offset_of!(NetflowAnalyzerConfig, max_clock_skew_ns), 48);
-        assert_eq!(offset_of!(NetflowAnalyzerConfig, reserved), 56);
+        assert_eq!(offset_of!(NetflowAnalyzerConfig, manual_aging), 56);
+        assert_eq!(offset_of!(NetflowAnalyzerConfig, reserved), 64);
 
         assert_eq!(size_of::<NetflowAnalyzerStats>(), 144);
         assert_eq!(align_of::<NetflowAnalyzerStats>(), 8);
@@ -1646,7 +1748,8 @@ mod tests {
             clock_sync_check_enabled: false,
             clock_fallback_to_receipt_time: false,
             max_clock_skew_ns: 0,
-            reserved: [0; 8],
+            manual_aging: 0,
+            reserved: [0; 7],
         };
         let state = TestState {
             count: AtomicU32::new(0),

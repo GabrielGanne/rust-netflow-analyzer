@@ -6,7 +6,7 @@
   boundaries, truncation, padding, unknown fields, template replacement and
   expiry, multiple observation domains, options semantics, and all documented
   error paths.
-- [ ] Add deterministic clock, concurrency, and lifecycle coverage for concurrent
+- [x] Add deterministic clock, concurrency, and lifecycle coverage for concurrent
   processing/flushing, repeated aging start/stop, and bounded cache behavior.
   Replace timing sleeps with an injectable or controllable clock where tests
   require deterministic time.

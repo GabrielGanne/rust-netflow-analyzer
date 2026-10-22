@@ -3,7 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::ops::{Deref, DerefMut};
-use std::time::Instant;
 
 use crate::parser::{TemplateRecord, V5_RECORD_LEN, VARIABLE_LENGTH};
 use crate::sampling::{SamplerSelector, SamplingRatio};
@@ -584,24 +583,25 @@ pub struct FlowRecord {
     pub exporter: ExporterKey,
     /// Protocol-tagged observation scope this flow belongs to.
     pub scope: Scope,
-    pub(crate) first_observed: Instant,
-    pub(crate) last_observed: Instant,
+    pub(crate) first_observed_ns: u64,
+    pub(crate) last_observed_ns: u64,
 }
 
 impl FlowRecord {
-    /// Constructs an initial cached record from decoded fields and scope identity.
+    /// Constructs an initial cached record from decoded fields and scope identity,
+    /// first observed at `now_ns` (Unix nanoseconds).
     pub fn from_fields(
         fields: &FlowFields,
         exporter: ExporterKey,
         scope: Scope,
-        now: Instant,
+        now_ns: u64,
     ) -> Self {
         Self {
             fields: *fields,
             exporter,
             scope,
-            first_observed: now,
-            last_observed: now,
+            first_observed_ns: now_ns,
+            last_observed_ns: now_ns,
         }
     }
 }

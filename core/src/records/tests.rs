@@ -260,7 +260,6 @@ fn from_v5_record_rejects_short_input() {
 
 #[test]
 fn flow_record_round_trips_to_ffi() {
-    use std::time::Instant;
     let fields = FlowFields {
         flow_id: Some(42),
         src_ip: [1u8; 16],
@@ -287,12 +286,7 @@ fn flow_record_round_trips_to_ffi() {
         present: presence::FLOW_ID | presence::IFACE_IN | presence::DSCP,
         sampler: SamplerSelector::Domain,
     };
-    let record = FlowRecord::from_fields(
-        &fields,
-        SINGLE_EXPORTER,
-        Scope::IpfixDomain(9),
-        Instant::now(),
-    );
+    let record = FlowRecord::from_fields(&fields, SINGLE_EXPORTER, Scope::IpfixDomain(9), 0);
     assert_eq!(record.fields, fields);
     assert_eq!(record.flow_id, Some(42));
     let ffi = record.to_ffi();

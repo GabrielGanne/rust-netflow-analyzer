@@ -29,7 +29,7 @@
 
 #include "netflow-analyzer.h"
 
-/* NetflowAnalyzerConfig: five u64 knobs, two bools (+6 pad), one u64, [u64;8].
+/* NetflowAnalyzerConfig: five u64 knobs, two bools (+6 pad), two u64, [u64;7].
  * Size, alignment, and every field offset are pinned so a reorder of the two
  * equal-width `u64` knobs (invisible to size alone) is still caught. The Rust
  * side pins the identical numbers in `public_struct_layout_is_pinned`. */
@@ -43,7 +43,8 @@ static_assert(offsetof(NetflowAnalyzerConfig, scan_interval_secs) == 32, "Config
 static_assert(offsetof(NetflowAnalyzerConfig, clock_sync_check_enabled) == 40, "Config layout changed");
 static_assert(offsetof(NetflowAnalyzerConfig, clock_fallback_to_receipt_time) == 41, "Config layout changed");
 static_assert(offsetof(NetflowAnalyzerConfig, max_clock_skew_ns) == 48, "Config layout changed");
-static_assert(offsetof(NetflowAnalyzerConfig, reserved) == 56, "Config reserved tail moved");
+static_assert(offsetof(NetflowAnalyzerConfig, manual_aging) == 56, "Config layout changed");
+static_assert(offsetof(NetflowAnalyzerConfig, reserved) == 64, "Config reserved tail moved");
 
 /* NetflowAnalyzerStats: twelve u64 counters/gauges, then [u64;6]. */
 static_assert(sizeof(NetflowAnalyzerStats) == 144, "Stats size changed (ABI break)");
@@ -112,6 +113,7 @@ const nfa_anyfn netflow_analyzer_abi_export_probe[] = {
     (nfa_anyfn)netflow_analyzer_destroy,
     (nfa_anyfn)netflow_analyzer_get_stats,
     (nfa_anyfn)netflow_analyzer_flush,
+    (nfa_anyfn)netflow_analyzer_age_at,
     (nfa_anyfn)netflow_analyzer_purge_exporter,
     (nfa_anyfn)netflow_analyzer_process_packet,
     (nfa_anyfn)netflow_analyzer_process_packet_at,
