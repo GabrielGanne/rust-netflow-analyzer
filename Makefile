@@ -31,7 +31,7 @@ check:
 # Regenerate the C header from the Rust sources (requires cbindgen).
 # Install with: cargo install cbindgen
 header:
-	cbindgen --config ffi/cbndgen.toml --crate netflow_analyzer_ffi --output $(HEADER)
+	cbindgen --config ffi/cbindgen.toml --crate netflow_analyzer_ffi --output $(HEADER)
 
 # Build and run the C integration test-bench against the release staticlib.
 c-example: release
