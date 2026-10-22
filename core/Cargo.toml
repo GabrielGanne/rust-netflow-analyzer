@@ -1,6 +1,6 @@
 [package]
 name = "netflow_analyzer_core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Zero-copy NetFlow v5/v9 and IPFIX decoding and flow-aggregation engine."
 readme = "README.md"
