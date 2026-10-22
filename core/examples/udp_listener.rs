@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Reference OS-socket integration (Phase 1).
+//! Reference OS-socket integration.
 //!
 //! Binds a UDP socket, feeds every received datagram into the engine, prints
 //! emitted flows from the background aging thread, and reports telemetry.

@@ -1,12 +1,13 @@
 # netflow_analyzer_ffi
 
-C ABI (FFI) bindings for the [`netflow_analyzer_core`](../core) NetFlow/IPFIX
-engine.
+C ABI (FFI) bindings for the
+[`netflow_analyzer_core`](https://github.com/GabrielGanne/rust-netflow-analyzer/tree/main/core)
+NetFlow/IPFIX engine.
 
 This crate builds a `cdylib` and `staticlib` exposing a C-callable surface for
 creating an engine, processing datagrams, registering flow/record callbacks, and
 reading a telemetry snapshot. The generated C header is
-[`include/netflow-analyzer.h`](include/netflow-analyzer.h); regenerate it with
+[`include/netflow-analyzer.h`](https://github.com/GabrielGanne/rust-netflow-analyzer/blob/main/ffi/include/netflow-analyzer.h); regenerate it with
 `make header` (cbindgen).
 
 ## Quick start
@@ -60,9 +61,6 @@ These invariants are enforced by the test suite (run via `make c-example` /
   signature and `extern "C"` calling convention.
 - `tools/check_symbols.sh` confirms the static library exports exactly the
   public `netflow_analyzer_*` symbols.
-
-The rationale for using these source-level checks instead of `libabigail` is
-recorded in [`docs/abi.md`](../docs/abi.md).
 
 ## License
 

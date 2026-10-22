@@ -4,8 +4,7 @@ This note records which aggregation behaviours the engine performs, and which
 common NetFlow/IPFIX aggregation modes it deliberately does **not** perform, for
 the first public release. It exists so consumers know exactly what an emitted
 `FlowRecord` represents and do not assume higher-level processing that is not
-there. The mode names in parentheses match the local `flowtable` config surface
-described in `netflow-analyzer-migration.md` §1.3.
+there.
 
 ## The aggregation model
 
@@ -40,7 +39,9 @@ For each key the engine maintains:
 
 Sampling normalization applies to rates learned from **NetFlow v9 / IPFIX
 options records** (`samplingInterval`, `samplerRandomInterval`, or the
-`samplingPacketInterval` / `samplingPacketSpace` pair). A flow is matched to its
+`samplingPacketInterval` / `samplingPacketSpace` pair) and to the **NetFlow v5**
+header `sampling_interval`, which applies to every record in that packet. A
+v9 / IPFIX flow is matched to its
 sampler by the `flowSamplerId` / `selectorId` it carries, or the domain-wide
 sampler when it carries neither. Scaling is applied per record at decode time
 and is **never retroactive** — a rate learned or changed later does not rescale
@@ -49,9 +50,10 @@ counters already folded into an aggregate. It is best-effort:
 - If a domain's untagged rate becomes ambiguous (conflicting advertisements), it
   stops scaling **subsequent** records for that sampler (factor 1) rather than
   mis-scaling them; records already folded keep the rate that was applied then,
-  so a rolled-up total can mix scaled and unscaled contributions. A **NetFlow
-  v5** header `sampling_interval` is parsed but not yet applied, so v5 counters
-  are never scaled.
+  so a rolled-up total can mix scaled and unscaled contributions.
+- A rate scoped finer than the observation domain (per interface, line card, …)
+  that carries no `flowSamplerId` / `selectorId` cannot be matched to a flow and
+  is ignored rather than applied domain-wide.
 - `selectionSequenceId` (IE 301) is **not** interpreted, so a flow that tags its
   sampler only that way is treated as the domain sampler: scaled by a domain-wide
   rate if one is configured (which may not be its true rate), and unscaled

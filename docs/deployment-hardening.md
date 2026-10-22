@@ -43,9 +43,9 @@ record:
   subsequent record with an unrecognised key is rejected and discarded, incrementing
   `flows_dropped`. Existing resident flows continue accumulating, but legitimate
   new traffic is dropped.
-- **Memory Footprint**: On LP64 (64-bit Linux) architectures, `FlowKey` occupies 56 bytes
-  and `FlowRecord` occupies 208 bytes, meaning each stored flow key-value pair requires
-  at least 264 bytes of raw payload. When factoring in `DashMap` internal sharding,
+- **Memory Footprint**: On LP64 (64-bit Linux) architectures, `FlowKey` occupies 64 bytes
+  and `FlowRecord` occupies 224 bytes, meaning each stored flow key-value pair requires
+  at least 288 bytes of raw payload. When factoring in `DashMap` internal sharding,
   spare bucket capacity as tables double, control bytes, and allocator fragmentation,
   measured resident memory is approximately **550–600 bytes per entry**:
   - **500,000 flows**: ~275–300 MB RSS.

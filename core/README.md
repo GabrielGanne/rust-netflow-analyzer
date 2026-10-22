@@ -28,10 +28,10 @@ record to a sink without touching the flow cache.
 The engine performs additive flow aggregation keyed by
 `(exporter_key, Scope, identity)`, with idle-timeout eviction and active-timeout
 rollover (periodic intermediate dumps), and normalizes counters by the sampling
-rate advertised in NetFlow v9 / IPFIX options records. Flow deduplication
-(max-instead-of-sum and cross-observation-point), bidirectional (biflow)
-aggregation, and empty-record dropping are **out of scope** for this release;
-NetFlow v5 header sampling is not yet applied. Timeout-based emission runs on the
+rate advertised in NetFlow v9 / IPFIX options records or the NetFlow v5 header.
+Flow deduplication (max-instead-of-sum and cross-observation-point),
+bidirectional (biflow) aggregation, and empty-record dropping are **out of
+scope** for this release. Timeout-based emission runs on the
 background aging worker, which a Rust caller must start with `start_aging`. See
 the [aggregation semantics doc][agg] for the full model and its limitations.
 

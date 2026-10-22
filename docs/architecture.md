@@ -67,7 +67,7 @@ The parser processes datagram buffers directly without copying payloads onto the
 
 ### 2. Exporter Identity and Scoping
 All internal state is scoped by `(exporter_key, Scope)`:
-- `exporter_key`: An opaque 64-bit integer supplied by the caller, distinguishing transport sessions (e.g. peer socket address, interface, or router instance).
+- `exporter_key`: An opaque 128-bit integer (`ExporterKey = u128`; C callers pass a `uint64_t` or a 16-byte key via the `*_addr` entry points) supplied by the caller, distinguishing transport sessions (e.g. peer socket address, interface, or router instance).
 - `Scope`: Encodes the protocol discriminator (`NetFlow v9`, `IPFIX`, or `NetFlow v5 Engine`) and observation domain ID, preventing domain collisions between distinct protocols or independent devices.
 
 ### 3. Sampling Normalization
