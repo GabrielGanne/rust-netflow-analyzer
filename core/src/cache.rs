@@ -87,13 +87,17 @@ impl TemplateCache {
         now_ns: u64,
     ) -> bool {
         self.observe(now_ns);
+        // Definitions are stamped with the latest time seen, so a definition
+        // received after a clock rollback is not already expired for queries
+        // evaluated at that latest time.
+        let defined_at_ns = self.latest().max(now_ns);
         let key = (exporter, scope, template.template_id);
         for attempt in 0..2 {
             match self.map.entry(key) {
                 Entry::Occupied(mut entry) => {
                     // An out-of-order or clock-rolled-back refresh replaces the
                     // layout but never shortens the newest definition's lifetime.
-                    let defined_at_ns = entry.get().defined_at_ns.max(now_ns);
+                    let defined_at_ns = entry.get().defined_at_ns.max(defined_at_ns);
                     entry.insert(CachedTemplate {
                         record: Arc::new(template),
                         defined_at_ns,
@@ -106,9 +110,9 @@ impl TemplateCache {
                     if self.reserve_slot() {
                         drop(entry.insert(CachedTemplate {
                             record: Arc::new(template),
-                            defined_at_ns: now_ns,
+                            defined_at_ns,
                         }));
-                        self.note_definition(now_ns);
+                        self.note_definition(defined_at_ns);
                         return true;
                     }
                 }
@@ -793,6 +797,19 @@ mod tests {
         assert!(cache.insert(1, scope, sample_template(256), T0));
         assert!(cache.get(1, scope, 256, T0 - 3600 * SECOND).is_some());
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn template_defined_after_clock_rollback_survives_latest_queries() {
+        let cache = TemplateCache::with_lifetime(1, Duration::from_secs(1800));
+        let scope = Scope::V9Domain(1);
+        assert!(cache.get(1, scope, 256, T0).is_none());
+        let rolled_back = T0 - 3600 * SECOND;
+        assert!(cache.insert(1, scope, sample_template(256), rolled_back));
+
+        assert!(cache.get_latest(1, scope, 256).is_some());
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(1, scope, 256, rolled_back + SECOND).is_some());
     }
 
     #[test]
