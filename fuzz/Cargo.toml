@@ -1,0 +1,30 @@
+[package]
+name = "netflow_analyzer_fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MPL-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+netflow_analyzer_core = { path = "../core" }
+
+# Kept out of the main workspace: it builds only on nightly with cargo-fuzz.
+[workspace]
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stateful"
+path = "fuzz_targets/stateful.rs"
+test = false
+doc = false
+bench = false

@@ -3,7 +3,7 @@
 CARGO  ?= cargo
 HEADER := ffi/include/netflow-analyzer.h
 
-.PHONY: all build release test check header c-example bench clean deny install uninstall
+.PHONY: all build release test check header c-example bench fuzz clean deny install uninstall
 
 all: build
 
@@ -39,6 +39,12 @@ c-example: release
 
 bench:
 	./tools/bench.sh
+
+# Run every fuzz target for FUZZ_SECONDS each (requires cargo-fuzz and the
+# nightly toolchain pinned in fuzz/rust-toolchain.toml).
+FUZZ_SECONDS ?= 60
+fuzz:
+	./tools/fuzz.sh $(FUZZ_SECONDS)
 
 # Install the C header, the static and shared libraries, and a pkg-config file
 # (netflow-analyzer.pc) so C projects can consume the library as an external

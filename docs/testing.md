@@ -63,6 +63,35 @@ Additional Criterion arguments can be passed after the command, for example
   `target/criterion/environment/<timestamp>.txt` before each run. Compare
   results only between runs whose environment files match.
 
+## Optional robustness tools
+
+These need tools beyond the stable toolchain, so they are not part of
+`tools/test.sh`.
+
+Fuzzing needs `cargo install cargo-fuzz` and the nightly pinned in
+`fuzz/rust-toolchain.toml` (`rustup toolchain install nightly-2026-10-01
+--component rust-src`):
+
+```sh
+./tools/fuzz.sh            # every target, 60 s each
+./tools/fuzz.sh 600 packet # one target, 10 minutes
+```
+
+- `packet` feeds one datagram to fresh decode-only and fused contexts and
+  checks they agree, that every decoded record reaches the sink, and that
+  aging drains the cache.
+- `stateful` feeds a sequence of `[len:u16, delay_secs:u8, packet]` frames to
+  one small-capacity context (an empty packet runs `age_at`), so templates
+  learned in one packet decode later ones, and checks the cache bounds.
+- `fuzz/seeds/<target>/` holds the checked-in seeds: v5, v9 and IPFIX
+  template/data, options/sampling, padding, enterprise and variable-length
+  fields, template withdrawal and redefinition, and a truncated header.
+  libFuzzer writes new inputs to the ignored `fuzz/corpus/`; crashes land in
+  `fuzz/artifacts/`.
+
+The fuzz crate is outside the workspace, so `cargo deny` does not cover it;
+`libfuzzer-sys` adds the NCSA license, which is used only to build the fuzzers.
+
 ## Planned additions
 
 1. Stabilize the local gate. The rustfmt drift is resolved, and
