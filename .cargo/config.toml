@@ -1,0 +1,5 @@
+# Prefer dependency versions compatible with the workspace `rust-version`
+# when resolving (cargo 1.84+), so `cargo update` keeps the lockfile usable on
+# the MSRV toolchain.
+[resolver]
+incompatible-rust-versions = "fallback"

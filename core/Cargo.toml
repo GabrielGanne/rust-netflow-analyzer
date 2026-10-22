@@ -11,11 +11,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-nom = "7.1"
-dashmap = "6.0"
+nom = "8.0"
+dashmap = "6.2"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.7"
 
 # The reference OS-socket listener in `examples/udp_listener.rs` is auto-discovered
 # by cargo and packaged with the crate; no explicit `[[example]]` target needed.

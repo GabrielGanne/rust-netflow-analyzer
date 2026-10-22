@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Flow aging and template expiry use each packet's receipt time (Unix nanoseconds) instead of the local monotonic clock, so `*_at` timestamps drive them. Do not mix wall-clock and `*_at` entry points on one context. `FlowRecord::from_fields` takes `now_ns: u64` instead of an `Instant`.
 - The aging worker waits on a condition variable instead of 100 ms sleep slices: `scan_interval` below 100 ms is honoured, and `stop_aging` / `netflow_analyzer_destroy` return without waiting for the slice to end.
+- Dependencies: `nom` 8.0 (from 7.1) and `dashmap` 6.2; benchmarks use `criterion` 0.7, the newest release supporting Rust 1.82.
 - C ABI version bumped to 3 (`NetflowAnalyzerFlowRecord::exporter_key_hi` takes the first reserved slot).
 - Documented that `flows_output`, `flows_dropped` and `active_flows` are flow-cache counters, always `0` on the decode-only path.
 
