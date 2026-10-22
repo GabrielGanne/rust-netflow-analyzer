@@ -21,30 +21,10 @@
 - [ ] Add sanitizer/Miri coverage where supported for unsafe FFI lifecycle and
   concurrency paths.
 
-## Pending actions
-
-- [ ] Reject unmatched scoped rates instead of treating them as domain-wide
-
 ## Before publishing
 
-- [ ] Reconcile versioning: CHANGELOG dates 0.1.0 to 2026-09-28, but nothing is
-  tagged or published, and Unreleased holds breaking changes (C ABI v3,
-  `ExporterKey = u128`). Fold them into 0.1.0 or bump the version, then tag.
-- [ ] Fix the broken `docs/abi.md` link in `ffi/README.md` (the file does not
-  exist): write the ABI stability document or retarget the link.
-- [ ] Use absolute repository URLs in `core/README.md` and `ffi/README.md`;
-  relative links such as `../core` and `../docs/` break on crates.io/docs.rs.
-- [ ] Update `netflow-analyzer-migration.md`: it still describes a 64-bit
-  `uint64_t exporter_key` and omits the 128-bit `*_addr` entry points. Move it
-  under `docs/`, and confirm that comparing against the third-party
-  `netflow.h` parser is suitable for a public repository.
-- [ ] Remove internal roadmap wording from public sources ("Phase 1" in
-  `core/examples/udp_listener.rs`, "Phase 4" below).
-- [ ] Rename `ffi/cbndgen.toml` to `cbindgen.toml` (typo) and update the
-  Makefile.
-- [ ] Make the root `LICENSE` and the `core/`/`ffi/` copies byte-identical
-  (they differ by one byte), and run `reuse lint`.
+- [ ] Date the 0.2.0 CHANGELOG entry and tag the release (see RELEASING.md).
 
 ## To investigate
 
-- [ ] Phase 4: implement the dpdk_runner crate (high-performance packet source).
+- [ ] Implement the dpdk_runner crate (high-performance packet source).
