@@ -8,9 +8,29 @@
 //! production model where one engine is shared across workers) and repeatedly
 //! feeds it a pre-built datagram, so we measure the steady-state decode + cache
 //! upsert cost rather than one-off allocation noise.
+//!
+//! Workload dimensions:
+//! - `process_packet`: the original cases. Their v9/IPFIX packets carry the
+//!   template, so every iteration also redefines it.
+//! - `v9_records_per_packet`: records per datagram (and so datagram size), with
+//!   the template either warm (sent once, data-only packets) or resent in
+//!   every packet.
+//! - `flow_cache`: cache hits (a pre-warmed pool of flows) versus misses
+//!   (every record is a new flow).
+//!
+//! `tools/bench.sh` records the environment next to the Criterion results.
+
+use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use netflow_analyzer_core::FlowContext;
+
+/// Length of the v9 header plus the template FlowSet built by [`v9_packet`].
+const V9_TEMPLATE_PREFIX: usize = 20 + 36;
+/// Length of one v9 data record built by [`v9_packet`].
+const V9_RECORD_LEN: usize = 21;
+/// Offset of the first record's source address within a data-only packet.
+const V9_DATA_SRC_OFFSET: usize = 20 + 4 + 8;
 
 /// Minimal big-endian writer used to assemble synthetic packets.
 struct Builder {
@@ -147,8 +167,8 @@ fn v5_packet(records: usize) -> Vec<u8> {
 fn bench_process_packet(c: &mut Criterion) {
     let mut group = c.benchmark_group("process_packet");
 
-    // NetFlow v9: template set + a single data record, replayed on a warm
-    // context so the template is already cached after the first iteration.
+    // NetFlow v9: template set + a single data record, replayed on one
+    // context. The template is redefined by every packet.
     {
         let packet = v9_packet(1);
         group.throughput(Throughput::Elements(1));
@@ -176,7 +196,8 @@ fn bench_process_packet(c: &mut Criterion) {
         });
     }
 
-    // IPFIX: template set + one data record on a warm context.
+    // IPFIX: template set + one data record; the template is redefined by
+    // every packet.
     {
         let packet = ipfix_packet();
         group.throughput(Throughput::Elements(1));
@@ -223,5 +244,111 @@ fn bench_process_packet(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_process_packet);
+/// `v9_packet(records)` without its template FlowSet: header + data FlowSet.
+fn v9_data_only_packet(records: usize) -> Vec<u8> {
+    let full = v9_packet(records);
+    [&full[..20], &full[V9_TEMPLATE_PREFIX..]].concat()
+}
+
+/// Rewrites every record's source address so the packet carries the
+/// `records` flows starting at `first_flow`.
+fn set_flows(packet: &mut [u8], records: usize, first_flow: u32) {
+    for i in 0..records {
+        let at = V9_DATA_SRC_OFFSET + i * V9_RECORD_LEN;
+        let src = first_flow.wrapping_add(i as u32);
+        packet[at..at + 4].copy_from_slice(&src.to_be_bytes());
+    }
+}
+
+fn bench_records_per_packet(c: &mut Criterion) {
+    let mut group = c.benchmark_group("v9_records_per_packet");
+    // 60 records of 21 bytes fill a 1500-byte MTU datagram.
+    for records in [1usize, 10, 30, 60] {
+        group.throughput(Throughput::Elements(records as u64));
+
+        let data = v9_data_only_packet(records);
+        group.bench_function(format!("warm_template/{records}r_{}B", data.len()), |b| {
+            let ctx = FlowContext::new();
+            ctx.process_packet(&v9_packet(0)).expect("template ok");
+            b.iter(|| {
+                let n = ctx.process_packet(black_box(&data)).expect("parse ok");
+                assert_eq!(n, records);
+            });
+        });
+
+        let full = v9_packet(records);
+        group.bench_function(format!("template_resent/{records}r_{}B", full.len()), |b| {
+            let ctx = FlowContext::new();
+            b.iter(|| {
+                let n = ctx.process_packet(black_box(&full)).expect("parse ok");
+                assert_eq!(n, records);
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_flow_cache(c: &mut Criterion) {
+    const RECORDS: usize = 30;
+    /// Distinct flows cycled through by the hit case (all resident).
+    const HIT_POOL: u32 = 64 * 1024;
+    /// Packets timed between untimed flushes in the miss case, bounding the
+    /// cache to `MISS_CHUNK * RECORDS` flows.
+    const MISS_CHUNK: u64 = 4096;
+
+    let mut group = c.benchmark_group("flow_cache");
+    group.throughput(Throughput::Elements(RECORDS as u64));
+
+    group.bench_function("hit_64k_resident", |b| {
+        let ctx = FlowContext::new();
+        let mut packet = v9_data_only_packet(RECORDS);
+        ctx.process_packet(&v9_packet(0)).expect("template ok");
+        for first in (0..HIT_POOL).step_by(RECORDS) {
+            set_flows(&mut packet, RECORDS, first);
+            ctx.process_packet(&packet).expect("parse ok");
+        }
+        let resident = ctx.active_flows();
+        let mut first = 0u32;
+        b.iter(|| {
+            set_flows(&mut packet, RECORDS, first);
+            first = (first + RECORDS as u32) % HIT_POOL;
+            black_box(ctx.process_packet(black_box(&packet)).expect("parse ok"));
+        });
+        assert_eq!(ctx.active_flows(), resident, "every record was a hit");
+    });
+
+    group.bench_function("miss_new_flow", |b| {
+        let ctx = FlowContext::new();
+        let mut packet = v9_data_only_packet(RECORDS);
+        ctx.process_packet(&v9_packet(0)).expect("template ok");
+        b.iter_custom(|iters| {
+            let mut elapsed = Duration::ZERO;
+            let mut first = 0u32;
+            let mut done = 0u64;
+            while done < iters {
+                let chunk = MISS_CHUNK.min(iters - done);
+                let start = Instant::now();
+                for _ in 0..chunk {
+                    set_flows(&mut packet, RECORDS, first);
+                    first = first.wrapping_add(RECORDS as u32);
+                    black_box(ctx.process_packet(black_box(&packet)).expect("parse ok"));
+                }
+                elapsed += start.elapsed();
+                done += chunk;
+                ctx.flush(|_| {});
+            }
+            assert_eq!(ctx.stats().flows_dropped, 0, "misses were admitted");
+            elapsed
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_process_packet,
+    bench_records_per_packet,
+    bench_flow_cache
+);
 criterion_main!(benches);

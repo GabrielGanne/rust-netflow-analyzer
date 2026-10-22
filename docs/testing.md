@@ -54,8 +54,14 @@ Additional Criterion arguments can be passed after the command, for example
   codes for null and empty inputs. Its companion
   checks compile the header as C11 and C++11, pin every public structure field
   offset, link-probe each API function, and verify the exported symbol set.
-- `core/benches/process_packet.rs` provides v5, v9, IPFIX, warm-cache, and
-  cold-context throughput cases.
+- `core/benches/process_packet.rs` provides v5, v9, IPFIX, and cold-context
+  throughput cases; v9 at 1/10/30/60 records per packet (up to a 1500-byte
+  datagram) with a warm versus resent template; and flow-cache hits (64k
+  resident flows) versus misses (every record a new flow).
+- `tools/bench.sh` writes the commit, dirty state, kernel, CPU model and
+  count, frequency governor, `RUSTFLAGS`, and toolchain to
+  `target/criterion/environment/<timestamp>.txt` before each run. Compare
+  results only between runs whose environment files match.
 
 ## Planned additions
 

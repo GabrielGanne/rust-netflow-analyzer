@@ -12,7 +12,7 @@
   require deterministic time.
 - [x] Expand the runnable C example to cover decode-only callbacks, callback
   field values, null/empty inputs, and explicit timestamps.
-- [ ] Keep benchmark workloads representative and runnable locally; cover packet
+- [x] Keep benchmark workloads representative and runnable locally; cover packet
   size, records per packet, template warmness, cache hit/miss behavior, and
   cold versus warm contexts. Record environment details when comparing runs.
 - [ ] Add a packet-parser fuzz crate with checked-in seeds for headers, FlowSets,
