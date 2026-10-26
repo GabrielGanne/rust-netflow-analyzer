@@ -71,7 +71,8 @@ This checks formatting (`cargo fmt --check`), runs debug and release tests acros
 
 1. **Concurrent Packet Ingestion**:
    - `FlowContext` is thread-safe (`Send + Sync`) and designed to be shared via `Arc` across worker threads.
-   - Concurrent `process_packet*` and `decode_packet*` calls access sharded cache buckets independently without contending on a global mutex.
+   - Flow-cache ingestion is sharded: concurrent `process_packet*` calls update flow records through independent shard locks, without a cache-wide mutex. Template lookups, clock, and sampling state are sharded the same way.
+   - Template maintenance is shared: every template definition or refresh, capacity reclamation when the template cache is full, and template expiry sweeps take one template-cache-wide mutex, so template traffic from different exporters can contend on it.
 2. **Single Controlling Thread**:
    - Engine lifecycle transitions — `start_aging`, `stop_aging`, `netflow_analyzer_create`, and `netflow_analyzer_destroy` — must be driven by a **single controlling thread**.
    - Initiating shutdown or calling `stop_aging` from within an emission callback (on the background aging thread) is misuse; as a safety measure, the worker detaches to prevent deadlocks, but synchronous termination is not guaranteed in that case.

@@ -53,8 +53,9 @@ record:
   Operators should budget at least 600 MB of heap memory per 1,000,000 configured flows.
   Unbounded or oversized configurations risk out-of-memory (OOM) process termination.
 - **CPU & Hash Contention**: Ingesting massive volumes of distinct keys stresses
-  hash table operations across the internal `DashMap` shards. While sharding prevents
-  a single global lock, concurrent lookups and inserts still compete for shard locks.
+  hash table operations across the internal `DashMap` shards. Sharding avoids a
+  single flow-cache lock, but concurrent lookups and inserts still compete for shard
+  locks, and template definitions and expiry sweeps share one template-cache mutex.
 - **Aging Sweep Overhead**: The background aging worker periodically scans cache
   shards to evict idle flows (`idle_timeout`) and roll over active flows (`active_timeout`).
   When millions of entries reside in memory, each sweep consumes noticeable CPU and

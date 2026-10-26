@@ -202,8 +202,10 @@ impl Default for EngineConfig {
 /// The core ingestion and state-tracking engine.
 ///
 /// A single `FlowContext` is shared (via `Arc`) across all worker threads. Its
-/// caches are internally sharded, so concurrent `process_packet` calls do not
-/// contend on a global lock.
+/// caches are internally sharded, so concurrent `process_packet` calls update
+/// flow records without a cache-wide lock. Template definitions, template
+/// capacity reclamation, and template expiry sweeps share one
+/// template-cache-wide mutex across all exporters.
 ///
 /// # Time domains
 ///
