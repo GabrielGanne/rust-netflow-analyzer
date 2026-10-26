@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Ignore IPFIX (Options) Template Withdrawals, as RFC 7011 §8.4 requires of UDP collectors, instead of replacing the cached definition with an empty one; the policy applies to every transport. Parse 4-byte Options Template Withdrawal records without misaligning the Set.
+
 ## [0.2.0] - 2026-10-22
 
 ### Added

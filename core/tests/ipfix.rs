@@ -164,6 +164,72 @@ fn options_sampling_scales_ipfix_flow_counters() {
     assert_eq!(flows[0].proto, 6);
 }
 
+/// An IPFIX message for domain 7 made of the given `(set id, body)` Sets.
+fn ipfix_message(sets: &[(u16, &[u8])]) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.put(10, 2)
+        .put(0, 2)
+        .put(1_700_000_000, 4)
+        .put(1, 4)
+        .put(7, 4);
+    for &(set_id, body) in sets {
+        b.put(set_id as u64, 2).put(4 + body.len() as u64, 2);
+        b.buf.extend_from_slice(body);
+    }
+    set_ipfix_total_length(&mut b.buf);
+    b.buf
+}
+
+#[test]
+fn udp_template_withdrawals_are_ignored() {
+    // RFC 7011 §8.4: a UDP collector must ignore Template Withdrawals. Both a
+    // specific withdrawal and the "withdraw all" id (2) leave the cached
+    // definition in place without consuming another slot.
+    let template = [0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x08]; // 256: octetDeltaCount/8
+    let data = 1500u64.to_be_bytes();
+    let ctx = FlowContext::new();
+    assert_eq!(ctx.process_packet(&ipfix_message(&[(2, &template)])), Ok(0));
+
+    let withdrawals: [&[u8]; 2] = [&[0x01, 0x00, 0x00, 0x00], &[0x00, 0x02, 0x00, 0x00]];
+    for withdrawal in withdrawals {
+        let msg = ipfix_message(&[(2, withdrawal), (256, &data)]);
+        assert_eq!(ctx.process_packet(&msg), Ok(1));
+    }
+    let stats = ctx.stats();
+    assert_eq!(ctx.active_templates(), 1);
+    assert_eq!(
+        stats.templates_received, 1,
+        "withdrawals are not definitions"
+    );
+    assert_eq!(stats.malformed_packets, 0);
+}
+
+#[test]
+fn udp_options_template_withdrawals_are_ignored() {
+    let template = [
+        0x01, 0x04, 0x00, 0x02, 0x00, 0x01, // 260: 2 fields, 1 scope
+        0x00, 0x95, 0x00, 0x04, // observationDomainId/4
+        0x00, 0x22, 0x00, 0x04, // samplingInterval/4
+    ];
+    let data = [0, 0, 0, 7, 0, 0, 0x03, 0xE8];
+    let ctx = FlowContext::new();
+    assert_eq!(ctx.process_packet(&ipfix_message(&[(3, &template)])), Ok(0));
+
+    // Options withdrawals are 4 bytes (RFC 7011 §8.1); several in one Set must
+    // stay aligned rather than being misread as a 6-byte options header.
+    let withdrawals = [
+        0x01, 0x04, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00,
+    ];
+    let msg = ipfix_message(&[(3, &withdrawals), (260, &data)]);
+    assert_eq!(ctx.process_packet(&msg), Ok(0));
+
+    let stats = ctx.stats();
+    assert_eq!(ctx.active_templates(), 1);
+    assert_eq!(stats.options_templates_received, 1);
+    assert_eq!(stats.options_records_processed, 1);
+    assert_eq!(stats.malformed_packets, 0);
+}
+
 #[test]
 fn trailing_bytes_beyond_total_length_are_ignored() {
     // Bytes past the declared message length must not be walked: appending

@@ -473,15 +473,18 @@ pub(crate) fn parse_v9_options_template_set(
 fn parse_ipfix_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
     let (input, template_id) = be_u16(input)?;
     let (input, field_count) = be_u16(input)?;
+    // A withdrawal record is only the 4-byte id + zero count (RFC 7011 §8.1).
+    if field_count == 0 {
+        return Ok((
+            input,
+            TemplateRecord::from_options_fields(template_id, 0, Vec::new()),
+        ));
+    }
     let (input, scope_field_count) = be_u16(input)?;
 
     // Validate per RFC 7011 §3.4.2.2: a definition must use a non-reserved
-    // template id and a scope count in 1..=field_count. A record with
-    // field_count 0 is a Template Withdrawal (§8.1), exempt from these rules.
-    if field_count != 0
-        && (template_id < FIRST_DATA_SET_ID
-            || scope_field_count == 0
-            || scope_field_count > field_count)
+    // template id and a scope count in 1..=field_count.
+    if template_id < FIRST_DATA_SET_ID || scope_field_count == 0 || scope_field_count > field_count
     {
         return Err(validation_error(input));
     }
@@ -500,8 +503,8 @@ pub(crate) fn parse_ipfix_options_template_set(
     mut body: &[u8],
 ) -> IResult<&[u8], Vec<TemplateRecord>> {
     let mut templates = Vec::new();
-    // Minimum record is the 6-byte header (id + two count fields).
-    while body.len() >= 6 {
+    // Minimum record is the 4-byte withdrawal (id + zero field count).
+    while body.len() >= 4 {
         let (rest, template) = parse_ipfix_options_template_record(body)?;
         body = rest;
         templates.push(template);

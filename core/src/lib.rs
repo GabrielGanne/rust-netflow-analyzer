@@ -156,6 +156,16 @@ fn v5_sampling_ratio(sampling_interval: u16) -> SamplingRatio {
     }
 }
 
+/// Returns false for a Template Withdrawal (a zero-field record, RFC 7011 §8.1).
+///
+/// Withdrawals are ignored for every transport: RFC 7011 §8.4 requires UDP
+/// collectors to ignore them, and the transport-agnostic core cannot tell a
+/// reliable session apart. Templates instead age out via the template lifetime
+/// or are dropped by an explicit exporter purge.
+fn is_definition(template: &parser::TemplateRecord) -> bool {
+    !template.fields.is_empty()
+}
+
 /// Current wall-clock time as Unix nanoseconds, saturating at `u64::MAX`.
 pub(crate) fn now_unix_ns() -> u64 {
     SystemTime::now()
@@ -509,7 +519,7 @@ impl FlowContext {
                 id if id == FLOWSET_ID_V9_TEMPLATE || id == SET_ID_IPFIX_TEMPLATE => {
                     match parser::parse_template_set(body) {
                         Ok((_, templates)) => {
-                            for template in templates {
+                            for template in templates.into_iter().filter(is_definition) {
                                 self.counters
                                     .templates_received
                                     .fetch_add(1, Ordering::Relaxed);
@@ -604,7 +614,7 @@ impl FlowContext {
         templates: Vec<parser::TemplateRecord>,
         now_ns: u64,
     ) {
-        for template in templates {
+        for template in templates.into_iter().filter(is_definition) {
             self.counters
                 .options_templates_received
                 .fetch_add(1, Ordering::Relaxed);
