@@ -77,7 +77,7 @@ Options templates configure packet sampling rates (`samplingInterval` IE 34, `sa
 
 ### 4. Dual Ingestion Pipelines
 - **Fused Aggregation (`process_packet*`)**: Folds decoded flow records into the internal flow table, performing additive stitching for identical keys and updating observation timestamps.
-- **Stateless Decode-Only (`decode_packet*`)**: Updates template definitions and clock state but bypasses the flow cache, invoking a user callback per record for consumers managing their own aggregation pipeline.
+- **Decode-Only (`decode_packet*`)**: Bypasses the flow cache, invoking a user callback per record for consumers managing their own aggregation pipeline. Decoding is still stateful: template and options-template definitions, exporter clock state, and learned sampling ratios are retained per `(exporter_key, Scope)` across calls. A data packet decodes only on the context, and under the exporter key, that previously received its templates; a fresh context or a different key emits no records for it. Templates expire through `age_at` or the aging worker (`netflow_analyzer_age_at` for a C decode-only context, which starts no worker); call `purge_exporter` when a transport session ends or restarts to drop its templates, clock, and sampling state.
 
 ### 5. Concurrent Sharded State and Aging
 - The flow cache and template cache are internally sharded using `DashMap`, allowing concurrent worker threads to ingest packets without a global lock.

@@ -312,8 +312,9 @@ impl FlowContext {
 
     /// Decode-only counterpart of [`Self::process_packet`]: parses a datagram and
     /// emits each decoded data record through `sink` **without** touching the flow
-    /// cache. Template and options-template state is still updated (it is required
-    /// to decode), but no aggregation, timeouts, or eviction take place.
+    /// cache. Template, options-template, clock, and sampling state is still
+    /// updated and retained per exporter (it is required to decode later
+    /// packets), but no flow aggregation, timeouts, or eviction take place.
     ///
     /// The receipt timestamp defaults to the current wall clock. Use
     /// [`Self::decode_packet_at`] to supply a capture timestamp explicitly.

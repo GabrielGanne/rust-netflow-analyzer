@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Ignore IPFIX (Options) Template Withdrawals, as RFC 7011 §8.4 requires of UDP collectors, instead of replacing the cached definition with an empty one; the policy applies to every transport. Parse 4-byte Options Template Withdrawal records without misaligning the Set.
 - Dispatch template and options template Sets by packet protocol: NetFlow v9 accepts only FlowSet IDs 0 and 1, IPFIX only Set IDs 2 and 3. Inapplicable IDs are skipped like other reserved Sets instead of installing or replacing templates.
+- Documentation no longer calls the decode-only path stateless: it bypasses flow-cache aggregation but retains per-exporter template, clock, and sampling state across calls.
 
 ## [0.2.0] - 2026-10-22
 

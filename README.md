@@ -25,7 +25,7 @@ The workspace consists of two crates:
 
 ## Architecture
 
-The engine uses a zero-copy parser, an explicit session identity model, and fine-grained sharded state across both a fused aggregation pipeline and a stateless decode-only path.
+The engine uses a zero-copy parser, an explicit session identity model, and fine-grained sharded state across both a fused aggregation pipeline and a decode-only path. The decode-only path bypasses flow-cache aggregation but still retains per-exporter template, clock, and sampling state across calls, so packets from one exporter session must be decoded through the same context and exporter key.
 
 See the dedicated [Architecture Documentation](docs/architecture.md) for full pipeline diagrams and component details.
 

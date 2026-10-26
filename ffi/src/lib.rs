@@ -16,7 +16,8 @@
 //! - **Lifecycle**: `netflow_analyzer_create` creates an engine instance and starts the
 //!   background aging worker; `netflow_analyzer_destroy` stops aging and reclaims all resources.
 //! - **Packet Processing**: `netflow_analyzer_process_packet` (fused decode + aggregation)
-//!   and `netflow_analyzer_decode_packet` (stateless per-record callback).
+//!   and `netflow_analyzer_decode_packet` (per-record callback without flow-cache
+//!   aggregation; template, clock, and sampling state is still retained per exporter).
 //! - **Exporter Scoping**: Key-aware symbols (`_from` and `_from_at`) allow one engine
 //!   context to track multiple exporters concurrently without template or flow collisions.
 //! - **Telemetry**: `netflow_analyzer_get_stats` returns a point-in-time snapshot of
