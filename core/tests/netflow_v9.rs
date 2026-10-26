@@ -9,7 +9,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use common::{sample_v9_packet, Builder};
+use common::{flowset, packet, sample_v9_packet, template_record, v9_header, Builder};
 use netflow_analyzer_core::records::FlowRecord;
 use netflow_analyzer_core::sampling::{SamplerSelector, SamplingRatio};
 use netflow_analyzer_core::scope::{Scope, SINGLE_EXPORTER};
@@ -507,6 +507,46 @@ fn unknown_reserved_set_id_is_skipped() {
 
     let ctx = FlowContext::new();
     assert_eq!(ctx.process_packet(&b.buf).expect("parse ok"), 0);
+}
+
+#[test]
+fn ipfix_template_set_ids_are_ignored() {
+    // NetFlow v9 does not use the IPFIX Set IDs 2 and 3. Neither may install a
+    // template nor replace the one defined through FlowSet ID 0.
+    let ipfix_options = [
+        0x01, 0x04, 0x00, 0x02, 0x00, 0x01, // 260: 2 fields, 1 scope
+        0x00, 0x95, 0x00, 0x04, // observationDomainId/4
+        0x00, 0x22, 0x00, 0x04, // samplingInterval/4
+    ];
+    let ctx = FlowContext::new();
+    let pkt = packet(
+        v9_header(42),
+        &[
+            flowset(2, &template_record(256, &[(1, 8)])),
+            flowset(256, &[0; 8]),
+            flowset(3, &ipfix_options),
+            flowset(260, &[0, 0, 0, 7, 0, 0, 0x03, 0xE8]),
+        ],
+    );
+    assert_eq!(ctx.process_packet(&pkt), Ok(0));
+    assert_eq!(ctx.active_templates(), 0);
+
+    let pkt = packet(
+        v9_header(42),
+        &[
+            flowset(0, &template_record(256, &[(1, 8)])),
+            flowset(2, &template_record(256, &[(4, 4)])),
+            flowset(256, &1500u64.to_be_bytes()),
+        ],
+    );
+    assert_eq!(ctx.process_packet(&pkt), Ok(1));
+
+    let stats = ctx.stats();
+    assert_eq!(ctx.active_templates(), 1);
+    assert_eq!(stats.templates_received, 1);
+    assert_eq!(stats.options_templates_received, 0);
+    assert_eq!(stats.options_records_processed, 0);
+    assert_eq!(stats.malformed_packets, 0);
 }
 
 #[test]

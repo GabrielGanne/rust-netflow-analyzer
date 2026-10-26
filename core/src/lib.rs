@@ -495,6 +495,13 @@ impl FlowContext {
         // (e.g. an old 4-byte template splitting one new 8-byte record into two),
         // silently corrupting flows.
         let mut rejected_template = false;
+        // Template Set IDs are protocol-specific: NetFlow v9 uses 0 and 1, IPFIX
+        // uses 2 and 3. An inapplicable ID is reserved for that protocol and
+        // skipped like any other reserved Set, so it never installs a template.
+        let (template_set_id, options_set_id) = match header {
+            ParsedHeader::Ipfix(_) => (SET_ID_IPFIX_TEMPLATE, SET_ID_IPFIX_OPTIONS),
+            _ => (FLOWSET_ID_V9_TEMPLATE, FLOWSET_ID_V9_OPTIONS),
+        };
 
         // Walk each FlowSet/Set in the payload. A structural inconsistency stops
         // the walk without panicking; the unconsumed remainder is detected after
@@ -516,27 +523,25 @@ impl FlowContext {
             payload = remainder;
 
             match fs.set_id {
-                id if id == FLOWSET_ID_V9_TEMPLATE || id == SET_ID_IPFIX_TEMPLATE => {
-                    match parser::parse_template_set(body) {
-                        Ok((_, templates)) => {
-                            for template in templates.into_iter().filter(is_definition) {
-                                self.counters
-                                    .templates_received
-                                    .fetch_add(1, Ordering::Relaxed);
-                                self.templates
-                                    .insert(exporter, scope, template, receipt_time_ns);
-                            }
-                        }
-                        Err(_) => {
-                            rejected_template = true;
-                            break;
+                id if id == template_set_id => match parser::parse_template_set(body) {
+                    Ok((_, templates)) => {
+                        for template in templates.into_iter().filter(is_definition) {
+                            self.counters
+                                .templates_received
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.templates
+                                .insert(exporter, scope, template, receipt_time_ns);
                         }
                     }
-                }
+                    Err(_) => {
+                        rejected_template = true;
+                        break;
+                    }
+                },
                 // Options templates describe the layout of options data records
                 // (exporter metadata). Decode and store them so their data sets
                 // can later be interpreted rather than silently dropped.
-                id if id == FLOWSET_ID_V9_OPTIONS => {
+                id if id == options_set_id && id == FLOWSET_ID_V9_OPTIONS => {
                     match parser::parse_v9_options_template_set(body) {
                         Ok((_, templates)) => self.store_options_templates(
                             exporter,
@@ -550,7 +555,7 @@ impl FlowContext {
                         }
                     }
                 }
-                id if id == SET_ID_IPFIX_OPTIONS => {
+                id if id == options_set_id && id == SET_ID_IPFIX_OPTIONS => {
                     match parser::parse_ipfix_options_template_set(body) {
                         Ok((_, templates)) => self.store_options_templates(
                             exporter,

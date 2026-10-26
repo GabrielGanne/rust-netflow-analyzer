@@ -231,6 +231,43 @@ fn udp_options_template_withdrawals_are_ignored() {
 }
 
 #[test]
+fn netflow_v9_template_set_ids_are_ignored() {
+    // RFC 7011 §3.3.2: Set IDs 0 and 1 are not used by IPFIX. Neither may
+    // install a template nor replace the one defined through Set ID 2.
+    let template = [0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x08]; // 256: octetDeltaCount/8
+    let v9_options = [
+        0x01, 0x04, 0x00, 0x04, 0x00, 0x04, // 260: 4-byte scope, 4-byte options
+        0x00, 0x01, 0x00, 0x04, // scope: System/4
+        0x00, 0x22, 0x00, 0x04, // samplingInterval/4
+    ];
+    let options_data = [0, 0, 0, 7, 0, 0, 0x03, 0xE8];
+    let ctx = FlowContext::new();
+    let msg = ipfix_message(&[
+        (0, &template),
+        (256, &[0; 8]),
+        (1, &v9_options),
+        (260, &options_data),
+    ]);
+    assert_eq!(ctx.process_packet(&msg), Ok(0));
+    assert_eq!(ctx.active_templates(), 0);
+
+    let replacement = [0x01, 0x00, 0x00, 0x01, 0x00, 0x04, 0x00, 0x04]; // 256: protocolIdentifier/4
+    let msg = ipfix_message(&[
+        (2, &template),
+        (0, &replacement),
+        (256, &1500u64.to_be_bytes()),
+    ]);
+    assert_eq!(ctx.process_packet(&msg), Ok(1));
+
+    let stats = ctx.stats();
+    assert_eq!(ctx.active_templates(), 1);
+    assert_eq!(stats.templates_received, 1);
+    assert_eq!(stats.options_templates_received, 0);
+    assert_eq!(stats.options_records_processed, 0);
+    assert_eq!(stats.malformed_packets, 0);
+}
+
+#[test]
 fn trailing_bytes_beyond_total_length_are_ignored() {
     // Bytes past the declared message length must not be walked: appending
     // garbage after `total_length` leaves decoding unchanged.
