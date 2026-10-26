@@ -272,13 +272,14 @@ fn variable_length_template_has_no_fixed_length() {
 #[test]
 fn split_fixed_records_discards_padding() {
     let body = [1u8, 2, 3, 4, 5, 6, 7]; // 7 bytes, record_len 3 -> 2 records + 1 pad
-    let records = split_fixed_records(&body, 3);
+    let mut records = split_fixed_records(&body, 3);
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0], &[1, 2, 3]);
-    assert_eq!(records[1], &[4, 5, 6]);
+    assert_eq!(records.next(), Some(&[1, 2, 3][..]));
+    assert_eq!(records.next(), Some(&[4, 5, 6][..]));
+    assert_eq!(records.next(), None);
 }
 
 #[test]
 fn split_fixed_records_zero_len_is_empty() {
-    assert!(split_fixed_records(&[1, 2, 3], 0).is_empty());
+    assert!(split_fixed_records(&[1, 2, 3], 0).next().is_none());
 }

@@ -645,11 +645,7 @@ impl FlowContext {
         let ratio = v5_sampling_ratio(header.sampling_interval);
         let mut decoded = 0usize;
         // Trust the header count but never read past the buffer.
-        let available = payload.len() / V5_RECORD_LEN;
-        for record in parser::split_fixed_records(payload, V5_RECORD_LEN)
-            .into_iter()
-            .take(count.min(available))
-        {
+        for record in parser::split_fixed_records(payload, V5_RECORD_LEN).take(count) {
             if let Some(mut fields) = FlowFields::from_v5_record_at(record, Some(time_context)) {
                 fields.bytes = ratio.expand(fields.bytes);
                 fields.packets = ratio.expand(fields.packets);

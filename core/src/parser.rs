@@ -516,12 +516,15 @@ pub(crate) fn parse_ipfix_options_template_set(
 ///
 /// This is the zero-copy hot path: each returned element borrows directly from
 /// the original packet buffer rather than copying record bytes onto the heap.
-pub(crate) fn split_fixed_records(body: &[u8], record_len: usize) -> Vec<&[u8]> {
+pub(crate) fn split_fixed_records(
+    body: &[u8],
+    record_len: usize,
+) -> std::slice::ChunksExact<'_, u8> {
     if record_len == 0 {
-        return Vec::new();
+        return [].chunks_exact(1);
     }
     // `chunks_exact` discards trailing padding shorter than a full record.
-    body.chunks_exact(record_len).collect()
+    body.chunks_exact(record_len)
 }
 
 #[cfg(test)]
