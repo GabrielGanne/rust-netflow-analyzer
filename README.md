@@ -99,7 +99,7 @@ To defend against Denial of Service (DoS) attacks and hostile input:
 ## Security Posture
 
 - **Memory Safety**: Pure Rust core engine without `unsafe` blocks in packet parsing or aggregation.
-- **Panic Boundaries**: FFI entry points are guarded with `catch_unwind` (`guard_ffi`), translating panics into error codes (`-1`) to prevent undefined behavior across `extern "C"` boundaries.
+- **Panic Boundaries**: FFI entry points are guarded with `catch_unwind` (`guard_ffi`), so panics never unwind across `extern "C"` boundaries. A caught panic makes integer-returning operations (packet processing and decoding, `netflow_analyzer_age_at`, purge) return `-4` (internal error; `-1` means invalid arguments), `netflow_analyzer_create` return null, and `netflow_analyzer_get_stats` return a zeroed snapshot; `netflow_analyzer_flush` and `netflow_analyzer_destroy` return normally with no error report.
 - **Hostile Input Hardening**:
   - Structural validation stops corrupted FlowSet chains gracefully.
   - Clock skew validation drops or rebases wildly drifted exporter timestamps before they can poison time bounds.

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dispatch template and options template Sets by packet protocol: NetFlow v9 accepts only FlowSet IDs 0 and 1, IPFIX only Set IDs 2 and 3. Inapplicable IDs are skipped like other reserved Sets instead of installing or replacing templates.
 - Documentation no longer calls the decode-only path stateless: it bypasses flow-cache aggregation but retains per-exporter template, clock, and sampling state across calls.
 - Documentation scopes the no-global-mutex claim to flow-cache ingestion: template definitions, capacity reclamation, and expiry sweeps share one template-cache-wide mutex.
+- README: caught FFI panics return `-4` (not `-1`) from integer-returning operations; documented the null, zeroed-stats, and void fallbacks.
 
 ## [0.2.0] - 2026-10-22
 
