@@ -109,3 +109,27 @@ fn v9_fixed_record_framing_does_not_allocate() {
 fn ipfix_fixed_record_framing_does_not_allocate() {
     assert_template_framing_does_not_allocate(true);
 }
+
+#[test]
+fn aging_without_flows_or_due_templates_does_not_allocate() {
+    let ctx = FlowContext::new();
+    let now = 1_700_000_000_000_000_000;
+    let definition = packet(
+        ipfix_header(1),
+        &[flowset(2, &template_record(256, &[(1, 8)]))],
+    );
+    ctx.decode_packet_at(&definition, now, &mut |_, _| {})
+        .expect("template parsed");
+    assert_eq!(ctx.age_at(now, |_| {}), 0);
+
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    let emitted = ctx.age_at(now + 1_000_000_000, |_| {});
+    let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+
+    assert_eq!(emitted, 0);
+    assert_eq!(allocations, 0);
+    assert_eq!(ctx.active_templates(), 1);
+
+    ctx.age_at(now + 31 * 60 * 1_000_000_000, |_| {});
+    assert_eq!(ctx.active_templates(), 0);
+}

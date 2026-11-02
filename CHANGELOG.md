@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `FlowContext::age_at` no longer iterates an empty flow cache, which locked and allocated a guard per map shard, and scans templates only when the earliest expiry is due. A call with nothing to age performs no allocation.
 - Fixed-width NetFlow v5/v9 and IPFIX record framing iterates over borrowed slices without allocating a temporary vector; NetFlow v5 applies its header record count during iteration.
 - Ignore IPFIX (Options) Template Withdrawals, as RFC 7011 §8.4 requires of UDP collectors, instead of replacing the cached definition with an empty one; the policy applies to every transport. Parse 4-byte Options Template Withdrawal records without misaligning the Set.
 - Dispatch template and options template Sets by packet protocol: NetFlow v9 accepts only FlowSet IDs 0 and 1, IPFIX only Set IDs 2 and 3. Inapplicable IDs are skipped like other reserved Sets instead of installing or replacing templates.

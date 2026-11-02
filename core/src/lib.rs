@@ -862,7 +862,7 @@ impl FlowContext {
         };
         self.flows
             .sweep(&self.aging_cfg, &self.counters, &counting, now_ns);
-        self.templates.sweep_expired(now_ns);
+        self.templates.sweep_due(now_ns);
         emitted.get()
     }
 

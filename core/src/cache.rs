@@ -199,6 +199,13 @@ impl TemplateCache {
         }
     }
 
+    /// Drops every template expired by `now_ns`, scanning only when the
+    /// earliest recorded expiry is due.
+    pub(crate) fn sweep_due(&self, now_ns: u64) {
+        self.observe(now_ns);
+        self.sweep_if_expired(now_ns);
+    }
+
     /// Drops every template expired by `now_ns` (Unix nanoseconds).
     pub(crate) fn sweep_expired(&self, now_ns: u64) {
         self.observe(now_ns);
@@ -396,6 +403,11 @@ impl FlowCache {
         let active = duration_ns(cfg.active_timeout);
         let idle_due = |r: &FlowRecord| now_ns.saturating_sub(r.last_observed_ns) >= idle;
         let active_due = |r: &FlowRecord| now_ns.saturating_sub(r.first_observed_ns) >= active;
+        // Slots are reserved before insertion, so a zero count means an empty
+        // map; iterating one would still lock and allocate a guard per shard.
+        if self.count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
 
         // Read pass: collect only the keys that currently look due. Holding
         // read locks here is safe because no user callback runs; each candidate
