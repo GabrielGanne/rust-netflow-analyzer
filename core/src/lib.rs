@@ -537,6 +537,7 @@ impl FlowContext {
         }
 
         let mut data_records = 0usize;
+        let mut v9_suffixes = Vec::new();
         let mut v9_remaining = match &header {
             ParsedHeader::V9(h) => Some(usize::from(h.count)),
             _ => None,
@@ -587,6 +588,7 @@ impl FlowContext {
             match fs.set_id {
                 id if id == template_set_id => match parser::parse_template_set(body, version) {
                     Ok((_, templates)) => {
+                        v9_suffixes.clear();
                         v9_remaining = v9_remaining.and_then(|n| n.checked_sub(templates.len()));
                         for template in templates.into_iter().filter(is_definition) {
                             self.counters
@@ -607,6 +609,7 @@ impl FlowContext {
                 id if id == options_set_id && id == FLOWSET_ID_V9_OPTIONS => {
                     match parser::parse_v9_options_template_set(body) {
                         Ok((_, templates)) => {
+                            v9_suffixes.clear();
                             v9_remaining =
                                 v9_remaining.and_then(|n| n.checked_sub(templates.len()));
                             self.store_options_templates(
@@ -647,12 +650,24 @@ impl FlowContext {
                             if let Some((minimum, maximum)) = v9_record_bounds(&template, body) {
                                 if minimum != maximum {
                                     let count = v9_remaining.and_then(|remaining| {
-                                        let (after_min, after_max) = self.v9_suffix_bounds(
-                                            exporter,
-                                            scope,
-                                            payload,
-                                            receipt_time_ns,
-                                        )?;
+                                        while v9_suffixes
+                                            .last()
+                                            .is_some_and(|(len, _)| *len > payload.len())
+                                        {
+                                            v9_suffixes.pop();
+                                        }
+                                        if v9_suffixes
+                                            .last()
+                                            .is_none_or(|(len, _)| *len != payload.len())
+                                        {
+                                            v9_suffixes = self.v9_suffix_bounds(
+                                                exporter,
+                                                scope,
+                                                payload,
+                                                receipt_time_ns,
+                                            );
+                                        }
+                                        let (after_min, after_max) = v9_suffixes.last()?.1?;
                                         let lower =
                                             minimum.max(remaining.saturating_sub(after_max));
                                         let upper = maximum.min(remaining.checked_sub(after_min)?);
@@ -716,24 +731,48 @@ impl FlowContext {
         scope: Scope,
         mut payload: &[u8],
         now_ns: u64,
-    ) -> Option<(usize, usize)> {
-        let (mut minimum, mut maximum) = (0usize, 0usize);
+    ) -> Vec<(usize, Option<(usize, usize)>)> {
+        let mut sets = Vec::new();
         while !payload.is_empty() {
-            let (rest, set) = parser::parse_flowset_header(payload).ok()?;
-            let length = usize::from(set.length).checked_sub(4)?;
-            let body = rest.get(..length)?;
-            payload = &rest[length..];
-            if matches!(set.set_id, FLOWSET_ID_V9_TEMPLATE | FLOWSET_ID_V9_OPTIONS) {
-                return None;
-            }
-            if set.set_id >= FIRST_DATA_SET_ID {
-                let template = self.templates.get(exporter, scope, set.set_id, now_ns)?;
-                let (lower, upper) = v9_record_bounds(&template, body)?;
-                minimum = minimum.checked_add(lower)?;
-                maximum = maximum.checked_add(upper)?;
+            let len = payload.len();
+            let parsed = (|| {
+                let (rest, set) = parser::parse_flowset_header(payload).ok()?;
+                let length = usize::from(set.length).checked_sub(4)?;
+                let body = rest.get(..length)?;
+                let bounds = if matches!(set.set_id, FLOWSET_ID_V9_TEMPLATE | FLOWSET_ID_V9_OPTIONS)
+                {
+                    None
+                } else if set.set_id >= FIRST_DATA_SET_ID {
+                    self.templates
+                        .get(exporter, scope, set.set_id, now_ns)
+                        .and_then(|template| v9_record_bounds(&template, body))
+                } else {
+                    Some((0, 0))
+                };
+                Some((&rest[length..], bounds))
+            })();
+            match parsed {
+                Some((rest, bounds)) => {
+                    sets.push((len, bounds));
+                    payload = rest;
+                }
+                None => {
+                    sets.push((len, None));
+                    break;
+                }
             }
         }
-        Some((minimum, maximum))
+        let mut bounds = Some((0usize, 0usize));
+        let mut suffixes = vec![(0, bounds)];
+        for (len, set_bounds) in sets.into_iter().rev() {
+            bounds = bounds
+                .zip(set_bounds)
+                .and_then(|((min, max), (lower, upper))| {
+                    Some((min.checked_add(lower)?, max.checked_add(upper)?))
+                });
+            suffixes.push((len, bounds));
+        }
+        suffixes
     }
 
     /// Records every decoded options template under `(exporter, scope)`,

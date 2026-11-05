@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolve IPFIX uptime timestamps against `systemInitTimeMilliseconds`, including 32-bit uptime rollover. Without a usable initialization time, retain export-time fallback values with the timestamp presence bits clear.
 - Encode IPv4 addresses with the documented `::ffff:` mapped prefix; the UDP listener now distinguishes mapped IPv4 from native IPv6 addresses such as `::1`.
 - Use NetFlow v9 header record counts to distinguish short fixed-width records from alignment padding. Ambiguous layouts stop partial decoding and increment `malformed_packets` instead of emitting guessed records.
+- Avoid repeated scans of later NetFlow v9 Sets when decoding packets with many padded short records.
 - `FlowContext::age_at` no longer iterates an empty flow cache, which locked and allocated a guard per map shard, and scans templates only when the earliest expiry is due. A call with nothing to age performs no allocation.
 - Fixed-width NetFlow v5/v9 and IPFIX record framing iterates over borrowed slices without allocating a temporary vector; NetFlow v5 applies its header record count during iteration.
 - Ignore IPFIX (Options) Template Withdrawals, as RFC 7011 §8.4 requires of UDP collectors, instead of replacing the cached definition with an empty one; the policy applies to every transport. Parse 4-byte Options Template Withdrawal records without misaligning the Set.

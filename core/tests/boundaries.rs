@@ -100,6 +100,39 @@ fn v9_short_sets_use_the_remaining_packet_record_count() {
 }
 
 #[test]
+fn v9_many_padded_short_sets_decode_once_each() {
+    let mut header = v9_header(7);
+    header[2..4].copy_from_slice(&8001u16.to_be_bytes());
+    let mut sets = vec![flowset(0, &template_record(256, &[(4, 1)]))];
+    sets.extend((0..8000).map(|_| flowset(256, &[6, 0, 0, 0])));
+    let ctx = FlowContext::new();
+    let (result, records) = decode(&ctx, &packet(header, &sets));
+    assert_eq!(result, Ok(8000));
+    assert!(records.iter().all(|r| r.proto == 6));
+    assert_eq!(ctx.stats().malformed_packets, 0);
+}
+
+#[test]
+fn v9_short_set_before_template_change_remains_ambiguous() {
+    let mut header = v9_header(7);
+    header[2..4].copy_from_slice(&4u16.to_be_bytes());
+    let buf = packet(
+        header,
+        &[
+            flowset(0, &template_record(256, &[(4, 1)])),
+            flowset(256, &[6, 0, 0, 0]),
+            flowset(0, &template_record(256, &[(4, 1)])),
+            flowset(256, &[17, 0, 0, 0]),
+        ],
+    );
+    let ctx = FlowContext::new();
+    let (result, records) = decode(&ctx, &buf);
+    assert_eq!(result, Ok(0));
+    assert!(records.is_empty());
+    assert_eq!(ctx.stats().malformed_packets, 1);
+}
+
+#[test]
 fn v9_options_records_are_included_in_the_padding_budget() {
     let mut header = v9_header(7);
     header[2..4].copy_from_slice(&4u16.to_be_bytes());
