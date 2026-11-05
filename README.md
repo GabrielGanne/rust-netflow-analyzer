@@ -7,118 +7,44 @@ memory buffers without heap allocation for packet framing, manages template
 definitions and clock drift per exporter, and aggregates decoded records into
 an internally sharded, size-bounded flow cache with background aging.
 
-The workspace consists of two crates:
-- [`netflow_analyzer_core`](core): Pure Rust decoding, aggregation, template management, and clock tracking engine.
-- [`netflow_analyzer_ffi`](ffi): C ABI (`cdylib` and `staticlib`) bindings and cbindgen-generated C header (`include/netflow-analyzer.h`).
-
----
+| Crate | Contents |
+| :--- | :--- |
+| [`netflow_analyzer_core`](core) | Pure Rust decoding, aggregation, template, and clock engine (no `unsafe`). |
+| [`netflow_analyzer_ffi`](ffi) | C ABI (`cdylib`, `staticlib`) and the generated header `include/netflow-analyzer.h`; error codes, ABI versioning, and installation. |
 
 ## Supported Protocols
 
-| Protocol | Specification | Decoding Support | Aggregation Support |
+| Protocol | Specification | Decoding | Aggregation |
 | :--- | :--- | :--- | :--- |
-| **NetFlow v5** | Legacy fixed format | Full (48-byte records, domain-less, engine type/id scoped) | Additive flow stitching |
-| **NetFlow v9** | [RFC 3954](https://datatracker.ietf.org/doc/html/rfc3954) | Template FlowSets, Options Template FlowSets, Data FlowSets, variable-length elements | Additive flow stitching with options sampling normalization |
-| **IPFIX** | [RFC 7011](https://datatracker.ietf.org/doc/html/rfc7011) | Template Sets, Options Template Sets, Data Sets, declared length validation, variable-length elements | Additive flow stitching with options sampling normalization |
-
----
-
-## Architecture
-
-The engine uses a zero-copy parser, an explicit session identity model, and fine-grained sharded state across both a fused aggregation pipeline and a decode-only path. The decode-only path bypasses flow-cache aggregation but still retains per-exporter template, clock, and sampling state across calls, so packets from one exporter session must be decoded through the same context and exporter key.
-
-See the dedicated [Architecture Documentation](docs/architecture.md) for full pipeline diagrams and component details.
-
----
+| **NetFlow v5** | Legacy fixed format | 48-byte records, scoped by engine type/id | Additive flow stitching, header sampling |
+| **NetFlow v9** | [RFC 3954](https://datatracker.ietf.org/doc/html/rfc3954) | Templates, options templates, data, variable-length elements | Additive flow stitching, options sampling |
+| **IPFIX** | [RFC 7011](https://datatracker.ietf.org/doc/html/rfc7011) | Templates, options templates, data, length validation, variable-length elements | Additive flow stitching, options sampling |
 
 ## Examples
 
-Runnable integration examples are provided in the repository:
+- [`core/examples/quickstart.rs`](core/examples/quickstart.rs): configure a context, ingest a packet, age and flush flows. `cargo run -p netflow_analyzer_core --example quickstart`
+- [`core/examples/udp_listener.rs`](core/examples/udp_listener.rs): multi-exporter UDP collector with an exporter allow-list, bounded peer table, and restart detection. `cargo run -p netflow_analyzer_core --example udp_listener -- --help`
+- [`examples/c_integration`](examples/c_integration): self-checking C/C++ ABI test covering the fused, manual-aging, and decode-only paths. `make release && make c-example`
 
-- **C Integration (`examples/c_integration`)**: Demonstrates creating an engine context, processing packets, handling flow callbacks, and validating ABI struct layouts:
-  ```sh
-  make release
-  make c-example
-  ```
-- **Rust Quickstart (`core/examples/quickstart.rs`)**: Demonstrates context configuration, packet ingestion, background aging, and telemetry snapshots:
-  ```sh
-  cargo run -p netflow_analyzer_core --example quickstart
-  ```
-- **Reference UDP Listener (`core/examples/udp_listener.rs`)**: A multi-exporter OS-socket daemon ingesting real NetFlow/IPFIX datagrams from a network socket:
-  ```sh
-  cargo run -p netflow_analyzer_core --example udp_listener -- --help
-  ```
-  The listener admits loopback sources by default. Use repeated `--allow-exporter <IP>` options to admit specific remote exporters; this replaces the loopback defaults. `--max-peers` bounds endpoint state, and `--peer-idle` reclaims idle peers when capacity is needed or they return. Source-IP admission requires a network boundary that prevents spoofing.
-  Each endpoint and protocol scope has its own exporter key, so a detected restart in one observation domain leaves other domains running.
+## Documentation
 
----
+- [Architecture](docs/architecture.md): pipeline, components, concurrency, threading and lifecycle rules.
+- [Aggregation Semantics](docs/aggregation.md): what an emitted flow represents, sampling normalization, emission paths, out-of-scope modes.
+- [Exporter Identity](docs/exporter-identity.md): exporter keys, scopes, and the key rotation and purge contract.
+- [Deployment Hardening](docs/deployment-hardening.md): resource limits, hostile input, cache sizing, and monitoring.
+- [Testing](docs/testing.md): local gate, benchmarks, fuzzing, and sanitizers.
+- [Contributing](CONTRIBUTING.md) and [Releasing](RELEASING.md).
 
-## Testing and Verification
-
-Run the full local verification gate before submitting changes:
+## Testing
 
 ```sh
-./tools/test.sh
-# or
-make check
+./tools/test.sh   # or: make check
 ```
 
-This checks formatting (`cargo fmt --check`), runs debug and release tests across all workspace targets, runs documentation tests, runs Clippy with warnings denied (`-D warnings`), validates dependency policy and security advisories (`cargo deny --locked check`), and builds and runs the C integration test and ABI checks.
+## Platforms
 
----
+Linux `x86_64` and `aarch64` (LP64); C11 and C++11 headers; Rust 1.82 or newer.
 
-## Threading and Lifecycle Rules
+## License
 
-1. **Concurrent Packet Ingestion**:
-   - `FlowContext` is thread-safe (`Send + Sync`) and designed to be shared via `Arc` across worker threads.
-   - Flow-cache ingestion is sharded: concurrent `process_packet*` calls update flow records through independent shard locks, without a cache-wide mutex. Template lookups, clock, and sampling state are sharded the same way.
-   - Template maintenance is shared: every template definition or refresh, capacity reclamation when the template cache is full, and template expiry sweeps take one template-cache-wide mutex, so template traffic from different exporters can contend on it.
-2. **Single Controlling Thread**:
-   - Engine lifecycle transitions — `start_aging`, `stop_aging`, `netflow_analyzer_create`, and `netflow_analyzer_destroy` — must be driven by a **single controlling thread**.
-   - Initiating shutdown or calling `stop_aging` from within an emission callback (on the background aging thread) is misuse; as a safety measure, the worker detaches to prevent deadlocks, but synchronous termination is not guaranteed in that case.
-3. **Lock-Free Callbacks**:
-   - All flow emission callbacks (aging sweep, manual `flush`, and `purge_exporter`) execute **after** releasing internal cache shard locks.
-   - User callbacks can safely re-enter the engine (for example to query `stats()`) without deadlocking.
-4. **Exporter Key Rotation and Purge**:
-   - When an exporter restarts or its session ends, callers must retire the key using `purge_exporter` (or `netflow_analyzer_purge_exporter`).
-   - `purge_exporter` emits residual accumulated traffic first, then drops cached templates, clock state, and sampling factors, reclaiming capacity without memory leaks.
-
----
-
-## Resource Limits and Bounded Memory
-
-To defend against Denial of Service (DoS) attacks and hostile input:
-
-- **Flow Cache Bound**: Controlled by `max_flows` (default: 1,000,000). Once full, new flow keys are rejected, and `flows_dropped` increments. Existing resident flows continue accumulating traffic normally.
-- **Template Cache Bound**: Controlled by `max_templates` (default: 65,536). Templates expire 30 minutes after their last definition; lookup, capacity admission, and the background aging worker reclaim expired entries. Exporters must resend templates before expiry to keep data records decodable. New template definitions beyond the cap are rejected until capacity is reclaimed. The same value separately caps per-scope clock state and learned sampling rates; beyond it, new scopes are not clock-tracked and new sampling rates are not stored, so their flows go unscaled.
-- **Pre-Allocation Limits**: Template field counts are bounded (`MAX_TEMPLATE_FIELDS = 1024`) and verified against remaining datagram bytes before allocating heap memory.
-- **Framing Enforcement**: IPFIX declared `total_length` is strictly enforced. Datagrams claiming impossible lengths or Sets that overrun message boundaries are rejected immediately before walking record bodies.
-
----
-
-## Security Posture
-
-- **Memory Safety**: Pure Rust core engine without `unsafe` blocks in packet parsing or aggregation.
-- **Panic Boundaries**: FFI entry points are guarded with `catch_unwind` (`guard_ffi`), so panics never unwind across `extern "C"` boundaries. A caught panic makes integer-returning operations (packet processing and decoding, `netflow_analyzer_age_at`, purge) return `-4` (internal error; `-1` means invalid arguments), `netflow_analyzer_create` return null, and `netflow_analyzer_get_stats` return a zeroed snapshot; `netflow_analyzer_flush` and `netflow_analyzer_destroy` return normally with no error report.
-- **Hostile Input Hardening**:
-  - Structural validation stops corrupted FlowSet chains gracefully.
-  - Clock skew validation drops or rebases wildly drifted exporter timestamps before they can poison time bounds.
-  - For guidance on securing public or multi-tenant listeners, trusted exporter allow-lists, rate limiting, conservative cache sizing, and mitigating hostile high-cardinality traffic, see the [Deployment Hardening Guide](docs/deployment-hardening.md).
-
----
-
-## Design Constraints
-
-The following limitations are deliberate architectural choices:
-
-- **Hard-Capped Memory**: Memory is bounded by design. The engine will never unbounded-buffer incoming flows or templates; when caps are reached, traffic beyond capacity is dropped rather than risking out-of-memory crashes.
-- **Non-Retroactive Normalization**: Packet-sampling scaling is performed per-record at ingestion time. Subsequent options records or reconfigurations do not retroactively rewrite historical counters already folded into aggregates (see [Aggregation Semantics](docs/aggregation.md)).
-- **Explicit Exporter Scoping**: The engine does not guess or heuristically merge transport sessions across restarts. Callers must manage exporter keys and issue transport-session resets via `purge_exporter` when exporters restart (see [Exporter Identity](docs/exporter-identity.md)).
-
----
-
-## Supported Platforms and MSRV
-
-- **Tier 1 Supported Platforms**: Linux `x86_64` and `aarch64` (64-bit, LP64).
-- **C ABI Standard**: C11 and C++11 compatible headers (`ffi/include/netflow-analyzer.h`).
-- **Minimum Supported Rust Version (MSRV)**: Rust **1.82**.
+Mozilla Public License 2.0 (MPL-2.0). See [`LICENSE`](LICENSE).

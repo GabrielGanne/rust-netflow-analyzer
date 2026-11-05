@@ -67,10 +67,21 @@ record:
 - The engine caps template storage at `max_templates` (default: 65,536). Exceeding
   the cap rejects further template definitions, protecting heap memory, but prevents
   subsequent legitimate templates from being registered until the exporter state is purged.
+- Templates expire 30 minutes after their last definition; lookup, capacity
+  admission, and the aging worker reclaim expired entries. Exporters must resend
+  templates before expiry to keep their data records decodable.
 - `max_templates` also sizes the per-`(exporter, scope)` clock table and the
   learned sampling-rate table, each with its own count. Once either is full, new
   scopes are not clock-tracked and new sampling rates are not stored, so those
   scopes' flows are aggregated unscaled. Lowering `max_templates` shrinks all three.
+
+### Malformed and Oversized Input
+- Template field counts are capped at 1,024 (`MAX_TEMPLATE_FIELDS`) and checked
+  against the remaining datagram bytes before any heap allocation.
+- The IPFIX `total_length` is enforced: a message claiming an impossible length,
+  or whose Sets overrun it, is rejected before any record body is walked.
+- A corrupted FlowSet chain stops decoding of the rest of the packet and
+  increments `malformed_packets`; records already decoded are kept.
 
 ### Peer Key Table Exhaustion (Listener Layer)
 - A listener that maps each distinct `SocketAddr` to an `ExporterKey` without a

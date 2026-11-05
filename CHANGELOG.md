@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Documentation: the README is an overview that links to the docs and examples. Threading and lifecycle rules moved to `docs/architecture.md`, FFI error codes and panic handling to `ffi/README.md`, and input limits to `docs/deployment-hardening.md`.
+
 ## [0.3.0] - 2026-11-05
 
 ### Changed

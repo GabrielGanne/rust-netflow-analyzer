@@ -91,3 +91,20 @@ Options templates configure packet sampling rates (`samplingInterval` IE 34, `sa
 - A background worker thread sweeps the flow cache at configurable intervals (`scan_interval`), evicting idle flows (`idle_timeout`) and rolling over active flows (`active_timeout`). It waits on a condition variable, so `stop_aging` wakes it immediately.
 - Aging and template expiry run on each packet's receipt time in Unix nanoseconds. The wall-clock entry points pair with the background worker; the `*_at` entry points pair with `age_at` (`netflow_analyzer_age_at`, on a C context created with `manual_aging` set), which runs one sweep at a caller-supplied time for deterministic replay and tests. A context should use only one of these two time domains. Elapsed time saturates at zero, so time moving backwards never ages state early.
 - All callbacks run outside cache locks to avoid blocking ingestion or causing deadlocks.
+
+### 6. Threading and Lifecycle Rules
+- **Concurrent ingestion:** `FlowContext` is `Send + Sync` and is meant to be
+  shared via `Arc` across worker threads calling `process_packet*` /
+  `decode_packet*` concurrently.
+- **Single controlling thread:** lifecycle transitions — `start_aging`,
+  `stop_aging`, `netflow_analyzer_create`, and `netflow_analyzer_destroy` — must
+  be driven by one controlling thread. Calling `stop_aging` or initiating
+  shutdown from an emission callback (on the aging thread) is misuse: the worker
+  detaches to avoid a deadlock, but synchronous termination is not guaranteed.
+- **Re-entrant callbacks:** emission callbacks (aging sweep, `flush`,
+  `purge_exporter`) run after shard locks are released, so they may call back
+  into the engine (for example `stats()`) without deadlocking.
+- **Exporter retirement:** when an exporter restarts or its session ends, retire
+  its key with `purge_exporter` (`netflow_analyzer_purge_exporter`), which emits
+  residual flows and then drops its templates, clock, and sampling state. See
+  [Exporter Identity](exporter-identity.md) for the full contract.

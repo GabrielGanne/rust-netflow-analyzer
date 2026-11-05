@@ -27,6 +27,17 @@ make install PREFIX=/usr/local
 pkg-config --cflags --libs netflow-analyzer
 ```
 
+## Error codes and panics
+
+Integer-returning functions return `-1` for invalid arguments, `-2` for a
+malformed packet, and `-3` for a clock-skew rejection. Every entry point
+is guarded with `catch_unwind`, so a panic never unwinds across `extern "C"`: a
+caught panic makes packet processing and decoding, `netflow_analyzer_age_at`,
+and purge return `-4` (internal error), `netflow_analyzer_create` return null,
+and `netflow_analyzer_get_stats` return a zeroed snapshot;
+`netflow_analyzer_flush` and `netflow_analyzer_destroy` return normally with no
+error report.
+
 ## Supported platforms and ABI stability
 
 **Tier 1 (built, tested, and guaranteed):** Linux on `x86_64` and `aarch64`
