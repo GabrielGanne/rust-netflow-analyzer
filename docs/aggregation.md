@@ -23,10 +23,13 @@ and counted in `flows_dropped` rather than evicting an existing flow.
 
 For each key the engine maintains:
 
-- **Counters:** `bytes` and `packets` are summed across contributing records,
-  saturating at `u64::MAX` — this is additive **flow stitching**. Each record is
-  first scaled by its sampler's rate before being summed, so counters are
-  estimated real traffic (see the sampling note below).
+- **Counters:** delta byte/packet counts are summed, saturating at `u64::MAX`.
+  Cumulative `octetTotalCount` / `packetTotalCount` snapshots contribute only
+  their increase over the unscaled watermark for the resident flow; lower or
+  repeated snapshots contribute zero. The increase is scaled by the current
+  sampling rate before addition. Delta counts take precedence when a record
+  carries both encodings, independently for bytes and packets and regardless
+  of field order. These are counter semantics, separate from flow deduplication.
 - **Times:** the earliest observed start and the latest observed end, in both
   exporter-derived and effective (clock-corrected) forms.
 - **Descriptive metadata:** the optional fields tracked by the `present`
@@ -36,6 +39,18 @@ For each key the engine maintains:
   a field not yet seen. The five-tuple fields (addresses, ports, protocol) are
   **not** carried forward this way: they are the flow's identity (or set from the
   first record, for a `flowId`-keyed flow) and are not merged from later records.
+
+Counter watermarks survive active-timeout rollover. The first cumulative
+snapshot for a newly resident flow contributes its full value; idle eviction,
+flush, and exporter purge remove its watermark along with the flow. There is
+no separate history cache for evicted flows. Exporter or metering-process
+resets require key rotation/purge as described in the exporter identity model;
+a lower snapshot alone is treated as reordering, not proof of a reset.
+
+Decode-only callbacks retain the exporter's counter encoding: `BYTES_TOTAL`
+and `PACKETS_TOTAL` in `present` identify cumulative snapshots, after sampling
+expansion. Their C names are `NETFLOW_ANALYZER_PRESENT_BYTES_TOTAL` and
+`NETFLOW_ANALYZER_PRESENT_PACKETS_TOTAL`. Aggregated emissions clear both bits.
 
 Sampling normalization applies to rates learned from **NetFlow v9 / IPFIX
 options records** (`samplingInterval`, `samplerRandomInterval`, or the
@@ -107,8 +122,10 @@ aggregated by the model above; the engine simply does not do the extra
 correlation, and downstream consumers must apply it themselves if they need it.
 
 - **Flow dedup** (`flow-dedup`). There is no mode that takes the maximum of
-  `packets`/`bytes` across records instead of summing them; the engine always
-  sums. It also does not detect the *same* flow reported by multiple observation
+  `packets`/`bytes` across delta records instead of summing them. Differencing
+  cumulative counters follows their encoding and does not deduplicate delta
+  records. The engine also does not detect the *same* flow reported by multiple
+  observation
   points: two observations that happen to share `(exporter_key, Scope, identity)`
   are **summed into one aggregate** (which double-counts a genuine duplicate and
   loses the individual observations), and observations that differ in exporter,

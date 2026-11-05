@@ -131,6 +131,16 @@
 #define NETFLOW_ANALYZER_PRESENT_END_TIME (1 << 17)
 
 /**
+ * Decode-only byte count is cumulative. Aggregated emissions always clear this bit.
+ */
+#define NETFLOW_ANALYZER_PRESENT_BYTES_TOTAL (1 << 18)
+
+/**
+ * Decode-only packet count is cumulative. Aggregated emissions always clear this bit.
+ */
+#define NETFLOW_ANALYZER_PRESENT_PACKETS_TOTAL (1 << 19)
+
+/**
  * Opaque handle handed back to C. Holds the engine plus the emission callback
  * (`None` for a decode-only context).
  */

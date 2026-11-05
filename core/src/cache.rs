@@ -11,7 +11,8 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 use crate::parser::TemplateRecord;
-use crate::records::{FlowFields, FlowKey, FlowRecord};
+use crate::records::{presence, FlowFields, FlowKey, FlowRecord};
+use crate::sampling::SamplingRatio;
 use crate::scope::{ExporterKey, Scope};
 use crate::stats::InternalCounters;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -285,13 +286,14 @@ impl FlowCache {
     ///
     /// `now_ns` (Unix nanoseconds) is the local observation time that drives
     /// idle and active aging.
-    pub(crate) fn upsert(
+    pub(crate) fn upsert_sampled(
         &self,
         exporter: ExporterKey,
         scope: Scope,
         fields: &FlowFields,
         counters: &InternalCounters,
         now_ns: u64,
+        ratio: SamplingRatio,
     ) {
         let key = fields.key(exporter, scope);
         // The `Entry` API holds the shard lock for `key`, so the vacant branch
@@ -300,8 +302,20 @@ impl FlowCache {
         match self.map.entry(key) {
             Entry::Occupied(mut occupied) => {
                 let existing = occupied.get_mut();
-                existing.bytes = existing.bytes.saturating_add(fields.bytes);
-                existing.packets = existing.packets.saturating_add(fields.packets);
+                let bytes = counter_increment(
+                    fields.bytes,
+                    fields.present & presence::BYTES_TOTAL != 0,
+                    fields.total_bytes,
+                    &mut existing.fields.total_bytes,
+                );
+                let packets = counter_increment(
+                    fields.packets,
+                    fields.present & presence::PACKETS_TOTAL != 0,
+                    fields.total_packets,
+                    &mut existing.fields.total_packets,
+                );
+                existing.bytes = existing.bytes.saturating_add(ratio.expand(bytes));
+                existing.packets = existing.packets.saturating_add(ratio.expand(packets));
                 if fields.start_time_ns != 0
                     && (existing.start_time_ns == 0
                         || fields.start_time_ns < existing.start_time_ns)
@@ -325,7 +339,14 @@ impl FlowCache {
             }
             Entry::Vacant(vacant) => {
                 if self.reserve_slot() {
-                    vacant.insert(FlowRecord::from_fields(fields, exporter, scope, now_ns));
+                    let mut record = FlowRecord::from_fields(fields, exporter, scope, now_ns);
+                    record.bytes = ratio.expand(fields.bytes);
+                    record.packets = ratio.expand(fields.packets);
+                    record.fields.total_bytes = Some(fields.total_bytes.unwrap_or(fields.bytes));
+                    record.fields.total_packets =
+                        Some(fields.total_packets.unwrap_or(fields.packets));
+                    record.present &= !(presence::BYTES_TOTAL | presence::PACKETS_TOTAL);
+                    vacant.insert(record);
                 } else {
                     counters.flows_dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -526,6 +547,27 @@ impl FlowCache {
     }
 }
 
+fn counter_increment(
+    value: u64,
+    is_total: bool,
+    advertised_total: Option<u64>,
+    previous: &mut Option<u64>,
+) -> u64 {
+    let baseline = previous.unwrap_or(0);
+    let (increment, total) = if is_total {
+        (value.saturating_sub(baseline), value.max(baseline))
+    } else {
+        (
+            value,
+            advertised_total
+                .unwrap_or_else(|| baseline.saturating_add(value))
+                .max(baseline),
+        )
+    };
+    *previous = Some(total);
+    increment
+}
+
 /// Tunable timing parameters for the background aging engine.
 #[derive(Debug, Clone, Copy)]
 pub struct AgingConfig {
@@ -638,9 +680,30 @@ impl Drop for AgingHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::parser::{TemplateField, TemplateRecord};
     use crate::scope::SINGLE_EXPORTER;
     use std::sync::atomic::AtomicUsize;
+
+    impl FlowCache {
+        fn upsert(
+            &self,
+            exporter: ExporterKey,
+            scope: Scope,
+            fields: &FlowFields,
+            counters: &InternalCounters,
+            now_ns: u64,
+        ) {
+            self.upsert_sampled(
+                exporter,
+                scope,
+                fields,
+                counters,
+                now_ns,
+                SamplingRatio::NONE,
+            );
+        }
+    }
 
     fn sample_template(id: u16) -> TemplateRecord {
         TemplateRecord::from_fields(

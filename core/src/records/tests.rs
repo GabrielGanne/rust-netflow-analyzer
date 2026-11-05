@@ -285,6 +285,8 @@ fn flow_record_round_trips_to_ffi() {
         ip_version: 4,
         present: presence::FLOW_ID | presence::IFACE_IN | presence::DSCP,
         sampler: SamplerSelector::Domain,
+        total_bytes: None,
+        total_packets: None,
     };
     let record = FlowRecord::from_fields(&fields, SINGLE_EXPORTER, Scope::IpfixDomain(9), 0);
     assert_eq!(record.fields, fields);

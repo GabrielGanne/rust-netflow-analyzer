@@ -305,9 +305,15 @@ impl FlowContext {
             exporter,
             raw_bytes,
             receipt_time_ns,
-            &mut |exporter, scope, fields| {
-                self.flows
-                    .upsert(exporter, scope, fields, &self.counters, receipt_time_ns);
+            &mut |exporter, scope, fields, ratio| {
+                self.flows.upsert_sampled(
+                    exporter,
+                    scope,
+                    fields,
+                    &self.counters,
+                    receipt_time_ns,
+                    ratio,
+                );
             },
         )
     }
@@ -348,7 +354,7 @@ impl FlowContext {
         receipt_time_ns: u64,
         sink: &mut dyn FnMut(u32, &FlowFields),
     ) -> Result<usize, PacketError> {
-        self.decode_at(
+        self.decode_packet_from_at(
             SINGLE_EXPORTER,
             raw_bytes,
             receipt_time_ns,
@@ -401,7 +407,17 @@ impl FlowContext {
         receipt_time_ns: u64,
         sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
     ) -> Result<usize, PacketError> {
-        self.decode_at(exporter, raw_bytes, receipt_time_ns, sink)
+        self.decode_at(
+            exporter,
+            raw_bytes,
+            receipt_time_ns,
+            &mut |exporter, scope, fields, ratio| {
+                let mut fields = *fields;
+                fields.bytes = ratio.expand(fields.bytes);
+                fields.packets = ratio.expand(fields.packets);
+                sink(exporter, scope, &fields);
+            },
+        )
     }
 
     /// Core decode routine shared by every entry point. Decodes the datagram
@@ -412,7 +428,7 @@ impl FlowContext {
         exporter: ExporterKey,
         raw_bytes: &[u8],
         receipt_time_ns: u64,
-        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields, SamplingRatio),
     ) -> Result<usize, PacketError> {
         let (mut payload, header) = match parser::parse_packet_header(raw_bytes) {
             Ok(parsed) => parsed,
@@ -577,7 +593,7 @@ impl FlowContext {
                 id if id >= FIRST_DATA_SET_ID => {
                     if let Some(template) = self.templates.get(exporter, scope, id, receipt_time_ns)
                     {
-                        data_records += self.process_data_set(
+                        let records = self.process_data_set(
                             exporter,
                             scope,
                             &template,
@@ -585,6 +601,9 @@ impl FlowContext {
                             time_context,
                             sink,
                         );
+                        if !template.is_options {
+                            data_records += records;
+                        }
                     }
                 }
                 // Reserved/unknown set ids (e.g. 4..=255) are ignored.
@@ -639,17 +658,15 @@ impl FlowContext {
         payload: &[u8],
         header: &NetflowV5Header,
         time_context: RecordTimeContext,
-        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields, SamplingRatio),
     ) -> usize {
         let count = header.count as usize;
         let ratio = v5_sampling_ratio(header.sampling_interval);
         let mut decoded = 0usize;
         // Trust the header count but never read past the buffer.
         for record in parser::split_fixed_records(payload, V5_RECORD_LEN).take(count) {
-            if let Some(mut fields) = FlowFields::from_v5_record_at(record, Some(time_context)) {
-                fields.bytes = ratio.expand(fields.bytes);
-                fields.packets = ratio.expand(fields.packets);
-                sink(exporter, scope, &fields);
+            if let Some(fields) = FlowFields::from_v5_record_at(record, Some(time_context)) {
+                sink(exporter, scope, &fields, ratio);
                 decoded += 1;
             }
         }
@@ -669,27 +686,27 @@ impl FlowContext {
         template: &parser::TemplateRecord,
         body: &[u8],
         time_context: RecordTimeContext,
-        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields),
+        sink: &mut dyn FnMut(ExporterKey, Scope, &FlowFields, SamplingRatio),
     ) -> usize {
         // Options data records carry exporter metadata, not observed flows, so
         // they are decoded and interpreted separately without polluting the flow
-        // cache. `count` therefore tracks only flow records for the return value.
+        // cache. Count both kinds here so v9 header counts can identify padding.
         let is_options = template.is_options;
         let mut count = 0usize;
 
         match template.fixed_length {
             Some(record_len) if record_len > 0 => {
                 for record in parser::split_fixed_records(body, record_len) {
-                    if let Some((mut fields, _)) =
+                    if let Some((fields, _)) =
                         FlowFields::from_record_sized_at(template, record, Some(time_context))
                     {
                         if is_options {
                             self.consume_options_record(exporter, scope, template, record);
                         } else {
-                            self.apply_sampling(exporter, scope, &mut fields);
-                            sink(exporter, scope, &fields);
-                            count += 1;
+                            let ratio = self.sampling_ratio(exporter, scope, &fields);
+                            sink(exporter, scope, &fields, ratio);
                         }
+                        count += 1;
                     }
                 }
             }
@@ -698,9 +715,7 @@ impl FlowContext {
                 let mut cursor = body;
                 while !cursor.is_empty() {
                     match FlowFields::from_record_sized_at(template, cursor, Some(time_context)) {
-                        Some((mut fields, consumed))
-                            if consumed > 0 && consumed <= cursor.len() =>
-                        {
+                        Some((fields, consumed)) if consumed > 0 && consumed <= cursor.len() => {
                             if is_options {
                                 self.consume_options_record(
                                     exporter,
@@ -709,10 +724,10 @@ impl FlowContext {
                                     &cursor[..consumed],
                                 );
                             } else {
-                                self.apply_sampling(exporter, scope, &mut fields);
-                                sink(exporter, scope, &fields);
-                                count += 1;
+                                let ratio = self.sampling_ratio(exporter, scope, &fields);
+                                sink(exporter, scope, &fields, ratio);
                             }
+                            count += 1;
                             cursor = &cursor[consumed..];
                         }
                         _ => break,
@@ -748,22 +763,21 @@ impl FlowContext {
         }
     }
 
-    /// Scales a decoded flow record's byte and packet counters up to their
-    /// estimated real values using the sampling ratio advertised for the
-    /// record's sampler, matching it by the same `(exporter, scope, selector)`
-    /// the options record was stored under. This runs per record, **before**
-    /// aggregation, so records sampled at different rates are each normalized
-    /// before they are summed or (later) stitched/deduplicated.
+    /// Looks up the sampling ratio for this record. Aggregation differences
+    /// cumulative counters before applying it; decode-only sinks scale directly.
     ///
     /// The common unsampled case is free: when no sampling has been advertised
     /// at all, the whole cache is empty and the lookup is skipped.
-    fn apply_sampling(&self, exporter: ExporterKey, scope: Scope, fields: &mut FlowFields) {
+    fn sampling_ratio(
+        &self,
+        exporter: ExporterKey,
+        scope: Scope,
+        fields: &FlowFields,
+    ) -> SamplingRatio {
         if self.sampling.is_empty() {
-            return;
+            return SamplingRatio::NONE;
         }
-        let ratio = self.sampling.ratio(exporter, scope, fields.sampler);
-        fields.bytes = ratio.expand(fields.bytes);
-        fields.packets = ratio.expand(fields.packets);
+        self.sampling.ratio(exporter, scope, fields.sampler)
     }
 
     /// Starts the background aging thread. Idle flows are evicted and long-lived

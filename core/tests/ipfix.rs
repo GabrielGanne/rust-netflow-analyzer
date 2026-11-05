@@ -8,11 +8,142 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use common::{sample_ipfix_packet, set_ipfix_total_length, Builder};
+use common::{
+    flowset, ipfix_header, packet, sample_ipfix_packet, set_ipfix_total_length, template_record,
+    Builder,
+};
 use netflow_analyzer_core::records::FlowRecord;
 use netflow_analyzer_core::sampling::{SamplerSelector, SamplingRatio};
 use netflow_analyzer_core::scope::{Scope, SINGLE_EXPORTER};
 use netflow_analyzer_core::{FlowContext, PacketError};
+
+#[test]
+fn cumulative_counters_preserve_watermarks_across_active_rollover() {
+    use netflow_analyzer_core::records::presence;
+    use netflow_analyzer_core::{AgingConfig, EngineConfig};
+    use std::cell::RefCell;
+    use std::time::Duration;
+    let ctx = FlowContext::with_config(EngineConfig {
+        aging: AgingConfig {
+            active_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(30),
+            ..AgingConfig::default()
+        },
+        ..EngineConfig::default()
+    });
+    let start = 1_700_000_000_000_000_000;
+    let emitted = RefCell::new(Vec::new());
+    for (step, bytes, packets) in [(0, 100u64, 10u64), (1, 150, 15), (2, 120, 12), (3, 180, 18)] {
+        let body = [
+            7u64.to_be_bytes(),
+            bytes.to_be_bytes(),
+            packets.to_be_bytes(),
+        ]
+        .concat();
+        let buf = packet(
+            ipfix_header(7),
+            &[
+                flowset(2, &template_record(256, &[(148, 8), (85, 8), (86, 8)])),
+                flowset(256, &body),
+            ],
+        );
+        let now = start + step * 1_000_000_000;
+        assert_eq!(ctx.process_packet_at(&buf, now), Ok(1));
+        ctx.age_at(now, |r| {
+            emitted.borrow_mut().push((r.bytes, r.packets, r.present))
+        });
+    }
+    ctx.flush(|r| emitted.borrow_mut().push((r.bytes, r.packets, r.present)));
+    let emitted = emitted.into_inner();
+    assert_eq!(emitted.iter().map(|r| r.0).sum::<u64>(), 180);
+    assert_eq!(emitted.iter().map(|r| r.1).sum::<u64>(), 18);
+    assert!(emitted
+        .iter()
+        .all(|r| r.2 & (presence::BYTES_TOTAL | presence::PACKETS_TOTAL) == 0));
+}
+
+#[test]
+fn delta_counters_take_precedence_over_totals_in_either_field_order() {
+    use netflow_analyzer_core::records::presence;
+    for fields in [
+        vec![(1, 8), (85, 8), (2, 8), (86, 8)],
+        vec![(86, 8), (2, 8), (85, 8), (1, 8)],
+    ] {
+        let mut body = Builder::new();
+        for &(id, _) in &fields {
+            body.put(
+                match id {
+                    1 => 20,
+                    85 => 120,
+                    2 => 2,
+                    _ => 12,
+                },
+                8,
+            );
+        }
+        let buf = packet(
+            ipfix_header(7),
+            &[
+                flowset(2, &template_record(256, &fields)),
+                flowset(256, &body.buf),
+            ],
+        );
+        let ctx = FlowContext::new();
+        assert_eq!(
+            ctx.decode_packet(&buf, &mut |_, f| {
+                assert_eq!((f.bytes, f.packets), (20, 2));
+                assert_eq!(
+                    f.present & (presence::BYTES_TOTAL | presence::PACKETS_TOTAL),
+                    0
+                );
+            }),
+            Ok(1)
+        );
+    }
+}
+
+#[test]
+fn cumulative_counters_are_differenced_before_sampling_reconfiguration() {
+    use netflow_analyzer_core::records::presence;
+    let ctx = FlowContext::new();
+    for (total, interval) in [(100, 10), (150, 20)] {
+        let mut options_template = Builder::new();
+        options_template
+            .put(300, 2)
+            .put(3, 2)
+            .put(1, 2)
+            .put(149, 2)
+            .put(4, 2)
+            .put(48, 2)
+            .put(1, 2)
+            .put(34, 2)
+            .put(4, 2);
+        let mut options = Builder::new();
+        options.put(7, 4).put(1, 1).put(interval, 4);
+        let mut record = Builder::new();
+        record.put(42, 8).put(total, 8).put(1, 1);
+        let buf = packet(
+            ipfix_header(7),
+            &[
+                flowset(3, &options_template.buf),
+                flowset(300, &options.buf),
+                flowset(2, &template_record(256, &[(148, 8), (85, 8), (48, 1)])),
+                flowset(256, &record.buf),
+            ],
+        );
+        assert_eq!(ctx.process_packet(&buf), Ok(1));
+        assert_eq!(
+            ctx.decode_packet(&buf, &mut |_, fields| {
+                assert_eq!(fields.bytes, total * interval);
+                assert_ne!(fields.present & presence::BYTES_TOTAL, 0);
+                let ffi = fields.to_ffi(SINGLE_EXPORTER, Scope::IpfixDomain(7));
+                assert_ne!(ffi.present & presence::BYTES_TOTAL, 0);
+            }),
+            Ok(1)
+        );
+    }
+    ctx.flush(|record| assert_eq!(record.bytes, 2_000));
+}
 
 #[test]
 fn decodes_ipfix_packet() {

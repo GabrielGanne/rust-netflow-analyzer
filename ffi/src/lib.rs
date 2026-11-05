@@ -178,6 +178,10 @@ pub const NETFLOW_ANALYZER_PRESENT_START_TIME: u32 = 1 << 16;
 /// Flow end time was exported; when clear, `end_time_ns` is the packet export
 /// time.
 pub const NETFLOW_ANALYZER_PRESENT_END_TIME: u32 = 1 << 17;
+/// Decode-only byte count is cumulative. Aggregated emissions always clear this bit.
+pub const NETFLOW_ANALYZER_PRESENT_BYTES_TOTAL: u32 = 1 << 18;
+/// Decode-only packet count is cumulative. Aggregated emissions always clear this bit.
+pub const NETFLOW_ANALYZER_PRESENT_PACKETS_TOTAL: u32 = 1 << 19;
 
 /// Tunable engine settings passed from C at construction time. A null pointer
 /// to [`netflow_analyzer_create`] selects library defaults for every field.
@@ -1308,6 +1312,11 @@ mod tests {
         assert_eq!(NETFLOW_ANALYZER_PRESENT_DST_PORT, presence::DST_PORT);
         assert_eq!(NETFLOW_ANALYZER_PRESENT_START_TIME, presence::START_TIME);
         assert_eq!(NETFLOW_ANALYZER_PRESENT_END_TIME, presence::END_TIME);
+        assert_eq!(NETFLOW_ANALYZER_PRESENT_BYTES_TOTAL, presence::BYTES_TOTAL);
+        assert_eq!(
+            NETFLOW_ANALYZER_PRESENT_PACKETS_TOTAL,
+            presence::PACKETS_TOTAL
+        );
     }
 
     #[test]

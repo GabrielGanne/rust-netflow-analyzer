@@ -199,6 +199,10 @@ pub mod presence {
     pub const START_TIME: u32 = 1 << 16;
     /// Flow end time was exported (otherwise it is the packet export time).
     pub const END_TIME: u32 = 1 << 17;
+    /// Decode-only byte count is cumulative, rather than a delta.
+    pub const BYTES_TOTAL: u32 = 1 << 18;
+    /// Decode-only packet count is cumulative, rather than a delta.
+    pub const PACKETS_TOTAL: u32 = 1 << 19;
 }
 
 /// Normalized values decoded from a single exported data record.
@@ -220,9 +224,11 @@ pub struct FlowFields {
     pub dst_port: u16,
     /// IP protocol number (e.g. 6 for TCP, 17 for UDP).
     pub proto: u8,
-    /// Flow byte count (scaled by any configured sampling ratio).
+    /// Flow byte count (scaled by sampling). On decode-only output,
+    /// [`presence::BYTES_TOTAL`] identifies a cumulative snapshot.
     pub bytes: u64,
-    /// Flow packet count (scaled by any configured sampling ratio).
+    /// Flow packet count (scaled by sampling). On decode-only output,
+    /// [`presence::PACKETS_TOTAL`] identifies a cumulative snapshot.
     pub packets: u64,
     /// Effective flow start time in Unix nanoseconds, corrected when fallback is used.
     pub start_time_ns: u64,
@@ -262,6 +268,9 @@ pub struct FlowFields {
     /// with the same key but different selectors are summed), so it is not part
     /// of the emitted `FlowRecord`/FFI identity.
     pub(crate) sampler: SamplerSelector,
+    // Unscaled snapshots become counter watermarks while retained in the cache.
+    pub(crate) total_bytes: Option<u64>,
+    pub(crate) total_packets: Option<u64>,
 }
 
 impl FlowFields {
@@ -312,14 +321,19 @@ impl FlowFields {
     ) -> Option<(Self, usize)> {
         let mut fields = FlowFields::default();
         let mut timestamps = DecodedTimestamps::default();
+        let mut counters = DecodedCounters::default();
 
         let offset = walk_record_fields(template, record, |type_id, enterprise_number, raw| {
             // Enterprise-specific elements share numeric ids with IANA ones, so
             // only interpret elements from the standard registry.
-            if enterprise_number.is_none() && !timestamps.apply_element(type_id, raw) {
+            if enterprise_number.is_none()
+                && !timestamps.apply_element(type_id, raw)
+                && !counters.apply_element(type_id, raw)
+            {
                 fields.apply_element(type_id, raw);
             }
         })?;
+        counters.resolve(&mut fields);
 
         let fallback = time_context
             .map(|ctx| ctx.original_export_time_ns)
@@ -430,8 +444,6 @@ impl FlowFields {
                 self.proto = raw.first().copied().unwrap_or(0);
                 self.present |= presence::PROTO;
             }
-            IE_OCTET_DELTA_COUNT | IE_OCTET_TOTAL_COUNT => self.bytes = read_be_uint(raw),
-            IE_PACKET_DELTA_COUNT | IE_PACKET_TOTAL_COUNT => self.packets = read_be_uint(raw),
             IE_FLOW_ID => {
                 self.flow_id = Some(read_be_uint(raw));
                 self.present |= presence::FLOW_ID;
@@ -570,7 +582,7 @@ impl FlowFields {
         if missing & presence::DST_PORT != 0 {
             self.dst_port = other.dst_port;
         }
-        self.present |= other.present;
+        self.present |= other.present & !(presence::BYTES_TOTAL | presence::PACKETS_TOTAL);
     }
 }
 
@@ -746,6 +758,40 @@ impl FlowRecord {
     /// Converts this record to the C-compatible [`NetflowAnalyzerFlowRecord`] representation.
     pub fn to_ffi(&self) -> NetflowAnalyzerFlowRecord {
         self.fields.to_ffi(self.exporter, self.scope)
+    }
+}
+
+#[derive(Default)]
+struct DecodedCounters {
+    bytes_delta: Option<u64>,
+    packets_delta: Option<u64>,
+    bytes_total: Option<u64>,
+    packets_total: Option<u64>,
+}
+
+impl DecodedCounters {
+    fn apply_element(&mut self, type_id: u16, raw: &[u8]) -> bool {
+        match type_id {
+            IE_OCTET_DELTA_COUNT => self.bytes_delta = Some(read_be_uint(raw)),
+            IE_PACKET_DELTA_COUNT => self.packets_delta = Some(read_be_uint(raw)),
+            IE_OCTET_TOTAL_COUNT => self.bytes_total = Some(read_be_uint(raw)),
+            IE_PACKET_TOTAL_COUNT => self.packets_total = Some(read_be_uint(raw)),
+            _ => return false,
+        }
+        true
+    }
+
+    fn resolve(self, fields: &mut FlowFields) {
+        fields.bytes = self.bytes_delta.or(self.bytes_total).unwrap_or(0);
+        fields.packets = self.packets_delta.or(self.packets_total).unwrap_or(0);
+        fields.total_bytes = self.bytes_total;
+        fields.total_packets = self.packets_total;
+        if self.bytes_delta.is_none() && self.bytes_total.is_some() {
+            fields.present |= presence::BYTES_TOTAL;
+        }
+        if self.packets_delta.is_none() && self.packets_total.is_some() {
+            fields.present |= presence::PACKETS_TOTAL;
+        }
     }
 }
 
