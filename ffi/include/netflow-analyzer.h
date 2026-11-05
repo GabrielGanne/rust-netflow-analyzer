@@ -31,12 +31,13 @@
 
 /**
  * ABI version of this library's C interface. Bumped whenever the public struct
- * layouts or function signatures change in a way a compiled consumer must be
- * rebuilt for. A consumer can compare this compile-time value from the header
- * against [`netflow_analyzer_abi_version`] at runtime to detect a header/library
+ * layouts, function signatures, or the encoding of an existing field change in
+ * a way a compiled consumer must be rebuilt or updated for. A consumer can
+ * compare this compile-time value from the header against
+ * [`netflow_analyzer_abi_version`] at runtime to detect a header/library
  * mismatch before using the API.
  */
-#define NETFLOW_ANALYZER_ABI_VERSION 3
+#define NETFLOW_ANALYZER_ABI_VERSION 4
 
 /**
  * Flow ID was present in the record.

@@ -1,6 +1,6 @@
 [package]
 name = "netflow_analyzer_ffi"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "C ABI (FFI) bindings for the netflow_analyzer_core NetFlow/IPFIX engine."
 readme = "README.md"
@@ -18,4 +18,4 @@ crate-type = ["cdylib", "staticlib"]
 # in-workspace, but rewrites the dependency to this registry requirement in the
 # published `.crate`. It must track core's version, so core has to be published
 # first (see RELEASING.md).
-netflow_analyzer_core = { path = "../core", version = "0.2.0" }
+netflow_analyzer_core = { path = "../core", version = "0.3.0" }

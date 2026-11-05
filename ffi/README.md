@@ -47,7 +47,9 @@ The C interface is versioned:
   `NetflowAnalyzerStats` added `options_templates_received` /
   `options_records_processed` in ABI version 2, leaving `reserved[6]`).
 - Any change that alters a public struct's size/layout or a function signature
-  is an **ABI break** and bumps `NETFLOW_ANALYZER_ABI_VERSION`.
+  is an **ABI break** and bumps `NETFLOW_ANALYZER_ABI_VERSION`. So does a change
+  to how an existing field is encoded (for example IPv4 addresses gaining the
+  `::ffff:` mapped prefix in ABI version 4).
 
 These invariants are enforced by the test suite (run via `make c-example` /
 `./tools/test.sh`):

@@ -46,11 +46,12 @@ pub const NETFLOW_ANALYZER_SCOPE_IPFIX: u8 = 1;
 pub const NETFLOW_ANALYZER_SCOPE_V5: u8 = 2;
 
 /// ABI version of this library's C interface. Bumped whenever the public struct
-/// layouts or function signatures change in a way a compiled consumer must be
-/// rebuilt for. A consumer can compare this compile-time value from the header
-/// against [`netflow_analyzer_abi_version`] at runtime to detect a header/library
+/// layouts, function signatures, or the encoding of an existing field change in
+/// a way a compiled consumer must be rebuilt or updated for. A consumer can
+/// compare this compile-time value from the header against
+/// [`netflow_analyzer_abi_version`] at runtime to detect a header/library
 /// mismatch before using the API.
-pub const NETFLOW_ANALYZER_ABI_VERSION: u32 = 3;
+pub const NETFLOW_ANALYZER_ABI_VERSION: u32 = 4;
 
 /// C-compatible callback invoked whenever a flow is emitted: from the
 /// background aging thread on idle eviction or active-timeout rollover, and
