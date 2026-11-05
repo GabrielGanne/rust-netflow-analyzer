@@ -22,7 +22,7 @@ domain alone is not sufficient:
 ## Decision
 
 The caller identifies the exporter/transport session with an **explicit,
-opaque `u64` key** supplied on every ingest call. The engine keys all
+opaque 128-bit key** (`ExporterKey = u128`) supplied on every ingest call. The engine keys all
 per-exporter state on the pair `(exporter_key, Scope)`, where `Scope` is the
 protocol-tagged scope defined below (**not** a bare `observation_domain_id`
 `u32`, which is undefined for v5 and collides across v9/IPFIX):
@@ -103,7 +103,7 @@ used for internal keying **and** surfaced on emitted identity, so no two version
 collide and every emitted record is attributable to the exact protocol and
 domain/engine it came from.
 
-### Why an opaque `u64`
+### Why an opaque integer key
 
 - **Transport-agnostic.** The core never assumes UDP, sockets, or `std::net`
   types. A caller reading from UDP, a pcap file, or a kernel ring buffer maps
@@ -114,7 +114,11 @@ domain/engine it came from.
   acceptable — it collides between distinct concurrent peers and, worse, hands a
   restarted exporter the same key as its previous session, re-creating exactly
   the state collisions this design prevents.
-- **C-ABI friendly.** A `u64` crosses the FFI boundary without new structs or
+- **Wide enough for an address.** 128 bits hold a raw IPv6 (or IPv4-mapped)
+  address, so a caller that allocates keys from addresses need not hash them
+  down. A 64-bit key `k` is the same key as the 128-bit value `k`.
+- **C-ABI friendly.** The key crosses the FFI boundary as a `uint64_t`, or as a
+  16-byte buffer through the `*_addr` entry points, without new structs or
   lifetime rules, which matters for the published C header.
 - **Cheap to hash and compare** as part of the cache keys.
 
@@ -158,11 +162,11 @@ domain/engine it came from.
 
 Scoping the caches by `(exporter_key, observation_domain_id)` keeps two
 exporters' identical five-tuples in **separate** cache entries, but the emission
-path must also let the consumer tell them apart. Today `FlowRecord` (and its
-C-ABI mirror `NetflowAnalyzerFlowRecord`) carries neither the exporter key nor
-the observation domain, and `NetflowAnalyzerFlowCallback` receives only the
-record plus context-wide `user_data`. Emitting two same-tuple flows from
-different exporters would therefore be indistinguishable downstream.
+path must also let the consumer tell them apart. Before this model,
+`FlowRecord` (and its C-ABI mirror `NetflowAnalyzerFlowRecord`) carried neither
+the exporter key nor the observation domain, and `NetflowAnalyzerFlowCallback`
+received only the record plus context-wide `user_data`, so two same-tuple flows
+from different exporters were indistinguishable downstream.
 
 So the implementation must **carry the exporter key and the tagged `Scope` on
 the emitted record**: add the exporter key and the protocol-tagged scope (from
@@ -188,6 +192,12 @@ public C structs) and land **before** the first published ABI. Mark the public
 `NetflowAnalyzerFlowRecord` `#[non_exhaustive]` so later additions do not repeat
 the Rust-side break. Because the crate is still pre-`0.1` and unreleased,
 finalizing the record layout now is the right time to absorb this change once.
+
+*Status: implemented. Emitted records carry the exporter key
+(`exporter_key`/`exporter_key_hi` in the C record) and the tagged scope
+(`scope_protocol` plus domain or engine fields); the `decode_packet_from*` and
+`decode_packet_scoped*` sinks receive `(ExporterKey, Scope, &FlowFields)`.
+`NetflowAnalyzerFlowRecord` is `#[non_exhaustive]`.*
 
 ### API shape
 
@@ -235,7 +245,8 @@ the API is designed around.
 
 The exporter key adds a dimension to every cache key, so a hostile source that
 forges many distinct keys could grow state. Inside the engine this is bounded by
-the existing size caps on the template, clock, and flow caches, and is covered
+the existing size caps on the template, clock, sampling, and flow caches (the
+clock and sampling caches reuse the `max_templates` value), and is covered
 further by the resource-limit and deployment-hardening work tracked separately.
 
 The **caller's** endpoint-to-session-key table is a separate concern that the
@@ -263,6 +274,10 @@ step's stated prerequisites are also in place.
    legacy adapters (bare `u32` ⇒ a fixed scope), or privatize those caches and
    treat it as a deliberate breaking change coordinated with the pre-`0.1` API
    review.
+
+   *Status: the caches are private `FlowContext` fields; state is inspected
+   through scoped accessors such as `template`, `clock_state`, and
+   `sampler_ratio`.*
 2. **Land together — do not split:** scope the flow-cache keys by
    `(exporter_key, Scope)` *and* carry the exporter key and the tagged `Scope`
    on emitted `FlowRecord`s, through the FFI flow callback, and on the
@@ -310,8 +325,8 @@ step's stated prerequisites are also in place.
    as a regression. Use wrap- and reordering-aware, per-scope detection (or an
    explicit external generation signal from the caller) before treating a
    regression as a new session. Rotating keys without the purge from step 4
-   would fill `max_templates`/`max_domains` over time and stop later sessions
-   from decoding, so step 4 must land first.
+   would fill `max_templates` (which also caps clock and sampling state) over
+   time and stop later sessions from decoding, so step 4 must land first.
 
    Rotation also needs a **generation barrier**, because UDP delivers no clean
    session boundary: after the endpoint is remapped to the fresh key, late

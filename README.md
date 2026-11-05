@@ -90,7 +90,7 @@ This checks formatting (`cargo fmt --check`), runs debug and release tests acros
 To defend against Denial of Service (DoS) attacks and hostile input:
 
 - **Flow Cache Bound**: Controlled by `max_flows` (default: 1,000,000). Once full, new flow keys are rejected, and `flows_dropped` increments. Existing resident flows continue accumulating traffic normally.
-- **Template Cache Bound**: Controlled by `max_templates` (default: 65,536). Templates expire 30 minutes after their last definition; lookup, capacity admission, and the background aging worker reclaim expired entries. Exporters must resend templates before expiry to keep data records decodable. New template definitions beyond the cap are rejected until capacity is reclaimed.
+- **Template Cache Bound**: Controlled by `max_templates` (default: 65,536). Templates expire 30 minutes after their last definition; lookup, capacity admission, and the background aging worker reclaim expired entries. Exporters must resend templates before expiry to keep data records decodable. New template definitions beyond the cap are rejected until capacity is reclaimed. The same value separately caps per-scope clock state and learned sampling rates; beyond it, new scopes are not clock-tracked and new sampling rates are not stored, so their flows go unscaled.
 - **Pre-Allocation Limits**: Template field counts are bounded (`MAX_TEMPLATE_FIELDS = 1024`) and verified against remaining datagram bytes before allocating heap memory.
 - **Framing Enforcement**: IPFIX declared `total_length` is strictly enforced. Datagrams claiming impossible lengths or Sets that overrun message boundaries are rejected immediately before walking record bodies.
 

@@ -67,6 +67,10 @@ record:
 - The engine caps template storage at `max_templates` (default: 65,536). Exceeding
   the cap rejects further template definitions, protecting heap memory, but prevents
   subsequent legitimate templates from being registered until the exporter state is purged.
+- `max_templates` also sizes the per-`(exporter, scope)` clock table and the
+  learned sampling-rate table, each with its own count. Once either is full, new
+  scopes are not clock-tracked and new sampling rates are not stored, so those
+  scopes' flows are aggregated unscaled. Lowering `max_templates` shrinks all three.
 
 ### Peer Key Table Exhaustion (Listener Layer)
 - A listener that maps each distinct `SocketAddr` to an `ExporterKey` without a
