@@ -1123,8 +1123,9 @@ fn resolve_sampling_ratio(
 
 fn copy_ipv4(dst: &mut [u8; 16], raw: &[u8]) {
     if raw.len() >= 4 {
-        // IPv4-mapped layout: store the 4 octets in the trailing slot.
-        dst[12..16].copy_from_slice(&raw[..4]);
+        *dst = std::net::Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])
+            .to_ipv6_mapped()
+            .octets();
     }
 }
 

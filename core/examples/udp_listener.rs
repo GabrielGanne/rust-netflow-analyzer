@@ -680,16 +680,10 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Option<Opti
 }
 
 fn format_ip(addr: &[u8; 16]) -> String {
-    // Heuristic: if the first 12 bytes are zero, render as IPv4 (mapped layout).
-    if addr[..12].iter().all(|&b| b == 0) {
-        format!("{}.{}.{}.{}", addr[12], addr[13], addr[14], addr[15])
-    } else {
-        let mut groups = Vec::with_capacity(8);
-        for chunk in addr.chunks(2) {
-            groups.push(format!("{:02x}{:02x}", chunk[0], chunk[1]));
-        }
-        groups.join(":")
-    }
+    let address = Ipv6Addr::from(*addr);
+    address
+        .to_ipv4_mapped()
+        .map_or_else(|| address.to_string(), |v4| v4.to_string())
 }
 
 fn print_flow(record: &FlowRecord) {
@@ -923,6 +917,16 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_mapped_ipv4_and_native_ipv6_without_guessing() {
+        assert_eq!(
+            format_ip(&Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped().octets()),
+            "192.0.2.1"
+        );
+        assert_eq!(format_ip(&Ipv6Addr::LOCALHOST.octets()), "::1");
+        assert_eq!(format_ip(&Ipv6Addr::UNSPECIFIED.octets()), "::");
+    }
 
     fn v9_header(domain: u32, sequence: u32, uptime_ms: u32, export_seconds: u32) -> HeaderInfo {
         HeaderInfo {

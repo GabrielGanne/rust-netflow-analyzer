@@ -54,7 +54,10 @@ fn copy_ipv4_uses_mapped_layout() {
     let mut dst = [0u8; 16];
     copy_ipv4(&mut dst, &[192, 168, 0, 1]);
     assert_eq!(&dst[12..16], &[192, 168, 0, 1]);
-    assert!(dst[..12].iter().all(|&b| b == 0));
+    assert_eq!(
+        std::net::Ipv6Addr::from(dst).to_ipv4_mapped(),
+        Some(std::net::Ipv4Addr::new(192, 168, 0, 1))
+    );
 }
 
 #[test]

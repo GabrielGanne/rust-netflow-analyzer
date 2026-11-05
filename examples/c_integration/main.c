@@ -118,9 +118,8 @@ static size_t build_v9_packet(uint8_t *buf) {
 
 /* Asserts the fields of the single flow carried by build_v9_packet(). */
 static void check_sample_flow(const NetflowAnalyzerFlowRecord *rec) {
-    /* IPv4 octets occupy the trailing four bytes; the leading twelve are zero. */
-    static const uint8_t src[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 168, 1, 10};
-    static const uint8_t dst[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 5};
+    static const uint8_t src[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 192, 168, 1, 10};
+    static const uint8_t dst[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 10, 0, 0, 5};
     const uint32_t tuple = NETFLOW_ANALYZER_PRESENT_SRC_IP | NETFLOW_ANALYZER_PRESENT_DST_IP |
                            NETFLOW_ANALYZER_PRESENT_PROTO | NETFLOW_ANALYZER_PRESENT_SRC_PORT |
                            NETFLOW_ANALYZER_PRESENT_DST_PORT;
