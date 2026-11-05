@@ -103,6 +103,43 @@ fn delta_counters_take_precedence_over_totals_in_either_field_order() {
 }
 
 #[test]
+fn ipfix_uptime_uses_initialization_time_or_remains_absent() {
+    use netflow_analyzer_core::records::presence;
+    for with_init in [false, true] {
+        let mut fields = vec![(22, 4), (21, 4)];
+        let mut body = Builder::new();
+        body.put(10_000, 4).put(20_000, 4);
+        if with_init {
+            fields.push((160, 8));
+            body.put(1_699_999_900_000, 8);
+        }
+        let buf = packet(
+            ipfix_header(7),
+            &[
+                flowset(2, &template_record(256, &fields)),
+                flowset(256, &body.buf),
+            ],
+        );
+        let ctx = FlowContext::new();
+        assert_eq!(
+            ctx.decode_packet(&buf, &mut |_, f| {
+                let expected = if with_init {
+                    (1_699_999_910_000_000_000, 1_699_999_920_000_000_000)
+                } else {
+                    (1_700_000_000_000_000_000, 1_700_000_000_000_000_000)
+                };
+                assert_eq!((f.start_time_ns, f.end_time_ns), expected);
+                assert_eq!(
+                    f.present & (presence::START_TIME | presence::END_TIME) != 0,
+                    with_init
+                );
+            }),
+            Ok(1)
+        );
+    }
+}
+
+#[test]
 fn cumulative_counters_are_differenced_before_sampling_reconfiguration() {
     use netflow_analyzer_core::records::presence;
     let ctx = FlowContext::new();
@@ -143,6 +180,35 @@ fn cumulative_counters_are_differenced_before_sampling_reconfiguration() {
         );
     }
     ctx.flush(|record| assert_eq!(record.bytes, 2_000));
+}
+
+#[test]
+fn ipfix_uptime_unwraps_at_the_export_time() {
+    let init_ms = 1_690_000_000_000u64;
+    let elapsed_ms = (1u64 << 32) + 20_000;
+    let export_seconds = ((init_ms + elapsed_ms) / 1000) as u32;
+    let mut header = ipfix_header(7);
+    header[4..8].copy_from_slice(&export_seconds.to_be_bytes());
+    let mut body = Builder::new();
+    body.put(10_000, 4).put(20_000, 4).put(init_ms, 8);
+    let buf = packet(
+        header,
+        &[
+            flowset(2, &template_record(256, &[(22, 4), (21, 4), (160, 8)])),
+            flowset(256, &body.buf),
+        ],
+    );
+    let ctx = FlowContext::new();
+    assert_eq!(
+        ctx.decode_packet(&buf, &mut |_, fields| {
+            assert_eq!(
+                fields.start_time_ns,
+                (init_ms + (1u64 << 32) + 10_000) * 1_000_000
+            );
+            assert_eq!(fields.end_time_ns, (init_ms + elapsed_ms) * 1_000_000);
+        }),
+        Ok(1)
+    );
 }
 
 #[test]

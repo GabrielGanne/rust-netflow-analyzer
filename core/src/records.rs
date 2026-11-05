@@ -50,6 +50,7 @@ const IE_FLOW_START_NANOSECONDS: u16 = 156;
 const IE_FLOW_END_NANOSECONDS: u16 = 157;
 const IE_FLOW_START_DELTA_MICROSECONDS: u16 = 158;
 const IE_FLOW_END_DELTA_MICROSECONDS: u16 = 159;
+const IE_SYSTEM_INIT_TIME_MILLISECONDS: u16 = 160;
 
 // --- Sampling information elements carried by options data records ---
 // Interpreted from options records rather than flow records (see
@@ -400,10 +401,10 @@ impl FlowFields {
             | presence::PROTO
             | presence::SRC_PORT
             | presence::DST_PORT;
-        if let Some(ctx) = time_context {
+        if let Some(ctx) = time_context.filter(|ctx| ctx.system_uptime_ms.is_some()) {
             fields.present |= presence::START_TIME | presence::END_TIME;
-            fields.original_start_time_ns = uptime_timestamp_ns(ctx, first_ms);
-            fields.original_end_time_ns = uptime_timestamp_ns(ctx, last_ms);
+            fields.original_start_time_ns = uptime_timestamp_ns(ctx, first_ms)?;
+            fields.original_end_time_ns = uptime_timestamp_ns(ctx, last_ms)?;
             fields.start_time_ns = ctx.adjust_to_effective_clock(fields.original_start_time_ns);
             fields.end_time_ns = ctx.adjust_to_effective_clock(fields.original_end_time_ns);
         }
@@ -807,6 +808,7 @@ struct DecodedTimestamps {
     end_ntp: Option<u64>,
     start_delta_us: Option<u64>,
     end_delta_us: Option<u64>,
+    system_init_time_ms: Option<u64>,
 }
 
 impl DecodedTimestamps {
@@ -827,6 +829,7 @@ impl DecodedTimestamps {
             IE_FLOW_END_NANOSECONDS => self.end_ntp = Some(value),
             IE_FLOW_START_DELTA_MICROSECONDS => self.start_delta_us = Some(value),
             IE_FLOW_END_DELTA_MICROSECONDS => self.end_delta_us = Some(value),
+            IE_SYSTEM_INIT_TIME_MILLISECONDS => self.system_init_time_ms = Some(value),
             _ => return false,
         }
         true
@@ -852,11 +855,7 @@ impl DecodedTimestamps {
         self.start_ntp
             .map(|v| ntp_to_unix_ns(v, context))
             .or(self.start_absolute_ns)
-            .or_else(|| {
-                self.start_uptime_ms
-                    .zip(context)
-                    .map(|(v, ctx)| uptime_timestamp_ns(ctx, v))
-            })
+            .or_else(|| self.resolve_uptime(self.start_uptime_ms?, context))
             .or_else(|| delta_timestamp_ns(context?, self.start_delta_us?))
     }
 
@@ -864,12 +863,31 @@ impl DecodedTimestamps {
         self.end_ntp
             .map(|v| ntp_to_unix_ns(v, context))
             .or(self.end_absolute_ns)
-            .or_else(|| {
-                self.end_uptime_ms
-                    .zip(context)
-                    .map(|(v, ctx)| uptime_timestamp_ns(ctx, v))
-            })
+            .or_else(|| self.resolve_uptime(self.end_uptime_ms?, context))
             .or_else(|| delta_timestamp_ns(context?, self.end_delta_us?))
+    }
+
+    fn resolve_uptime(&self, switched_ms: u32, context: Option<RecordTimeContext>) -> Option<u64> {
+        if let Some(ctx) = context.filter(|ctx| ctx.system_uptime_ms.is_some()) {
+            return uptime_timestamp_ns(ctx, switched_ms);
+        }
+        let init_ns = self.system_init_time_ms?.saturating_mul(NS_PER_MILLISECOND);
+        let switched_ms = u64::from(switched_ms);
+        let elapsed_ms = context
+            // IPFIX export times have whole-second precision.
+            .map(|ctx| {
+                ctx.original_export_time_ns
+                    .saturating_add(NS_PER_SECOND - 1)
+                    .saturating_sub(init_ns)
+                    / NS_PER_MILLISECOND
+            })
+            .unwrap_or(switched_ms);
+        let era = elapsed_ms.saturating_sub(switched_ms) / (1_u64 << 32);
+        Some(
+            init_ns.saturating_add(
+                (era * (1_u64 << 32) + switched_ms).saturating_mul(NS_PER_MILLISECOND),
+            ),
+        )
     }
 }
 
@@ -883,14 +901,14 @@ fn delta_timestamp_ns(context: RecordTimeContext, delta_us: u64) -> Option<u64> 
     )
 }
 
-fn uptime_timestamp_ns(context: RecordTimeContext, switched_ms: u32) -> u64 {
-    let Some(uptime_ms) = context.system_uptime_ms else {
-        return context.original_export_time_ns;
-    };
+fn uptime_timestamp_ns(context: RecordTimeContext, switched_ms: u32) -> Option<u64> {
+    let uptime_ms = context.system_uptime_ms?;
     let elapsed_ms = uptime_ms.wrapping_sub(switched_ms) as u64;
-    context
-        .original_export_time_ns
-        .saturating_sub(elapsed_ms.saturating_mul(NS_PER_MILLISECOND))
+    Some(
+        context
+            .original_export_time_ns
+            .saturating_sub(elapsed_ms.saturating_mul(NS_PER_MILLISECOND)),
+    )
 }
 
 /// IPFIX dateTimeMicroseconds/dateTimeNanoseconds use the 64-bit NTP format:
