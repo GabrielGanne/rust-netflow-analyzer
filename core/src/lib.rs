@@ -76,7 +76,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cache::{AgingHandle, FlowCache, TemplateCache, DEFAULT_MAX_FLOWS, DEFAULT_MAX_TEMPLATES};
 use clock::{ClockDecision, ClockTracker};
 use parser::{
-    NetflowV5Header, ParsedHeader, FIRST_DATA_SET_ID, FLOWSET_ID_V9_OPTIONS,
+    NetflowV5Header, ParsedHeader, ProtocolVersion, FIRST_DATA_SET_ID, FLOWSET_ID_V9_OPTIONS,
     FLOWSET_ID_V9_TEMPLATE, IPFIX_HEADER_LEN, SET_ID_IPFIX_OPTIONS, SET_ID_IPFIX_TEMPLATE,
     V5_RECORD_LEN,
 };
@@ -517,9 +517,17 @@ impl FlowContext {
         // Template Set IDs are protocol-specific: NetFlow v9 uses 0 and 1, IPFIX
         // uses 2 and 3. An inapplicable ID is reserved for that protocol and
         // skipped like any other reserved Set, so it never installs a template.
-        let (template_set_id, options_set_id) = match header {
-            ParsedHeader::Ipfix(_) => (SET_ID_IPFIX_TEMPLATE, SET_ID_IPFIX_OPTIONS),
-            _ => (FLOWSET_ID_V9_TEMPLATE, FLOWSET_ID_V9_OPTIONS),
+        let (version, template_set_id, options_set_id) = match header {
+            ParsedHeader::Ipfix(_) => (
+                ProtocolVersion::Ipfix,
+                SET_ID_IPFIX_TEMPLATE,
+                SET_ID_IPFIX_OPTIONS,
+            ),
+            _ => (
+                ProtocolVersion::NetflowV9,
+                FLOWSET_ID_V9_TEMPLATE,
+                FLOWSET_ID_V9_OPTIONS,
+            ),
         };
 
         // Walk each FlowSet/Set in the payload. A structural inconsistency stops
@@ -542,7 +550,7 @@ impl FlowContext {
             payload = remainder;
 
             match fs.set_id {
-                id if id == template_set_id => match parser::parse_template_set(body) {
+                id if id == template_set_id => match parser::parse_template_set(body, version) {
                     Ok((_, templates)) => {
                         for template in templates.into_iter().filter(is_definition) {
                             self.counters

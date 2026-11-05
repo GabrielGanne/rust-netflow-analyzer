@@ -102,7 +102,7 @@ fn parses_flowset_header() {
 fn field_specifier_handles_enterprise_bit() {
     // type 0x8001 (enterprise), length 4, PEN 9
     let input = [0x80, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09];
-    let (rest, field) = parse_field_specifier(&input).unwrap();
+    let (rest, field) = parse_field_specifier(&input, ProtocolVersion::Ipfix).unwrap();
     assert_eq!(field.type_id, 1); // enterprise bit stripped
     assert_eq!(field.length, 4);
     assert_eq!(field.enterprise_number, Some(9));
@@ -112,7 +112,7 @@ fn field_specifier_handles_enterprise_bit() {
 #[test]
 fn field_specifier_standard_element() {
     let input = [0x00, 0x08, 0x00, 0x04];
-    let (_rest, field) = parse_field_specifier(&input).unwrap();
+    let (_rest, field) = parse_field_specifier(&input, ProtocolVersion::Ipfix).unwrap();
     assert_eq!(field.type_id, 8);
     assert_eq!(field.length, 4);
     assert_eq!(field.enterprise_number, None);
@@ -126,7 +126,7 @@ fn template_set_with_two_records() {
     // template 257, 1 field
     body.extend_from_slice(&[0x01, 0x01, 0x00, 0x01, 0x00, 0x0C, 0x00, 0x04]);
 
-    let (_rest, templates) = parse_template_set(&body).unwrap();
+    let (_rest, templates) = parse_template_set(&body, ProtocolVersion::Ipfix).unwrap();
     assert_eq!(templates.len(), 2);
     assert_eq!(templates[0].template_id, 256);
     assert_eq!(templates[0].fixed_length, Some(4));
@@ -141,7 +141,7 @@ fn template_field_count_exceeding_input_is_rejected() {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x01, 0x00, 0x00, 0x0A, 0x00, 0x08, 0x00, 0x04]);
 
-    assert!(parse_template_set(&body).is_err());
+    assert!(parse_template_set(&body, ProtocolVersion::Ipfix).is_err());
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn template_field_count_over_cap_is_rejected() {
         body.extend_from_slice(&[0x00, 0x08, 0x00, 0x04]); // type 8, length 4
     }
 
-    assert!(parse_template_set(&body).is_err());
+    assert!(parse_template_set(&body, ProtocolVersion::Ipfix).is_err());
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn reserved_template_id_rejects_the_set() {
     // Invalid: definition with reserved template id 100.
     body.extend_from_slice(&[0x00, 0x64, 0x00, 0x01, 0x00, 0x08, 0x00, 0x04]);
 
-    assert!(parse_template_set(&body).is_err());
+    assert!(parse_template_set(&body, ProtocolVersion::Ipfix).is_err());
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn template_withdrawal_is_accepted() {
     // (RFC 7011 §8.1); it parses as a valid (fieldless) record rather than
     // being rejected as a reserved id.
     let body = [0x00, 0x02, 0x00, 0x00]; // template id 2, field count 0
-    let (_rest, templates) = parse_template_set(&body).unwrap();
+    let (_rest, templates) = parse_template_set(&body, ProtocolVersion::Ipfix).unwrap();
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].template_id, 2);
 }

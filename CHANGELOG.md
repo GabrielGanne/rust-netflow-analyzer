@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Parse NetFlow v9 field IDs as full 16-bit values; only IPFIX field specifiers consume an enterprise number when the high bit is set.
 - Prefer delta counters over total counters regardless of field order. Aggregate cumulative byte/packet snapshots by their unscaled increase, retaining watermarks across active rollover and applying the current sampling rate afterward. Decode-only callbacks identify snapshots through the new `BYTES_TOTAL` / `PACKETS_TOTAL` presence bits; C struct layouts and function signatures are unchanged.
 - `FlowContext::age_at` no longer iterates an empty flow cache, which locked and allocated a guard per map shard, and scans templates only when the earliest expiry is due. A call with nothing to age performs no allocation.
 - Fixed-width NetFlow v5/v9 and IPFIX record framing iterates over borrowed slices without allocating a temporary vector; NetFlow v5 applies its header record count during iteration.

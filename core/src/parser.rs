@@ -10,7 +10,7 @@ use nom::{
 use crate::scope::Scope;
 
 /// Supported versions of the NetFlow/IPFIX protocol
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolVersion {
     /// NetFlow version 5 (fixed-format, legacy).
     NetflowV5,
@@ -313,11 +313,11 @@ pub(crate) fn parse_flowset_header(input: &[u8]) -> IResult<&[u8], FlowSetHeader
 
 /// Parses a single field specifier, transparently handling the IPFIX
 /// enterprise bit (`0x8000`) which prefixes a 4-byte Private Enterprise Number.
-fn parse_field_specifier(input: &[u8]) -> IResult<&[u8], TemplateField> {
+fn parse_field_specifier(input: &[u8], version: ProtocolVersion) -> IResult<&[u8], TemplateField> {
     let (input, raw_type) = be_u16(input)?;
     let (input, length) = be_u16(input)?;
 
-    if raw_type & 0x8000 != 0 {
+    if version == ProtocolVersion::Ipfix && raw_type & 0x8000 != 0 {
         let (input, enterprise) = be_u32(input)?;
         Ok((
             input,
@@ -346,7 +346,7 @@ fn validation_error(input: &[u8]) -> nom::Err<nom::error::Error<&[u8]>> {
 }
 
 /// Parses a single template record (template id, field count, field specifiers).
-fn parse_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
+fn parse_template_record(input: &[u8], version: ProtocolVersion) -> IResult<&[u8], TemplateRecord> {
     let (input, template_id) = be_u16(input)?;
     let (input, field_count) = be_u16(input)?;
     // Template ids 0-255 are reserved for Set ids (RFC 3954 §5.2, RFC 7011
@@ -357,7 +357,7 @@ fn parse_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
     if field_count != 0 && template_id < FIRST_DATA_SET_ID {
         return Err(validation_error(input));
     }
-    let (input, fields) = parse_field_specifiers(input, field_count as usize)?;
+    let (input, fields) = parse_field_specifiers(input, field_count as usize, version)?;
     Ok((input, TemplateRecord::from_fields(template_id, fields)))
 }
 
@@ -367,10 +367,13 @@ fn parse_template_record(input: &[u8]) -> IResult<&[u8], TemplateRecord> {
 /// whole set is rejected and no template is returned (RFC 7011 §9.1 requires a
 /// malformed message to be discarded rather than partially applied). Trailing
 /// padding shorter than a record header (< 4 bytes) is ignored.
-pub(crate) fn parse_template_set(mut body: &[u8]) -> IResult<&[u8], Vec<TemplateRecord>> {
+pub(crate) fn parse_template_set(
+    mut body: &[u8],
+    version: ProtocolVersion,
+) -> IResult<&[u8], Vec<TemplateRecord>> {
     let mut templates = Vec::new();
     while body.len() >= 4 {
-        let (rest, template) = parse_template_record(body)?;
+        let (rest, template) = parse_template_record(body, version)?;
         body = rest;
         templates.push(template);
     }
@@ -394,7 +397,11 @@ pub(crate) const MAX_TEMPLATE_FIELDS: usize = 1024;
 /// the bytes that actually remain **before** any allocation, so a hostile
 /// `field_count` cannot drive a large reservation (or a chain of them across
 /// many template records) before the fields are ever read.
-fn parse_field_specifiers(mut input: &[u8], count: usize) -> IResult<&[u8], Vec<TemplateField>> {
+fn parse_field_specifiers(
+    mut input: &[u8],
+    count: usize,
+    version: ProtocolVersion,
+) -> IResult<&[u8], Vec<TemplateField>> {
     let too_large = count > MAX_TEMPLATE_FIELDS
         || count
             .checked_mul(FIELD_SPECIFIER_MIN_LEN)
@@ -414,7 +421,7 @@ fn parse_field_specifiers(mut input: &[u8], count: usize) -> IResult<&[u8], Vec<
         )));
     }
     for _ in 0..count {
-        let (rest, field) = parse_field_specifier(input)?;
+        let (rest, field) = parse_field_specifier(input, version)?;
         input = rest;
         fields.push(field);
     }
@@ -442,7 +449,7 @@ fn parse_v9_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateReco
     let option_field_count = option_len_bytes / 4;
     let total = scope_field_count as usize + option_field_count as usize;
 
-    let (input, fields) = parse_field_specifiers(input, total)?;
+    let (input, fields) = parse_field_specifiers(input, total, ProtocolVersion::NetflowV9)?;
     Ok((
         input,
         TemplateRecord::from_options_fields(template_id, scope_field_count, fields),
@@ -489,7 +496,8 @@ fn parse_ipfix_options_template_record(input: &[u8]) -> IResult<&[u8], TemplateR
         return Err(validation_error(input));
     }
 
-    let (input, fields) = parse_field_specifiers(input, field_count as usize)?;
+    let (input, fields) =
+        parse_field_specifiers(input, field_count as usize, ProtocolVersion::Ipfix)?;
     Ok((
         input,
         TemplateRecord::from_options_fields(template_id, scope_field_count, fields),

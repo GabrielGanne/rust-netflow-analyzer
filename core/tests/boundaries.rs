@@ -31,6 +31,23 @@ fn decode(ctx: &FlowContext, buf: &[u8]) -> (Result<usize, PacketError>, Vec<Flo
 }
 
 #[test]
+fn v9_high_bit_field_ids_do_not_consume_enterprise_numbers() {
+    let body = [vec![0; 12], vec![6]].concat();
+    let buf = packet(
+        v9_header(7),
+        &[
+            flowset(0, &template_record(256, &[(33000, 12), (4, 1)])),
+            flowset(256, &body),
+        ],
+    );
+    let ctx = FlowContext::new();
+    let (result, records) = decode(&ctx, &buf);
+    assert_eq!(result, Ok(1));
+    assert_eq!(records[0].proto, 6);
+    assert_eq!(ctx.stats().malformed_packets, 0);
+}
+
+#[test]
 fn every_truncated_header_is_rejected() {
     let cases: [(&str, Vec<u8>, usize); 3] = [
         ("v5", sample_v5_packet(&[]), 24),
