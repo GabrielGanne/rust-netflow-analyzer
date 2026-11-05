@@ -166,6 +166,37 @@ fn is_definition(template: &parser::TemplateRecord) -> bool {
     !template.fields.is_empty()
 }
 
+fn v9_record_bounds(template: &parser::TemplateRecord, body: &[u8]) -> Option<(usize, usize)> {
+    if let Some(width) = template.fixed_length {
+        if width == 0 {
+            return None;
+        }
+        let maximum = body.len() / width;
+        let mut minimum = maximum;
+        if width < 4 && body.len() % 4 == 0 {
+            for padding in 1..=3.min(body.len()) {
+                if (body.len() - padding) % width == 0
+                    && body[body.len() - padding..].iter().all(|&byte| byte == 0)
+                {
+                    minimum = minimum.min((body.len() - padding) / width);
+                }
+            }
+        }
+        return Some((minimum, maximum));
+    }
+    let mut cursor = body;
+    let mut count = 0;
+    while !cursor.is_empty() {
+        let (_, consumed) = FlowFields::from_record_sized(template, cursor)?;
+        if consumed == 0 {
+            return None;
+        }
+        cursor = &cursor[consumed..];
+        count += 1;
+    }
+    Some((count, count))
+}
+
 /// Current wall-clock time as Unix nanoseconds, saturating at `u64::MAX`.
 pub(crate) fn now_unix_ns() -> u64 {
     SystemTime::now()
@@ -506,14 +537,18 @@ impl FlowContext {
         }
 
         let mut data_records = 0usize;
-        // Set when a template/options set fails to parse or validate. Template
+        let mut v9_remaining = match &header {
+            ParsedHeader::V9(h) => Some(usize::from(h.count)),
+            _ => None,
+        };
+        // Set when a template/options set fails validation or v9 padding is ambiguous. Template
         // sets are transactional (see `parse_template_set`), so a rejected set
         // applies none of its templates and the previously cached definition is
         // retained. Decoding must then stop for the rest of this packet: any
         // following data set could otherwise be decoded against a *stale* layout
         // (e.g. an old 4-byte template splitting one new 8-byte record into two),
         // silently corrupting flows.
-        let mut rejected_template = false;
+        let mut malformed_body = false;
         // Template Set IDs are protocol-specific: NetFlow v9 uses 0 and 1, IPFIX
         // uses 2 and 3. An inapplicable ID is reserved for that protocol and
         // skipped like any other reserved Set, so it never installs a template.
@@ -552,6 +587,7 @@ impl FlowContext {
             match fs.set_id {
                 id if id == template_set_id => match parser::parse_template_set(body, version) {
                     Ok((_, templates)) => {
+                        v9_remaining = v9_remaining.and_then(|n| n.checked_sub(templates.len()));
                         for template in templates.into_iter().filter(is_definition) {
                             self.counters
                                 .templates_received
@@ -561,7 +597,7 @@ impl FlowContext {
                         }
                     }
                     Err(_) => {
-                        rejected_template = true;
+                        malformed_body = true;
                         break;
                     }
                 },
@@ -570,14 +606,18 @@ impl FlowContext {
                 // can later be interpreted rather than silently dropped.
                 id if id == options_set_id && id == FLOWSET_ID_V9_OPTIONS => {
                     match parser::parse_v9_options_template_set(body) {
-                        Ok((_, templates)) => self.store_options_templates(
-                            exporter,
-                            scope,
-                            templates,
-                            receipt_time_ns,
-                        ),
+                        Ok((_, templates)) => {
+                            v9_remaining =
+                                v9_remaining.and_then(|n| n.checked_sub(templates.len()));
+                            self.store_options_templates(
+                                exporter,
+                                scope,
+                                templates,
+                                receipt_time_ns,
+                            );
+                        }
                         Err(_) => {
-                            rejected_template = true;
+                            malformed_body = true;
                             break;
                         }
                     }
@@ -591,7 +631,7 @@ impl FlowContext {
                             receipt_time_ns,
                         ),
                         Err(_) => {
-                            rejected_template = true;
+                            malformed_body = true;
                             break;
                         }
                     }
@@ -601,6 +641,31 @@ impl FlowContext {
                 id if id >= FIRST_DATA_SET_ID => {
                     if let Some(template) = self.templates.get(exporter, scope, id, receipt_time_ns)
                     {
+                        let mut body = body;
+                        let width = template.fixed_length.unwrap_or(0);
+                        if version == ProtocolVersion::NetflowV9 && (1..4).contains(&width) {
+                            if let Some((minimum, maximum)) = v9_record_bounds(&template, body) {
+                                if minimum != maximum {
+                                    let count = v9_remaining.and_then(|remaining| {
+                                        let (after_min, after_max) = self.v9_suffix_bounds(
+                                            exporter,
+                                            scope,
+                                            payload,
+                                            receipt_time_ns,
+                                        )?;
+                                        let lower =
+                                            minimum.max(remaining.saturating_sub(after_max));
+                                        let upper = maximum.min(remaining.checked_sub(after_min)?);
+                                        (lower == upper).then_some(lower)
+                                    });
+                                    let Some(count) = count else {
+                                        malformed_body = true;
+                                        break;
+                                    };
+                                    body = &body[..count * width];
+                                }
+                            }
+                        }
                         let records = self.process_data_set(
                             exporter,
                             scope,
@@ -609,9 +674,12 @@ impl FlowContext {
                             time_context,
                             sink,
                         );
+                        v9_remaining = v9_remaining.and_then(|n| n.checked_sub(records));
                         if !template.is_options {
                             data_records += records;
                         }
+                    } else {
+                        v9_remaining = None;
                     }
                 }
                 // Reserved/unknown set ids (e.g. 4..=255) are ignored.
@@ -627,7 +695,7 @@ impl FlowContext {
         // flag the datagram as malformed rather than silently succeeding. (IPFIX
         // messages are already validated to tile exactly above, so unconsumed
         // bytes only arise for NetFlow v9.)
-        if rejected_template || !payload.is_empty() {
+        if malformed_body || !payload.is_empty() {
             self.counters
                 .malformed_packets
                 .fetch_add(1, Ordering::Relaxed);
@@ -638,6 +706,34 @@ impl FlowContext {
             .fetch_add(data_records as u64, Ordering::Relaxed);
 
         Ok(data_records)
+    }
+
+    /// Bounds records in later Sets without applying their options or emitting
+    /// flows. Unknown layouts cannot disambiguate padding in an earlier Set.
+    fn v9_suffix_bounds(
+        &self,
+        exporter: ExporterKey,
+        scope: Scope,
+        mut payload: &[u8],
+        now_ns: u64,
+    ) -> Option<(usize, usize)> {
+        let (mut minimum, mut maximum) = (0usize, 0usize);
+        while !payload.is_empty() {
+            let (rest, set) = parser::parse_flowset_header(payload).ok()?;
+            let length = usize::from(set.length).checked_sub(4)?;
+            let body = rest.get(..length)?;
+            payload = &rest[length..];
+            if matches!(set.set_id, FLOWSET_ID_V9_TEMPLATE | FLOWSET_ID_V9_OPTIONS) {
+                return None;
+            }
+            if set.set_id >= FIRST_DATA_SET_ID {
+                let template = self.templates.get(exporter, scope, set.set_id, now_ns)?;
+                let (lower, upper) = v9_record_bounds(&template, body)?;
+                minimum = minimum.checked_add(lower)?;
+                maximum = maximum.checked_add(upper)?;
+            }
+        }
+        Some((minimum, maximum))
     }
 
     /// Records every decoded options template under `(exporter, scope)`,

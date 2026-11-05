@@ -66,7 +66,11 @@ The parser processes datagram buffers directly without copying payloads onto the
 - **NetFlow v9 & IPFIX**: Packet headers and Set framing are validated first. Template Sets define the field offsets and lengths used to decode subsequent Data Sets. Variable-length records are decoded with zero-copy sub-slices.
 
 NetFlow v9 field types use all 16 bits; IPFIX alone interprets the high bit as
-an enterprise-number prefix.
+an enterprise-number prefix. For v9 records shorter than four bytes, the
+header record count disambiguates zero alignment padding using the known
+layouts of later Sets. If multiple record/padding splits remain possible, or
+later template changes or unknown layouts prevent a unique split, decoding
+stops and `malformed_packets` increments. Records already decoded are retained.
 
 ### 2. Exporter Identity and Scoping
 All internal state is scoped by `(exporter_key, Scope)`:

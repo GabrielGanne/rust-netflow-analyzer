@@ -48,6 +48,82 @@ fn v9_high_bit_field_ids_do_not_consume_enterprise_numbers() {
 }
 
 #[test]
+fn v9_record_count_distinguishes_short_records_from_padding() {
+    for width in 1..=3 {
+        for count in 1..=4 {
+            let mut header = v9_header(7);
+            header[2..4].copy_from_slice(&((count + 1) as u16).to_be_bytes());
+            let mut body = vec![0; width * count];
+            body[0] = 6;
+            body.resize((body.len() + 3) & !3, 0);
+            let mut fields = vec![(4, 1)];
+            if width > 1 {
+                fields.push((999, (width - 1) as u16));
+            }
+            let buf = packet(
+                header,
+                &[
+                    flowset(0, &template_record(256, &fields)),
+                    flowset(256, &body),
+                ],
+            );
+            let ctx = FlowContext::new();
+            let (result, records) = decode(&ctx, &buf);
+            assert_eq!(result, Ok(count), "width {width}, count {count}");
+            assert_eq!(records.len(), count);
+            assert_eq!(ctx.stats().malformed_packets, 0);
+        }
+    }
+}
+
+#[test]
+fn v9_short_sets_use_the_remaining_packet_record_count() {
+    for (count, expected, malformed) in [(3u16, 2, 0), (4, 0, 1)] {
+        let mut header = v9_header(7);
+        header[2..4].copy_from_slice(&count.to_be_bytes());
+        let buf = packet(
+            header,
+            &[
+                flowset(0, &template_record(256, &[(4, 1)])),
+                flowset(256, &[6, 0, 0, 0]),
+                flowset(256, &[17, 0, 0, 0]),
+            ],
+        );
+        let ctx = FlowContext::new();
+        let (result, records) = decode(&ctx, &buf);
+        assert_eq!(result, Ok(expected));
+        assert_eq!(ctx.stats().malformed_packets, malformed);
+        if malformed == 0 {
+            assert_eq!(records.iter().map(|r| r.proto).collect::<Vec<_>>(), [6, 17]);
+        }
+    }
+}
+
+#[test]
+fn v9_options_records_are_included_in_the_padding_budget() {
+    let mut header = v9_header(7);
+    header[2..4].copy_from_slice(&4u16.to_be_bytes());
+    let options = [260, 4, 4, 1, 4, 34, 4]
+        .iter()
+        .flat_map(|v| (*v as u16).to_be_bytes())
+        .collect::<Vec<_>>();
+    let buf = packet(
+        header,
+        &[
+            flowset(1, &options),
+            flowset(260, &[0, 0, 0, 1, 0, 0, 0, 1]),
+            flowset(0, &template_record(256, &[(4, 1)])),
+            flowset(256, &[6, 0, 0, 0]),
+        ],
+    );
+    let ctx = FlowContext::new();
+    let (result, records) = decode(&ctx, &buf);
+    assert_eq!(result, Ok(1));
+    assert_eq!(records[0].proto, 6);
+    assert_eq!(ctx.stats().options_records_processed, 1);
+}
+
+#[test]
 fn every_truncated_header_is_rejected() {
     let cases: [(&str, Vec<u8>, usize); 3] = [
         ("v5", sample_v5_packet(&[]), 24),
