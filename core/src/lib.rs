@@ -48,6 +48,8 @@
 //! }
 //! ```
 
+#![forbid(unsafe_code)]
+
 /// Cache configurations and hard caps for flows and templates.
 pub mod cache;
 /// Exporter clock tracking and skew validation.

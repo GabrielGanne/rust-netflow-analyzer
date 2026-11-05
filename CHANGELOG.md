@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-11-05
 
 ### Changed
+- `netflow_analyzer_core` forbids `unsafe` code at the crate level.
 - C ABI version bumped to 4: struct layouts and function signatures are unchanged, but IPv4 addresses now carry the `::ffff:` mapped prefix and cumulative counters set the new `BYTES_TOTAL` / `PACKETS_TOTAL` presence bits.
 
 ### Fixed
